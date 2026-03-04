@@ -1,6 +1,6 @@
 "use client";
 
-import { Tile } from "@/components/Tile";
+import Tile from "@/components/Tile";
 import Link from "next/link";
 import {
   Building2,

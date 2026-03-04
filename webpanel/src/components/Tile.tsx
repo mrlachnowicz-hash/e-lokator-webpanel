@@ -14,7 +14,7 @@ export default function Tile({
   desc: string;
 }) {
   return (
-    <Link href={href} className="tile">
+    <Link className="tile" href={href}>
       <div className="tileIcon">{icon}</div>
       <div className="tileTitle">{title}</div>
       <div className="tileDesc">{desc}</div>
