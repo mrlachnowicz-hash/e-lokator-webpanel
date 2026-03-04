@@ -1,0 +1,132 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+
+    function getMyData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function canUse() {
+      return signedIn() && getMyData().get('appBlocked', false) == false;
+    }
+
+    function isOwner() {
+      return signedIn() && (
+        request.auth.token.get('owner', false) == true ||
+        request.auth.token.email in ["mrlachnowicz@gmail.com"]
+      );
+    }
+
+    function myRole() { return getMyData().get('role', 'RESIDENT'); }
+    function myCommId() { return getMyData().get('communityId', ''); }
+
+    function isAdminOrMaster() {
+      return canUse() && (myRole() == "ADMIN" || myRole() == "MASTER");
+    }
+
+    function isAccountant() {
+      return canUse() && (myRole() == "ACCOUNTANT");
+    }
+
+    function isStaff() {
+      return canUse() && (myRole() == "ADMIN" || myRole() == "MASTER" || myRole() == "ACCOUNTANT");
+    }
+
+    function isMember(communityId) {
+      return canUse() && (myCommId() == communityId || isOwner());
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (
+        request.auth.uid == uid ||
+        (myCommId() != "" && myCommId() == resource.data.get('communityId', '')) ||
+        isStaff()
+      );
+      allow create, update, delete: if signedIn() && request.auth.uid == uid;
+      allow update: if isAdminOrMaster()
+        && myCommId() == resource.data.get('communityId', '')
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+          "chatMutedUntilMs", "chatBanned", "appBlocked", "blockedAtMs"
+        ]);
+    }
+
+    match /communities/{communityId} {
+      allow read: if signedIn();
+      allow create: if canUse() || isOwner();
+      allow update, delete: if isOwner() || (isStaff() && myCommId() == communityId);
+
+      match /chatMessages/{msgId} {
+        allow create: if isMember(communityId) && getMyData().get('chatBanned', false) == false;
+        // Pozwól autorowi na "usunięcie" (edycję pola 'deleted')
+        allow update: if isMember(communityId) && resource.data.senderUid == request.auth.uid
+                      && request.resource.data.diff(resource.data).changedKeys().hasOnly(['deleted', 'deletedAtMs']);
+      }
+
+      match /tickets/{ticketId} {
+        allow create: if isMember(communityId);
+      }
+
+      match /residentAnnouncements/{annId} {
+        allow read: if isMember(communityId);
+        allow create: if isMember(communityId);
+        allow update: if isMember(communityId);
+        allow delete: if isAdminOrMaster() || (isMember(communityId) && resource.data.createdByUid == request.auth.uid);
+      }
+
+      match /votes/{voteId} {
+        allow read: if isMember(communityId);
+        match /ballots/{ballotId} {
+          allow list, read: if isMember(communityId);
+          allow write: if isMember(communityId) && getMyData().get('flatId', '') == ballotId;
+        }
+      }
+
+      match /correspondence/{resUid} {
+        allow read, write: if (resUid == request.auth.uid && canUse()) || (isAdminOrMaster() && myCommId() == communityId);
+        match /messages/{msgId} {
+          allow read, create: if (resUid == request.auth.uid && canUse()) || (isAdminOrMaster() && myCommId() == communityId);
+        }
+      }
+
+      match /{sub=**} {
+        allow read: if isMember(communityId);
+        // Webpanel (ADMIN/MASTER/ACCOUNTANT) może zarządzać danymi wspólnoty
+        allow write: if isOwner() || (isStaff() && myCommId() == communityId);
+      }
+    }
+
+    // One-time SSO tokens (zapisywane przez Functions / konsumowane przez webpanel API)
+    match /webSessions/{token} {
+      allow read, write: if false;
+    }
+
+    // Join codes (zapisywane przez Functions, czytane przez claimJoinCode)
+    match /join_codes/{code} {
+      allow read, write: if false;
+    }
+
+    match /communityNames/{name} {
+      allow read, write: if signedIn();
+    }
+
+    match /invites/{inviteId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    match /seat_requests/{reqId} {
+      allow create: if canUse()
+        && myRole() == "MASTER"
+        && request.resource.data.communityId == myCommId()
+        && request.resource.data.status == "PENDING";
+      allow read, update, delete: if isOwner();
+    }
+
+    match /activation_codes/{code} {
+      allow read, write: if isOwner();
+    }
+  }
+}
