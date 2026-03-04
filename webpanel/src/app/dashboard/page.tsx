@@ -6,7 +6,7 @@ import { ISpreadsheet, IBuilding, IHome, IReceipt, ICoins, IShield, ILogout } fr
 import { useAuth } from "../../lib/authContext";
 
 export default function DashboardPage() {
-  const { user, role, logout, communityId } = useAuth();
+  const { user, logout } = useAuth() as any;
 
   return (
     <>
@@ -16,7 +16,7 @@ export default function DashboardPage() {
           <div>
             e-Lokator Webpanel{" "}
             <span style={{ color: "var(--muted)", fontWeight: 500, fontSize: 12 }}>
-              ({role || "—"} / {user?.uid?.slice(0, 6) || "—"})
+              ({user?.uid?.slice(0, 6) || "—"})
             </span>
           </div>
         </div>
@@ -76,12 +76,6 @@ export default function DashboardPage() {
           desc="Ustaw URL płatności (WebView + token SSO)."
         />
       </div>
-
-      {role === "MASTER" && communityId && (
-        <p style={{ marginTop: 16, color: "var(--muted)", fontSize: 12 }}>
-          Community: {communityId}
-        </p>
-      )}
     </>
   );
 }
