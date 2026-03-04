@@ -1,17 +1,9 @@
 "use client";
 
-import Tile from "@/components/Tile";
 import Link from "next/link";
-import {
-  Building2,
-  FileSpreadsheet,
-  Home,
-  Receipt,
-  Coins,
-  ShieldCheck,
-  LogOut,
-} from "lucide-react";
-import { useAuth } from "@/lib/authContext";
+import Tile from "../../components/Tile";
+import { ISpreadsheet, IBuilding, IHome, IReceipt, ICoins, IShield, ILogout } from "./_icons";
+import { useAuth } from "../../lib/authContext";
 
 export default function DashboardPage() {
   const { user, role, logout, communityId } = useAuth();
@@ -37,7 +29,8 @@ export default function DashboardPage() {
           <Link href="/charges">Naliczania</Link>
           <button className="pillBtn" onClick={logout} title="Wyloguj">
             <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
-              <LogOut size={16} /> Wyloguj
+              <span style={{ width: 16, height: 16, display: "inline-flex" }}><ILogout /></span>
+              Wyloguj
             </span>
           </button>
         </div>
@@ -48,39 +41,39 @@ export default function DashboardPage() {
       <div className="grid">
         <Tile
           href="/import"
-          icon={<FileSpreadsheet />}
+          icon={<ISpreadsheet />}
           title="Import lokali"
           desc="CSV/XLSX → flats + payer (mail-only) + zajęcie seats."
         />
         <Tile
           href="/buildings"
-          icon={<Building2 />}
+          icon={<IBuilding />}
           title="Budynki"
           desc="Lista i edycja budynków we wspólnocie."
         />
         <Tile
           href="/flats"
-          icon={<Home />}
+          icon={<IHome />}
           title="Lokale"
           desc="Podgląd lokali, payerów, metraż, dane kontaktowe."
         />
         <Tile
           href="/invoices"
-          icon={<Receipt />}
+          icon={<IReceipt />}
           title="Faktury (KSeF)"
-          desc="NOWA/DO_PRZYPISANIA/ZATWIERDZONA/ODRZUCONA + ręczne przypisanie."
+          desc="Statusy + ręczne przypisanie + sugestie AI."
         />
         <Tile
           href="/charges"
-          icon={<Coins />}
+          icon={<ICoins />}
           title="Naliczania"
           desc="Charges per flatId, okresy, salda i historia."
         />
         <Tile
           href="/payments"
-          icon={<ShieldCheck />}
+          icon={<IShield />}
           title="Płatności / SSO"
-          desc="Ustaw URL panelu płatności dla aplikacji (WebView + token)."
+          desc="Ustaw URL płatności (WebView + token SSO)."
         />
       </div>
 
