@@ -1,21 +1,20 @@
 "use client";
 
 import Link from "next/link";
-import type { ReactNode } from "react";
 
-export function Tile({
+export default function Tile({
   href,
   icon,
   title,
   desc,
 }: {
   href: string;
-  icon: ReactNode;
+  icon: React.ReactNode;
   title: string;
   desc: string;
 }) {
   return (
-    <Link className="tile" href={href}>
+    <Link href={href} className="tile">
       <div className="tileIcon">{icon}</div>
       <div className="tileTitle">{title}</div>
       <div className="tileDesc">{desc}</div>
