@@ -1,17 +1,24 @@
 "use client";
 
-import { useEffect } from "react";
-import { useRouter } from "next/navigation";
-import { useAuth } from "../lib/authContext";
+import { Suspense } from "react";
+import { useSearchParams } from "next/navigation";
 
-export default function Home() {
-  const router = useRouter();
-  const { user, loading } = useAuth();
+function SSOContent() {
+  const params = useSearchParams();
+  const token = params.get("token");
 
-  useEffect(() => {
-    if (loading) return;
-    router.replace(user ? "/dashboard" : "/login");
-  }, [loading, user, router]);
+  return (
+    <div style={{ padding: 40 }}>
+      <h1>SSO Login</h1>
+      <p>Token: {token}</p>
+    </div>
+  );
+}
 
-  return <div style={{ padding: 24 }}>Ładowanie…</div>;
+export default function Page() {
+  return (
+    <Suspense fallback={<div>Ładowanie...</div>}>
+      <SSOContent />
+    </Suspense>
+  );
 }
