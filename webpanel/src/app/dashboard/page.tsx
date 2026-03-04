@@ -11,7 +11,7 @@ import { Tile } from "../../components/Tile";
 import { IconSpreadsheet, IconBuilding, IconHome, IconReceipt, IconCoins, IconShield } from "../../components/icons";
 
 export default function DashboardPage() {
-  const { profile } = useAuth();
+  const { profile, user } = useAuth();
   const communityId = profile?.communityId || "";
   const role = String(profile?.role || "");
 
@@ -73,7 +73,7 @@ export default function DashboardPage() {
           </div>
           {!communityId && (
             <p style={{ marginTop: 10, color: "var(--muted)" }}>
-              Brak communityId w profilu – uzupełnij w Firestore users/{profile?.uid ?? ""}.
+              Brak communityId w profilu – uzupełnij w Firestore users/{user?.uid ?? ""}.
             </p>
           )}
         </div>
