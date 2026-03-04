@@ -33,7 +33,7 @@ export default function DashboardPage() {
   const genJoinCode = async () => {
     if (!communityId) return;
     const res = await callable("createJoinCode")({ communityId, role: "ACCOUNTANT" });
-    setJoinCode(String(res?.code || res?.data?.code || ""));
+    setJoinCode(String(res?.data?.code ?? ""));
   };
 
   const saveKsefCfg = async () => {
