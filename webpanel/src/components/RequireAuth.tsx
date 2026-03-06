@@ -22,22 +22,21 @@ export function RequireAuth({ children, roles }: { children: React.ReactNode; ro
     const role = String(profile?.role || "");
     if (!roles.includes(role)) {
       return (
-        <div className="accessWrap">
-          <div className="card accessCard">
-            <h2>Brak uprawnień</h2>
-            <p>Ta część systemu jest dostępna tylko dla administratorów webpanelu.</p>
-            <p>Twoja rola: <strong>{role || "?"}</strong></p>
-            <div className="formRow">
-              <button
-                className="btn"
-                onClick={async () => {
-                  await signOut(auth);
-                  router.replace("/login");
-                }}
-              >
-                Wyloguj
-              </button>
-            </div>
+        <div style={{ padding: 24, display: "grid", gap: 12, maxWidth: 560 }}>
+          <h2 style={{ margin: 0 }}>Brak uprawnień</h2>
+          <p style={{ margin: 0, opacity: 0.8 }}>
+            Ta część webpanelu jest dostępna tylko dla ról administracyjnych. Aktualna rola: {role || "?"}.
+          </p>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <button
+              className="btn"
+              onClick={async () => {
+                await signOut(auth);
+                router.replace("/login");
+              }}
+            >
+              Wyloguj
+            </button>
           </div>
         </div>
       );

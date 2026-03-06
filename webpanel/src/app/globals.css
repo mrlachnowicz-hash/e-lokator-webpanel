@@ -158,16 +158,16 @@ a{ color:inherit; text-decoration:none; }
 }
 
 .input, .select{
-  height:42px;
   width:100%;
+  min-width:0;
   max-width:100%;
+  height:42px;
   padding:0 12px;
   border-radius: 14px;
   border:1px solid rgba(234,242,255,.18);
   background: rgba(0,0,0,.25);
   color: var(--text);
   outline:none;
-  min-width: 0;
 }
 .input::placeholder{ color: rgba(157,179,211,.65); }
 .input:focus, .select:focus{
@@ -202,17 +202,4 @@ a{ color:inherit; text-decoration:none; }
 .loading{
   padding:24px;
   color:var(--muted);
-}
-
-
-.accessWrap{
-  min-height:100vh;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  padding:24px;
-}
-
-.accessCard{
-  width:min(100%, 520px);
 }

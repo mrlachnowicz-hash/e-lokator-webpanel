@@ -124,9 +124,7 @@ export default function InvoicesPage() {
                   title: form.title,
                   period: form.period,
                   category: form.category,
-                  totalGrossCents: Math.round(
-                    Number((form.totalGross || "0").replace(",", ".")) * 100
-                  ),
+                  totalGrossCents: Math.round(Number((form.totalGross || "0").replace(",", ".")) * 100),
                   currency: "PLN",
                   status: "NOWA",
                   source: "MANUAL",

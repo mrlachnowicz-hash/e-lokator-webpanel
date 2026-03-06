@@ -2,12 +2,10 @@
 
 import Link from "next/link";
 import { signOut } from "firebase/auth";
-import { useRouter } from "next/navigation";
 import { auth } from "../lib/firebase";
 import { useAuth } from "../lib/authContext";
 
 export function Nav() {
-  const router = useRouter();
   const { profile } = useAuth();
   const role = profile?.role || "";
   const comm = profile?.communityId || "";
@@ -29,13 +27,7 @@ export function Nav() {
         <Link href="/charges">Naliczania</Link>
         <Link href="/payments">Przelewy</Link>
         <Link href="/review">Review</Link>
-        <button
-          className="btnGhost"
-          onClick={async () => {
-            await signOut(auth);
-            router.replace("/login");
-          }}
-        >
+        <button className="btnGhost" onClick={() => signOut(auth)}>
           Wyloguj
         </button>
       </div>
