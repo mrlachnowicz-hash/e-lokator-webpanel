@@ -13,8 +13,9 @@ type Invoice = any;
 const formGridStyle: React.CSSProperties = {
   display: "grid",
   gap: 10,
-  gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+  gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
   alignItems: "stretch",
+  minWidth: 0,
 };
 
 const actionRowStyle: React.CSSProperties = {
@@ -29,6 +30,13 @@ const cardHeaderStyle: React.CSSProperties = {
   flexWrap: "wrap",
   gap: 12,
   alignItems: "center",
+  minWidth: 0,
+};
+
+const fieldStyle: React.CSSProperties = {
+  width: "100%",
+  minWidth: 0,
+  boxSizing: "border-box",
 };
 
 export default function InvoicesPage() {
@@ -57,39 +65,44 @@ export default function InvoicesPage() {
   return (
     <RequireAuth roles={["MASTER", "ADMIN", "ACCOUNTANT"]}>
       <Nav />
-      <div style={{ padding: 24, display: "grid", gap: 16 }}>
+      <div style={{ padding: 24, display: "grid", gap: 16, minWidth: 0 }}>
         <h2>Faktury</h2>
 
-        <div className="card" style={{ display: "grid", gap: 12 }}>
+        <div className="card" style={{ display: "grid", gap: 12, minWidth: 0 }}>
           <h3>Dodaj ręcznie</h3>
 
           <div style={formGridStyle}>
             <input
               className="input"
+              style={fieldStyle}
               placeholder="Dostawca"
               value={form.vendorName}
               onChange={(e) => setForm({ ...form, vendorName: e.target.value })}
             />
             <input
               className="input"
+              style={fieldStyle}
               placeholder="Tytuł"
               value={form.title}
               onChange={(e) => setForm({ ...form, title: e.target.value })}
             />
             <input
               className="input"
+              style={fieldStyle}
               placeholder="YYYY-MM"
               value={form.period}
               onChange={(e) => setForm({ ...form, period: e.target.value })}
             />
             <input
               className="input"
+              style={fieldStyle}
               placeholder="Kwota brutto"
               value={form.totalGross}
               onChange={(e) => setForm({ ...form, totalGross: e.target.value })}
             />
             <select
               className="select"
+              style={fieldStyle}
               value={form.category}
               onChange={(e) => setForm({ ...form, category: e.target.value })}
             >
@@ -112,7 +125,7 @@ export default function InvoicesPage() {
                   period: form.period,
                   category: form.category,
                   totalGrossCents: Math.round(
-                    Number(form.totalGross.replace(",", ".")) * 100
+                    Number((form.totalGross || "0").replace(",", ".")) * 100
                   ),
                   currency: "PLN",
                   status: "NOWA",
@@ -120,7 +133,12 @@ export default function InvoicesPage() {
                   createdAtMs: Date.now(),
                   updatedAtMs: Date.now(),
                 });
-                setForm({ ...form, vendorName: "", title: "", totalGross: "" });
+                setForm({
+                  ...form,
+                  vendorName: "",
+                  title: "",
+                  totalGross: "",
+                });
               }}
             >
               Dodaj fakturę
@@ -140,7 +158,7 @@ export default function InvoicesPage() {
           </div>
         </div>
 
-        <div style={{ display: "grid", gap: 12 }}>
+        <div style={{ display: "grid", gap: 12, minWidth: 0 }}>
           {items.map((inv) => (
             <InvoiceCard key={inv.id} inv={inv} communityId={communityId} />
           ))}
@@ -164,7 +182,7 @@ function InvoiceCard({ inv, communityId }: { inv: Invoice; communityId: string }
   const showFlatId = scope === "FLAT";
 
   return (
-    <div className="card" style={{ display: "grid", gap: 10 }}>
+    <div className="card" style={{ display: "grid", gap: 10, minWidth: 0 }}>
       <div style={cardHeaderStyle}>
         <strong>{inv.vendorName || "Faktura"}</strong>
         <span>{inv.title || inv.id}</span>
@@ -173,9 +191,20 @@ function InvoiceCard({ inv, communityId }: { inv: Invoice; communityId: string }
       </div>
 
       <div style={formGridStyle}>
-        <input className="input" value={period} onChange={(e) => setPeriod(e.target.value)} />
+        <input
+          className="input"
+          style={fieldStyle}
+          value={period}
+          onChange={(e) => setPeriod(e.target.value)}
+          placeholder="YYYY-MM"
+        />
 
-        <select className="select" value={category} onChange={(e) => setCategory(e.target.value)}>
+        <select
+          className="select"
+          style={fieldStyle}
+          value={category}
+          onChange={(e) => setCategory(e.target.value)}
+        >
           <option value="PRAD">PRĄD</option>
           <option value="WODA">WODA</option>
           <option value="GAZ">GAZ</option>
@@ -184,7 +213,12 @@ function InvoiceCard({ inv, communityId }: { inv: Invoice; communityId: string }
           <option value="INNE">INNE</option>
         </select>
 
-        <select className="select" value={scope} onChange={(e) => setScope(e.target.value)}>
+        <select
+          className="select"
+          style={fieldStyle}
+          value={scope}
+          onChange={(e) => setScope(e.target.value)}
+        >
           <option value="COMMON">Części wspólne</option>
           <option value="FLAT">Konkretny lokal</option>
         </select>
@@ -192,6 +226,7 @@ function InvoiceCard({ inv, communityId }: { inv: Invoice; communityId: string }
         {showBuildingId ? (
           <input
             className="input"
+            style={fieldStyle}
             placeholder="buildingId"
             value={buildingId}
             onChange={(e) => setBuildingId(e.target.value)}
@@ -201,6 +236,7 @@ function InvoiceCard({ inv, communityId }: { inv: Invoice; communityId: string }
         {showFlatId ? (
           <input
             className="input"
+            style={fieldStyle}
             placeholder="flatId"
             value={flatId}
             onChange={(e) => setFlatId(e.target.value)}
@@ -251,8 +287,8 @@ function InvoiceCard({ inv, communityId }: { inv: Invoice; communityId: string }
         <pre
           style={{
             whiteSpace: "pre-wrap",
-            margin: 0,
             overflowX: "auto",
+            margin: 0,
           }}
         >
           {JSON.stringify(inv.ai.suggestion, null, 2)}
