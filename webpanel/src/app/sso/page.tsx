@@ -9,52 +9,35 @@ function SsoInner() {
   const params = useSearchParams();
   const router = useRouter();
   const token = params.get("token") || "";
-  const [status, setStatus] = useState<"INIT" | "OK" | "ERR">("INIT");
-  const [message, setMessage] = useState<string>("");
+  const [message, setMessage] = useState("Ładowanie...");
 
   useEffect(() => {
-    let cancelled = false;
+    let active = true;
     (async () => {
       try {
-        if (!token) {
-          setStatus("ERR");
-          setMessage("Brak tokenu SSO.");
-          return;
-        }
-        await signInWithCustomToken(auth, token);
-        if (cancelled) return;
-        setStatus("OK");
-        setMessage("Zalogowano. Przekierowanie…");
-        router.replace("/payments");
+        if (!token) throw new Error("Brak tokenu SSO.");
+        const res = await fetch("/api/sso/consume", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        await signInWithCustomToken(auth, data.customToken);
+        if (!active) return;
+        setMessage("Zalogowano. Przekierowanie...");
+        router.replace(data.target || "/payments");
       } catch (e: any) {
-        if (cancelled) return;
-        setStatus("ERR");
-        setMessage(e?.message ?? String(e));
+        if (!active) return;
+        setMessage(`Błąd SSO: ${e?.message || String(e)}`);
       }
     })();
-    return () => {
-      cancelled = true;
-    };
-  }, [token, router]);
+    return () => { active = false; };
+  }, [router, token]);
 
-  return (
-    <div style={{ padding: 24 }}>
-      <h2>SSO</h2>
-      {status === "INIT" && <p>Ładowanie…</p>}
-      {status === "OK" && <p>{message}</p>}
-      {status === "ERR" && (
-        <p style={{ color: "#ff6b6b" }}>
-          Błąd SSO: {message || "Nieznany błąd"}
-        </p>
-      )}
-    </div>
-  );
+  return <div style={{ padding: 24 }}>{message}</div>;
 }
 
 export default function SsoPage() {
-  return (
-    <Suspense fallback={<div style={{ padding: 24 }}>Ładowanie…</div>}>
-      <SsoInner />
-    </Suspense>
-  );
+  return <Suspense fallback={<div style={{ padding: 24 }}>Ładowanie...</div>}><SsoInner /></Suspense>;
 }

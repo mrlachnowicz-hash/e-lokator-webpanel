@@ -10,6 +10,9 @@ export type UserProfile = {
   communityId?: string;
   customerId?: string;
   displayName?: string;
+  flatId?: string;
+  flatLabel?: string;
+  paymentsUrl?: string;
 };
 
 type AuthCtx = {

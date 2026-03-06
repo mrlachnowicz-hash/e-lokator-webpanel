@@ -1,15 +1,14 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
-import { writeBatch, collection, doc } from "firebase/firestore";
+import { addDoc, collection, doc, getDocs, query, setDoc, where, writeBatch } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
 
 type Row = {
-  building?: string;
   flatNumber?: string;
   name?: string;
   surname?: string;
@@ -18,140 +17,139 @@ type Row = {
   areaM2?: number;
 };
 
+type Building = { id: string; label: string };
+
 function normalizeRow(r: any): Row {
-  const building = String(r.building ?? r.BUILDING ?? r.budynek ?? "").trim();
-  const flatNumber = String(r.flatNumber ?? r.flatnumber ?? r.nr ?? r.flat ?? r.lokal ?? r.flatno ?? "").trim();
-  const name = String(r.name ?? r.imie ?? "").trim();
-  const surname = String(r.surname ?? r.nazwisko ?? "").trim();
-  const email = String(r.email ?? "").trim();
-  const phone = String(r.phone ?? r.tel ?? r.telefon ?? "").trim();
-  const areaM2 = r.areaM2 ?? r.area ?? r.metraz ?? r.m2;
-  return { building, flatNumber, name, surname, email, phone, areaM2: areaM2 ? Number(areaM2) : undefined };
+  const val = (keys: string[]) => keys.map((k) => r[k]).find((v) => v != null && String(v).trim() !== "") ?? "";
+  return {
+    flatNumber: String(val(["flatNumber", "flatnumber", "nr", "lokal", "flat", "mieszkanie"])).trim(),
+    name: String(val(["name", "imie", "imię"])).trim(),
+    surname: String(val(["surname", "nazwisko"])).trim(),
+    email: String(val(["email", "mail"])).trim(),
+    phone: String(val(["phone", "telefon", "tel"])).trim(),
+    areaM2: val(["areaM2", "metraz", "metraż", "m2", "area"]) ? Number(val(["areaM2", "metraz", "metraż", "m2", "area"])) : undefined,
+  };
 }
 
 export default function ImportPage() {
   const { profile } = useAuth();
   const communityId = profile?.communityId || "";
-  const role = String(profile?.role || "");
-  const canImport = useMemo(() => ["MASTER", "ADMIN", "ACCOUNTANT"].includes(role), [role]);
-
+  const [buildings, setBuildings] = useState<Building[]>([]);
+  const [buildingId, setBuildingId] = useState("");
   const [rows, setRows] = useState<Row[]>([]);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!communityId) return;
+    (async () => {
+      const snap = await getDocs(collection(db, "communities", communityId, "buildings"));
+      const list = snap.docs.map((d) => ({ id: d.id, label: String(d.data().label || d.data().name || d.id) }));
+      setBuildings(list);
+      if (!buildingId && list[0]) setBuildingId(list[0].id);
+    })();
+  }, [communityId, buildingId]);
+
+  const preview = useMemo(() => rows.slice(0, 8), [rows]);
+
   return (
     <RequireAuth roles={["MASTER", "ADMIN", "ACCOUNTANT"]}>
       <Nav />
-      <div style={{ padding: 24, display: "grid", gap: 16, maxWidth: 1000 }}>
-        <h2>Import lokali (CSV / XLSX)</h2>
-        <p style={{ opacity: 0.75 }}>
-          Minimalne kolumny: <code>building</code>, <code>flatNumber</code>, <code>name</code>, <code>surname</code>, <code>email</code>, <code>phone</code>.
-        </p>
+      <div style={{ padding: 24, display: "grid", gap: 16, maxWidth: 1100 }}>
+        <h2>Import lokali</h2>
+        <p style={{ opacity: 0.75 }}>Webpanel nie tworzy ulic ani budynków. Wybierz istniejący budynek z aplikacji i zaimportuj lokale oraz payerów.</p>
+        <div className="formRow">
+          <select className="select" value={buildingId} onChange={(e) => setBuildingId(e.target.value)}>
+            <option value="">Wybierz budynek</option>
+            {buildings.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
+          </select>
+          <input
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              const data = await file.arrayBuffer();
+              const wb = XLSX.read(data);
+              const ws = wb.Sheets[wb.SheetNames[0]!];
+              const json = XLSX.utils.sheet_to_json(ws, { defval: "" });
+              setRows((json as any[]).map(normalizeRow).filter((r) => !!r.flatNumber));
+            }}
+          />
+        </div>
 
-        <input
-          type="file"
-          accept=".csv,.xlsx,.xls"
-          onChange={async (e) => {
-            setMsg(null);
-            setErr(null);
-            const file = e.target.files?.[0];
-            if (!file) return;
-            const data = await file.arrayBuffer();
-            const wb = XLSX.read(data);
-            const ws = wb.Sheets[wb.SheetNames[0]!];
-            const json = XLSX.utils.sheet_to_json(ws, { defval: "" });
-            const parsed = (json as any[]).map(normalizeRow).filter(r => !!r.flatNumber);
-            setRows(parsed);
-          }}
-        />
-
-        <div style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 16 }}>
-          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <b>Wierszy:</b> {rows.length}
-            <div style={{ flex: 1 }} />
-            {canImport && (
-              <button
-                onClick={async () => {
-                  setMsg(null);
-                  setErr(null);
-                  try {
-                    if (!communityId) throw new Error("Brak communityId");
-                    if (rows.length === 0) throw new Error("Brak danych");
-
-                    // Firestore batch limit 500
-                    const chunks: Row[][] = [];
-                    for (let i = 0; i < rows.length; i += 400) chunks.push(rows.slice(i, i + 400));
-
-                    let created = 0;
-                    for (const chunk of chunks) {
-                      const batch = writeBatch(db);
-                      for (const r of chunk) {
-                        const ref = doc(collection(db, "communities", communityId, "flats"));
-                        batch.set(ref, {
-                          building: r.building || "",
-                          flatNumber: r.flatNumber || "",
-                          name: r.name || "",
-                          surname: r.surname || "",
-                          email: r.email || "",
-                          phone: r.phone || "",
-                          areaM2: r.areaM2 ?? null,
-                          createdAtMs: Date.now(),
-                          seatUsed: true,
-                          payer: {
-                            name: r.name || "",
-                            surname: r.surname || "",
-                            email: r.email || "",
-                            phone: r.phone || "",
-                            uid: null,
-                            mode: r.email ? "MAIL" : "OFFLINE"
-                          }
-                        });
-                        created++;
-                      }
-                      await batch.commit();
-                    }
-                    setMsg(`Import OK: utworzono ${created} lokali.`);
-                  } catch (e: any) {
-                    setErr(e?.message || "Błąd importu");
-                  }
-                }}
-              >
-                Importuj do Firestore
-              </button>
-            )}
+        {preview.length > 0 && (
+          <div className="card">
+            <h3>Podgląd</h3>
+            <div style={{ display: "grid", gap: 8 }}>
+              {preview.map((r, idx) => <div key={idx}>{r.flatNumber} — {r.name} {r.surname} — {r.email || "brak email"}</div>)}
+            </div>
           </div>
-          {msg && <div style={{ color: "green", marginTop: 10 }}>{msg}</div>}
-          {err && <div style={{ color: "crimson", marginTop: 10 }}>{err}</div>}
-        </div>
+        )}
 
-        <div style={{ maxHeight: 360, overflow: "auto", border: "1px solid #eee", borderRadius: 12 }}>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>building</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>flatNumber</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>name</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>surname</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>email</th>
-                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>phone</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.slice(0, 200).map((r, idx) => (
-                <tr key={idx}>
-                  <td style={{ padding: 8, borderBottom: "1px solid #f3f3f3" }}>{r.building}</td>
-                  <td style={{ padding: 8, borderBottom: "1px solid #f3f3f3" }}>{r.flatNumber}</td>
-                  <td style={{ padding: 8, borderBottom: "1px solid #f3f3f3" }}>{r.name}</td>
-                  <td style={{ padding: 8, borderBottom: "1px solid #f3f3f3" }}>{r.surname}</td>
-                  <td style={{ padding: 8, borderBottom: "1px solid #f3f3f3" }}>{r.email}</td>
-                  <td style={{ padding: 8, borderBottom: "1px solid #f3f3f3" }}>{r.phone}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <div style={{ opacity: 0.65 }}>
-          Podgląd pokazuje max 200 wierszy.
+        <div className="card">
+          <div className="formRow">
+            <strong>Wierszy: {rows.length}</strong>
+            <button
+              className="btn"
+              disabled={!communityId || !buildingId || rows.length === 0}
+              onClick={async () => {
+                setMsg(null); setErr(null);
+                try {
+                  const existingSnap = await getDocs(query(collection(db, "communities", communityId, "flats"), where("buildingId", "==", buildingId)));
+                  const existingByFlat = new Map(existingSnap.docs.map((d) => [String(d.data().flatNumber || ""), d]));
+                  const batch = writeBatch(db);
+                  let created = 0;
+                  let updated = 0;
+                  for (const row of rows) {
+                    const flatNumber = String(row.flatNumber || "").trim();
+                    if (!flatNumber) continue;
+                    const existing = existingByFlat.get(flatNumber);
+                    const flatRef = existing ? doc(db, "communities", communityId, "flats", existing.id) : doc(collection(db, "communities", communityId, "flats"));
+                    batch.set(flatRef, {
+                      buildingId,
+                      flatNumber,
+                      name: row.name || "",
+                      surname: row.surname || "",
+                      email: row.email || "",
+                      phone: row.phone || "",
+                      areaM2: row.areaM2 ?? null,
+                      updatedAtMs: Date.now(),
+                      createdAtMs: existing?.data()?.createdAtMs || Date.now(),
+                    }, { merge: true });
+                    const payerRef = existing ? doc(db, "communities", communityId, "payers", existing.id) : doc(db, "communities", communityId, "payers", flatRef.id);
+                    batch.set(payerRef, {
+                      flatId: flatRef.id,
+                      buildingId,
+                      flatNumber,
+                      name: row.name || "",
+                      surname: row.surname || "",
+                      email: row.email || "",
+                      phone: row.phone || "",
+                      mailOnly: !!row.email,
+                      updatedAtMs: Date.now(),
+                      createdAtMs: existing?.data()?.createdAtMs || Date.now(),
+                    }, { merge: true });
+                    if (existing) updated += 1; else created += 1;
+                  }
+                  await batch.commit();
+                  await addDoc(collection(db, "communities", communityId, "auditLogs"), {
+                    type: "IMPORT_FLATS",
+                    buildingId,
+                    rows: rows.length,
+                    created,
+                    updated,
+                    createdAtMs: Date.now(),
+                  });
+                  setMsg(`Import zakończony. Utworzono: ${created}, zaktualizowano: ${updated}.`);
+                } catch (e: any) {
+                  setErr(e?.message || "Błąd importu");
+                }
+              }}
+            >Uruchom import</button>
+          </div>
+          {msg ? <div style={{ color: "green" }}>{msg}</div> : null}
+          {err ? <div style={{ color: "crimson" }}>{err}</div> : null}
         </div>
       </div>
     </RequireAuth>

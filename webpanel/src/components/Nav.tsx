@@ -19,11 +19,14 @@ export function Nav() {
       </div>
 
       <div className="navLinks">
-        <Link href="/import">Import</Link>
+        <Link href="/dashboard">Panel</Link>
+        <Link href="/import">Import lokali</Link>
         <Link href="/buildings">Budynki</Link>
         <Link href="/flats">Lokale</Link>
-        <Link href="/invoices">Faktury (KSeF)</Link>
+        <Link href="/invoices">Faktury</Link>
         <Link href="/charges">Naliczania</Link>
+        <Link href="/payments">Przelewy</Link>
+        <Link href="/review">Review</Link>
         <button className="btnGhost" onClick={() => signOut(auth)}>
           Wyloguj
         </button>

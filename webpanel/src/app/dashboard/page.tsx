@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { doc, setDoc } from "firebase/firestore";
+import { useEffect, useMemo, useState } from "react";
+import { collection, doc, getCountFromServer, getDoc, setDoc } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
@@ -11,95 +11,86 @@ import { Tile } from "../../components/Tile";
 import { IconSpreadsheet, IconBuilding, IconHome, IconReceipt, IconCoins, IconShield } from "../../components/icons";
 
 export default function DashboardPage() {
-  const { profile, user } = useAuth();
+  const { profile } = useAuth();
   const communityId = profile?.communityId || "";
   const role = String(profile?.role || "");
-
   const [paymentsUrl, setPaymentsUrl] = useState("");
-  const [ksefMode, setKsefMode] = useState<"MOCK" | "REAL">("MOCK");
-  const [ksefId, setKsefId] = useState("");
-  const [joinCode, setJoinCode] = useState<string>("");
+  const [joinCode, setJoinCode] = useState("");
+  const [stats, setStats] = useState({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0 });
+
+  useEffect(() => {
+    if (!communityId) return;
+    (async () => {
+      const communitySnap = await getDoc(doc(db, "communities", communityId));
+      setPaymentsUrl(String(communitySnap.data()?.paymentsUrl || ""));
+      const [flats, invoices, settlements, review] = await Promise.all([
+        getCountFromServer(collection(db, "communities", communityId, "flats")),
+        getCountFromServer(collection(db, "communities", communityId, "invoices")),
+        getCountFromServer(collection(db, "communities", communityId, "settlements")),
+        getCountFromServer(collection(db, "communities", communityId, "reviewQueue")),
+      ]);
+      setStats({
+        flats: Number(flats.data().count || 0),
+        invoices: Number(invoices.data().count || 0),
+        settlements: Number(settlements.data().count || 0),
+        review: Number(review.data().count || 0),
+        unmatchedPayments: 0,
+      });
+    })();
+  }, [communityId]);
 
   const savePaymentsUrl = async () => {
     if (!communityId) return;
-    await setDoc(
-      doc(db, "communities", communityId),
-      { paymentsUrl },
-      { merge: true }
-    );
-    alert("Zapisano paymentsUrl.");
+    await setDoc(doc(db, "communities", communityId), { paymentsUrl, updatedAtMs: Date.now() }, { merge: true });
+    alert("Zapisano adres panelu płatności / SSO.");
   };
 
   const genJoinCode = async () => {
     if (!communityId) return;
     const res = await callable("createJoinCode")({ communityId, role: "ACCOUNTANT" });
-    setJoinCode(String(res?.data?.code ?? ""));
+    setJoinCode(String((res as any)?.data?.code || ""));
   };
 
-  const saveKsefCfg = async () => {
-    if (!communityId) return;
-    await setDoc(
-      doc(db, "communities", communityId),
-      { ksef: { mode: ksefMode, ident: ksefId } },
-      { merge: true }
-    );
-    alert("Zapisano konfigurację KSeF.");
-  };
+  const cards = useMemo(() => [
+    { href: "/import", icon: <IconSpreadsheet />, title: "Import lokali", desc: "CSV/XLSX → flats + payers" },
+    { href: "/buildings", icon: <IconBuilding />, title: "Budynki", desc: "Budynki utworzone przez aplikację" },
+    { href: "/flats", icon: <IconHome />, title: "Lokale", desc: "Lokal jako jednostka rozliczeniowa" },
+    { href: "/invoices", icon: <IconReceipt />, title: "Faktury", desc: "Import, parse, review, approve" },
+    { href: "/charges", icon: <IconCoins />, title: "Rozliczenia", desc: "Charges, settlements, balances" },
+    { href: "/payments", icon: <IconShield />, title: "Przelewy", desc: "Import CSV/XLSX i dopasowanie po EL-xxx" },
+  ], []);
 
   return (
     <RequireAuth roles={["MASTER", "ADMIN", "ACCOUNTANT"]}>
       <Nav />
+      <div className="sectionTitle">Panel rozliczeń</div>
+      <div className="grid">{cards.map((x) => <Tile key={x.href} {...x} />)}</div>
 
-      <div className="sectionTitle">Panel</div>
-
+      <div className="sectionTitle">Statystyki</div>
       <div className="grid">
-        <Tile href="/import" icon={<IconSpreadsheet />} title="Import lokali" desc="CSV/XLSX → flats + payer (mail-only) + zajęcie seats." />
-        <Tile href="/buildings" icon={<IconBuilding />} title="Budynki" desc="Lista i edycja budynków we wspólnocie." />
-        <Tile href="/flats" icon={<IconHome />} title="Lokale" desc="Podgląd lokali, payerów, metraż, dane kontaktowe." />
-        <Tile href="/invoices" icon={<IconReceipt />} title="Faktury (KSeF)" desc="Statusy + ręczne przypisanie + sugestie AI." />
-        <Tile href="/charges" icon={<IconCoins />} title="Naliczania" desc="Charges per flatId, okresy, salda i historia." />
-        <Tile href="/payments" icon={<IconShield />} title="Płatności / SSO" desc="Panel płatności (WebView + token SSO)." />
+        <div className="card"><h3>Lokale</h3><p>{stats.flats}</p></div>
+        <div className="card"><h3>Faktury</h3><p>{stats.invoices}</p></div>
+        <div className="card"><h3>Rozliczenia</h3><p>{stats.settlements}</p></div>
+        <div className="card"><h3>Review queue</h3><p>{stats.review}</p></div>
       </div>
 
       <div className="sectionTitle">Konfiguracja</div>
-
-      <div style={{ display: "grid", gap: 16, maxWidth: 980 }}>
+      <div style={{ display: "grid", gap: 16, maxWidth: 960 }}>
         <div className="card">
-          <h3>SSO / Płatności</h3>
-          <p>Aplikacja Android czyta <code>communities/{communityId || "..."}/paymentsUrl</code> i otwiera WebView.</p>
+          <h3>Adres webpanelu / SSO</h3>
+          <p>Aplikacja może otwierać webpanel przez <code>createWebSession</code> i ekran <code>/sso?token=...</code>.</p>
           <div className="formRow">
-            <input className="input" placeholder="np. https://panel.e-lokator.org/sso" value={paymentsUrl} onChange={(e) => setPaymentsUrl(e.target.value)} />
+            <input className="input" value={paymentsUrl} onChange={(e) => setPaymentsUrl(e.target.value)} placeholder="https://twoj-panel.vercel.app" />
             <button className="btn" onClick={savePaymentsUrl} disabled={!communityId}>Zapisz</button>
           </div>
-          {!communityId && (
-            <p style={{ marginTop: 10, color: "var(--muted)" }}>
-              Brak communityId w profilu – uzupełnij w Firestore users/{user?.uid ?? ""}.
-            </p>
-          )}
         </div>
-
         {(role === "MASTER" || role === "ADMIN") && (
           <div className="card">
-            <h3>Kod rejestracji księgowej</h3>
-            <p>Wygeneruj kod (join code) i przekaż księgowej. Księgowa rejestruje się w panelu.</p>
+            <h3>Kod dla księgowej</h3>
+            <p>Jednorazowy kod rejestracyjny do podpięcia roli ACCOUNTANT do tej wspólnoty.</p>
             <div className="formRow">
               <button className="btn" onClick={genJoinCode} disabled={!communityId}>Generuj kod</button>
-              {joinCode && <span style={{ fontWeight: 900, letterSpacing: 1 }}>{joinCode}</span>}
-            </div>
-          </div>
-        )}
-
-        {(role === "MASTER" || role === "ADMIN" || role === "ACCOUNTANT") && (
-          <div className="card">
-            <h3>KSeF – konfiguracja (MVP)</h3>
-            <p>Na MVP tryb MOCK generuje przykładowe faktury. Tryb REAL to TODO (tokeny KSeF).</p>
-            <div className="formRow">
-              <select className="select" value={ksefMode} onChange={(e) => setKsefMode(e.target.value as any)}>
-                <option value="MOCK">MOCK</option>
-                <option value="REAL">REAL (TODO)</option>
-              </select>
-              <input className="input" placeholder="Identyfikator (np. NIP wspólnoty)" value={ksefId} onChange={(e) => setKsefId(e.target.value)} />
-              <button className="btn" onClick={saveKsefCfg} disabled={!communityId}>Zapisz</button>
+              {joinCode ? <strong>{joinCode}</strong> : null}
             </div>
           </div>
         )}
