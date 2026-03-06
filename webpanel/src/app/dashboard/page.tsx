@@ -15,7 +15,6 @@ export default function DashboardPage() {
   const communityId = profile?.communityId || "";
   const role = String(profile?.role || "");
   const [webpanelUrl, setWebpanelUrl] = useState("");
-  const [legacyPaymentsUrl, setLegacyPaymentsUrl] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [stats, setStats] = useState({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0 });
 
@@ -23,8 +22,7 @@ export default function DashboardPage() {
     if (!communityId) return;
     (async () => {
       const communitySnap = await getDoc(doc(db, "communities", communityId));
-      setWebpanelUrl(String(communitySnap.data()?.webpanelUrl || ""));
-      setLegacyPaymentsUrl(String(communitySnap.data()?.paymentsUrl || ""));
+      setWebpanelUrl(String(communitySnap.data()?.webpanelUrl || communitySnap.data()?.paymentsUrl || ""));
       const [flats, invoices, settlements, review] = await Promise.all([
         getCountFromServer(collection(db, "communities", communityId, "flats")),
         getCountFromServer(collection(db, "communities", communityId, "invoices")),
@@ -41,7 +39,7 @@ export default function DashboardPage() {
     })();
   }, [communityId]);
 
-  const savePaymentsUrl = async () => {
+  const saveWebpanelUrl = async () => {
     if (!communityId) return;
     await setDoc(doc(db, "communities", communityId), { webpanelUrl, updatedAtMs: Date.now() }, { merge: true });
     alert("Zapisano adres webpanelu / SSO.");
@@ -80,12 +78,11 @@ export default function DashboardPage() {
       <div style={{ display: "grid", gap: 16, maxWidth: 960 }}>
         <div className="card">
           <h3>Adres webpanelu / SSO</h3>
-          <p>Aplikacja może otwierać webpanel przez <code>createWebSession</code> i ekran <code>/sso?token=...</code>. To pole używa nowego klucza <code>webpanelUrl</code>, żeby nie nadpisywać starych linków z innych systemów.</p>
+          <p>Aplikacja może otwierać webpanel przez <code>createWebSession</code> i ekran <code>/sso?token=...</code>.</p>
           <div className="formRow">
-            <input className="input" value={webpanelUrl} onChange={(e) => setWebpanelUrl(e.target.value)} placeholder="https://panel.e-lokator.org" />
-            <button className="btn" onClick={savePaymentsUrl} disabled={!communityId}>Zapisz</button>
+            <input className="input" value={webpanelUrl} onChange={(e) => setWebpanelUrl(e.target.value)} placeholder="https://twoj-panel.vercel.app" />
+            <button className="btn" onClick={saveWebpanelUrl} disabled={!communityId}>Zapisz</button>
           </div>
-          {legacyPaymentsUrl ? <p style={{ opacity: 0.7 }}>Legacy paymentsUrl w bazie: {legacyPaymentsUrl}</p> : null}
         </div>
         {(role === "MASTER" || role === "ADMIN") && (
           <div className="card">
