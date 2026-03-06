@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { addDoc, collection, doc, onSnapshot, orderBy, query, setDoc } from "firebase/firestore";
+import { collection, doc, getDocs, onSnapshot, query, setDoc, where, writeBatch } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
@@ -9,15 +9,24 @@ import { db } from "../../lib/firebase";
 
 type Flat = {
   id: string;
-  buildingId?: string;
-  building?: string;
-  flatNumber?: string;
-  name?: string;
-  surname?: string;
+  street?: string;
+  buildingNo?: string;
+  apartmentNo?: string;
+  flatLabel?: string;
+  flatKey?: string;
+  status?: string;
+  residentUid?: string | null;
+  createdAtMs?: number;
+  updatedAtMs?: number;
+};
+
+type Resident = {
+  uid: string;
+  displayName?: string;
   email?: string;
   phone?: string;
-  areaM2?: number;
-  createdAtMs?: number;
+  flatId?: string;
+  role?: string;
 };
 
 export default function FlatsPage() {
@@ -27,18 +36,84 @@ export default function FlatsPage() {
   const canEdit = useMemo(() => ["MASTER", "ADMIN", "ACCOUNTANT"].includes(role), [role]);
 
   const [items, setItems] = useState<Flat[]>([]);
-  const [flatNumber, setFlatNumber] = useState("");
-  const [building, setBuilding] = useState("");
-  const [name, setName] = useState("");
-  const [surname, setSurname] = useState("");
-  const [email, setEmail] = useState("");
-  const [phone, setPhone] = useState("");
+  const [residentsByFlat, setResidentsByFlat] = useState<Record<string, Resident[]>>({});
+  const [street, setStreet] = useState("");
+  const [buildingNo, setBuildingNo] = useState("");
+  const [apartmentNo, setApartmentNo] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     if (!communityId) return;
-    const q = query(collection(db, "communities", communityId, "flats"), orderBy("createdAtMs", "desc"));
-    return onSnapshot(q, (snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }))));
+    const unsub = onSnapshot(collection(db, "communities", communityId, "flats"), (snap) => {
+      const list = snap.docs
+        .map((d) => ({ id: d.id, ...(d.data() as any) }))
+        .sort((a: any, b: any) => {
+          const aKey = `${a.street || ""}|${a.buildingNo || ""}|${a.apartmentNo || ""}`;
+          const bKey = `${b.street || ""}|${b.buildingNo || ""}|${b.apartmentNo || ""}`;
+          return aKey.localeCompare(bKey, "pl");
+        });
+      setItems(list);
+    });
+    return unsub;
   }, [communityId]);
+
+  useEffect(() => {
+    if (!communityId) return;
+    const q = query(collection(db, "users"), where("communityId", "==", communityId), where("role", "==", "RESIDENT"));
+    return onSnapshot(q, (snap) => {
+      const grouped: Record<string, Resident[]> = {};
+      for (const d of snap.docs) {
+        const data = d.data() as any;
+        const flatId = String(data.flatId || "");
+        if (!flatId) continue;
+        (grouped[flatId] ||= []).push({
+          uid: d.id,
+          displayName: data.displayName,
+          email: data.email,
+          phone: data.phone,
+          flatId,
+          role: data.role,
+        });
+      }
+      setResidentsByFlat(grouped);
+    });
+  }, [communityId]);
+
+  const createFlat = async () => {
+    setMsg(null);
+    setErr(null);
+    try {
+      if (!communityId || !street.trim() || !buildingNo.trim() || !apartmentNo.trim()) {
+        throw new Error("Uzupełnij ulicę, numer budynku i numer lokalu.");
+      }
+      const normStreet = street.trim().toLowerCase().replace(/\s+/g, " ");
+      const flatKey = `${normStreet}|${buildingNo.trim()}|${apartmentNo.trim()}`;
+      const existing = await getDocs(query(
+        collection(db, "communities", communityId, "flats"),
+        where("flatKey", "==", flatKey)
+      ));
+      const batch = writeBatch(db);
+      const ref = existing.docs[0]?.ref ?? doc(collection(db, "communities", communityId, "flats"));
+      batch.set(ref, {
+        street: street.trim(),
+        buildingNo: buildingNo.trim(),
+        apartmentNo: apartmentNo.trim(),
+        flatLabel: apartmentNo.trim(),
+        flatKey,
+        status: existing.docs[0]?.data()?.status || "EMPTY",
+        updatedAtMs: Date.now(),
+        createdAtMs: existing.docs[0]?.data()?.createdAtMs || Date.now(),
+      }, { merge: true });
+      await batch.commit();
+      setStreet("");
+      setBuildingNo("");
+      setApartmentNo("");
+      setMsg("Lokal zapisany.");
+    } catch (e: any) {
+      setErr(e?.message || "Błąd zapisu lokalu");
+    }
+  };
 
   return (
     <RequireAuth roles={["MASTER", "ADMIN", "ACCOUNTANT"]}>
@@ -47,63 +122,44 @@ export default function FlatsPage() {
         <h2>Lokale</h2>
 
         {canEdit && (
-          <div style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 16, maxWidth: 900 }}>
+          <div className="card" style={{ maxWidth: 900 }}>
             <h3>Dodaj lokal</h3>
-            <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
-              <input placeholder="Budynek (nazwa/skrót)" value={building} onChange={(e) => setBuilding(e.target.value)} />
-              <input placeholder="Nr lokalu" value={flatNumber} onChange={(e) => setFlatNumber(e.target.value)} />
-              <input placeholder="Imię" value={name} onChange={(e) => setName(e.target.value)} />
-              <input placeholder="Nazwisko" value={surname} onChange={(e) => setSurname(e.target.value)} />
-              <input placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
-              <input placeholder="Telefon" value={phone} onChange={(e) => setPhone(e.target.value)} />
+            <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr 1fr" }}>
+              <input className="input" placeholder="Ulica" value={street} onChange={(e) => setStreet(e.target.value)} />
+              <input className="input" placeholder="Nr budynku" value={buildingNo} onChange={(e) => setBuildingNo(e.target.value)} />
+              <input className="input" placeholder="Nr lokalu" value={apartmentNo} onChange={(e) => setApartmentNo(e.target.value)} />
             </div>
-            <button
-              style={{ marginTop: 10 }}
-              onClick={async () => {
-                if (!communityId || !flatNumber.trim()) return;
-                await addDoc(collection(db, "communities", communityId, "flats"), {
-                  building: building.trim(),
-                  flatNumber: flatNumber.trim(),
-                  name: name.trim(),
-                  surname: surname.trim(),
-                  email: email.trim(),
-                  phone: phone.trim(),
-                  createdAtMs: Date.now(),
-                  seatUsed: true
-                });
-                setBuilding("");
-                setFlatNumber("");
-                setName("");
-                setSurname("");
-                setEmail("");
-                setPhone("");
-              }}
-            >
-              Zapisz
-            </button>
+            <div className="formRow" style={{ marginTop: 10 }}>
+              <button className="btn" onClick={createFlat}>Zapisz</button>
+              {msg ? <span style={{ color: "#8ef58e" }}>{msg}</span> : null}
+              {err ? <span style={{ color: "#ff9a9a" }}>{err}</span> : null}
+            </div>
           </div>
         )}
 
         <div style={{ display: "grid", gap: 10 }}>
-          {items.map((f) => (
-            <div key={f.id} style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14 }}>
-              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                <b>{f.building || ""} / {f.flatNumber || ""}</b>
-                <span style={{ opacity: 0.8 }}>{(f.name || "")} {(f.surname || "")}</span>
-                <span style={{ opacity: 0.7 }}>{f.email || ""}</span>
-                <div style={{ flex: 1 }} />
-                {canEdit && (
-                  <button
-                    onClick={async () => {
-                      await setDoc(doc(db, "communities", communityId, "flats", f.id), { updatedAtMs: Date.now() }, { merge: true });
-                    }}
-                  >
-                    Edytuj (TODO)
-                  </button>
-                )}
+          {items.length === 0 ? (
+            <div className="card">Brak lokali w tej wspólnocie.</div>
+          ) : items.map((f) => {
+            const residents = residentsByFlat[f.id] || [];
+            return (
+              <div key={f.id} className="card">
+                <div style={{ display: "grid", gap: 6 }}>
+                  <b>{f.street || "(brak ulicy)"} {f.buildingNo || ""} / {f.apartmentNo || f.flatLabel || ""}</b>
+                  <div style={{ opacity: 0.8 }}>Status: {f.status || "EMPTY"}</div>
+                  <div style={{ opacity: 0.8 }}>flatId: {f.id}</div>
+                  <div style={{ opacity: 0.8 }}>Klucz: {f.flatKey || "-"}</div>
+                  {residents.length > 0 ? (
+                    <div style={{ opacity: 0.95 }}>
+                      Lokatorzy: {residents.map((r) => r.displayName || r.email || r.uid).join(", ")}
+                    </div>
+                  ) : (
+                    <div style={{ opacity: 0.7 }}>Brak przypiętego lokatora w aplikacji.</div>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </RequireAuth>
