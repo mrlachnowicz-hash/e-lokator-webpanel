@@ -26,13 +26,15 @@ const Ctx = createContext<AuthCtx>({ user: null, profile: null, loading: true })
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [profileLoading, setProfileLoading] = useState(false);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
       setUser(u);
-      setLoading(false);
+      setAuthLoading(false);
       setProfile(null);
+      setProfileLoading(!!u);
     });
     return () => unsub();
   }, []);
@@ -42,9 +44,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const ref = doc(db, "users", user.uid);
     const unsub = onSnapshot(ref, (snap) => {
       setProfile((snap.data() || null) as any);
+      setProfileLoading(false);
+    }, () => {
+      setProfileLoading(false);
     });
     return () => unsub();
   }, [user]);
+
+  const loading = authLoading || (user ? profileLoading : false);
 
   const value = useMemo(() => ({ user, profile, loading }), [user, profile, loading]);
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

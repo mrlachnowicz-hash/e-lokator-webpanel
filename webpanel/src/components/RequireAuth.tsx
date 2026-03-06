@@ -2,7 +2,9 @@
 
 import React, { useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { signOut } from "firebase/auth";
 import { useAuth } from "../lib/authContext";
+import { auth } from "../lib/firebase";
 
 export function RequireAuth({ children, roles }: { children: React.ReactNode; roles?: string[] }) {
   const { user, profile, loading } = useAuth();
@@ -19,7 +21,26 @@ export function RequireAuth({ children, roles }: { children: React.ReactNode; ro
   if (roles && roles.length) {
     const role = String(profile?.role || "");
     if (!roles.includes(role)) {
-      return <div className="loading">Brak uprawnień (rola: {role || "?"}).</div>;
+      return (
+        <div className="accessWrap">
+          <div className="card accessCard">
+            <h2>Brak uprawnień</h2>
+            <p>Ta część systemu jest dostępna tylko dla administratorów webpanelu.</p>
+            <p>Twoja rola: <strong>{role || "?"}</strong></p>
+            <div className="formRow">
+              <button
+                className="btn"
+                onClick={async () => {
+                  await signOut(auth);
+                  router.replace("/login");
+                }}
+              >
+                Wyloguj
+              </button>
+            </div>
+          </div>
+        </div>
+      );
     }
   }
 
