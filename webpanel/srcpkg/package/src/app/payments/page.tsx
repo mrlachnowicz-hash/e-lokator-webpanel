@@ -40,7 +40,7 @@ export default function PaymentsPage() {
       <div style={{ padding: 24, display: "grid", gap: 16 }}>
         <h2>Import przelewów</h2>
         <div className="card" style={{ display: "grid", gap: 12 }}>
-          <p>System dopasowuje przelewy najpierw po kodzie <code>EL-xxx</code>, a gdy go brakuje lub jest błędny, próbuje dopasować wpłatę po numerze lokalu, nazwisku, adresie i treści przelewu. Dopiero nierozpoznane wpłaty trafiają do reviewQueue.</p>
+          <p>System dopasowuje przelewy po kodzie <code>EL-xxx</code>. Nierozpoznane przelewy trafiają do reviewQueue.</p>
           <input
             type="file"
             accept=".csv,.xlsx,.xls"
@@ -68,7 +68,6 @@ export default function PaymentsPage() {
               <span>{p.title || p.source || "Wpłata"}</span>
               <span>{(Number(p.amountCents || 0) / 100).toFixed(2)} PLN</span>
               <span>{p.code || "—"}</span>
-              <span>{p.matchedBy || (p.matched ? "CODE" : "REVIEW")}</span>
             </div>
           ))}
         </div>
