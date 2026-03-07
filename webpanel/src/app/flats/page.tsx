@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   collection,
-  deleteDoc,
   doc,
   getDoc,
   onSnapshot,
@@ -144,19 +143,11 @@ export default function FlatsPage() {
       try {
         const communitySnap = await getDoc(doc(db, "communities", communityId));
         const c: any = communitySnap.data() || {};
-        const keys = ["panelSeats", "panelSeatsLimit", "seats", "seatsLimit", "totalSeats", "maxSeats", "purchasedSeats", "seatsPurchased", "flatsLimit", "localsLimit", "localiLimit", "unitsLimit", "licenses", "seatCount"];
-        let limit: number | null = null;
-        let source: string | null = null;
-        for (const key of keys) {
-          const raw = c[key];
-          const num = typeof raw === "number" ? raw : (typeof raw === "string" && raw.trim() !== "" && Number.isFinite(Number(raw)) ? Number(raw) : null);
-          if (num != null) {
-            limit = Math.max(0, Math.floor(num));
-            source = key;
-            break;
-          }
-        }
-        setSeatInfo({ limit, used: snap.size, remaining: limit == null ? null : limit - snap.size, source });
+        const limitRaw = typeof c.seatsTotal === "number" ? c.seatsTotal : (typeof c.seatsTotal === "string" && c.seatsTotal.trim() !== "" && Number.isFinite(Number(c.seatsTotal)) ? Number(c.seatsTotal) : null);
+        const usedRaw = typeof c.seatsUsed === "number" ? c.seatsUsed : (typeof c.seatsUsed === "string" && c.seatsUsed.trim() !== "" && Number.isFinite(Number(c.seatsUsed)) ? Number(c.seatsUsed) : null);
+        const limit = limitRaw == null ? null : Math.max(0, Math.floor(limitRaw));
+        const used = Math.max(usedRaw == null ? snap.size : Math.floor(usedRaw), snap.size);
+        setSeatInfo({ limit, used, remaining: limit == null ? null : limit - used, source: "seatsTotal" });
       } catch {
         setSeatInfo({ limit: null, used: snap.size, remaining: null, source: null });
       }
@@ -243,12 +234,23 @@ export default function FlatsPage() {
     setBusy(true);
     setMsg(null);
     try {
-      await Promise.all([
-        deleteDoc(doc(db, "communities", communityId, "flats", flat.id)),
-        deleteDoc(doc(db, "communities", communityId, "payers", flat.id)).catch(() => undefined),
-      ]);
+      const token = await (await import("firebase/auth")).getAuth().currentUser?.getIdToken();
+      if (!token) throw new Error("Brak aktywnej sesji Firebase.");
+      const response = await fetch("/api/remove-flat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ communityId, flatId: flat.id }),
+      });
+      const data = await response.json().catch(() => ({} as any));
+      if (!response.ok) throw new Error(data?.error || "Błąd usuwania lokalu.");
       if (form.id === flat.id) resetForm();
-      setMsg(`Usunięto lokal: ${getFlatLabel(flat)}`);
+      setSeatInfo((prev) => ({ ...prev, used: data?.seatUsed ?? prev.used, remaining: prev.limit == null ? null : prev.limit - (data?.seatUsed ?? prev.used) }));
+      setMsg(`Usunięto lokal i odpięto użytkowników: ${getFlatLabel(flat)}`);
+    } catch (e: any) {
+      setMsg(e?.message || "Błąd usuwania lokalu.");
     } finally {
       setBusy(false);
     }

@@ -145,7 +145,7 @@ export async function POST(req: NextRequest) {
       }
 
       if (!existing) {
-        const seatStateNow = getSeatState(communityData as any, flatsSnap.size + plannedCreates);
+        const seatStateNow = getSeatState({ ...(communityData as any), seatsUsed: Math.max(Number((communityData as any)?.seatsUsed || 0), flatsSnap.size + plannedCreates) }, flatsSnap.size + plannedCreates);
         if (!canCreateFlat(seatStateNow)) {
           invalid += 1;
           details.push(`Brak seats: ${street} ${buildingNo}/${apartmentNo}. Limit: ${seatStateNow.limit}, wykorzystane: ${seatStateNow.used}.`);
@@ -216,8 +216,14 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    if (plannedCreates > 0) {
+      batch.set(communityRef, {
+        seatsUsed: Math.max(Number((communityData as any)?.seatsUsed || 0), flatsSnap.size) + plannedCreates,
+        updatedAtMs: now,
+      }, { merge: true });
+    }
     await batch.commit();
-    const seatStateEnd = getSeatState(communityData as any, flatsSnap.size + plannedCreates);
+    const seatStateEnd = getSeatState({ ...(communityData as any), seatsUsed: Math.max(Number((communityData as any)?.seatsUsed || 0), flatsSnap.size) + plannedCreates }, flatsSnap.size + plannedCreates);
     return NextResponse.json({ ok: true, created, updated, skipped, invalid, duplicateInFile, details, seatLimit: seatStateEnd.limit, seatUsed: seatStateEnd.used, seatRemaining: seatStateEnd.remaining, seatSource: seatStateEnd.source });
   } catch (error: any) {
     return NextResponse.json({ error: error?.message || "Błąd importu serwerowego." }, { status: 500 });
