@@ -59,7 +59,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const unsub = onSnapshot(
       ref,
       (snap) => {
-        setProfile((snap.data() || null) as any);
+        const raw = (snap.data() || null) as any;
+        const normalized = raw ? { ...raw, communityId: String(raw.communityId || raw.customerId || "") || undefined } : null;
+        setProfile(normalized as any);
         setProfileResolved(true);
       },
       () => {

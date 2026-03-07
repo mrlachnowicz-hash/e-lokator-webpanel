@@ -46,7 +46,6 @@ export default function DashboardPage() {
 
   const saveWebpanelUrl = async () => {
     if (!communityId) return;
-    if (role !== "MASTER") { alert("Tylko MASTER może zmieniać konfigurację webpanelu."); return; }
     await setDoc(doc(db, "communities", communityId), { webpanelUrl, updatedAtMs: Date.now() }, { merge: true });
     alert("Zapisano adres webpanelu / SSO.");
   };
@@ -103,7 +102,7 @@ export default function DashboardPage() {
             <button className="btn" onClick={saveWebpanelUrl} disabled={!communityId}>Zapisz</button>
           </div>
         </div>
-        {(role === "MASTER") && panelEnabled && (
+        {role === "MASTER" && panelEnabled && (
           <div className="card">
             <h3>Kod dla księgowej</h3>
             <p>Jednorazowy kod rejestracyjny do podpięcia roli ACCOUNTANT do tej wspólnoty.</p>

@@ -2,12 +2,11 @@
 
 import { useEffect, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
-import { collection, getDocs } from "firebase/firestore";
+import { collection, doc, getDocs, writeBatch } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
-import { callable } from "../../lib/functions";
 
 type Row = {
   flatNumber?: string;
@@ -74,7 +73,7 @@ export default function ImportPage() {
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 16, maxWidth: 1100 }}>
         <h2>Import lokali</h2>
-        <p style={{ opacity: 0.75 }}>Aplikacja jest źródłem prawdy. Wybierz istniejącą ulicę z aplikacji, wpisz numer budynku i zaimportuj lokale bez tworzenia duplikatów. Nowe lokale zużywają seats.</p>
+        <p style={{ opacity: 0.75 }}>Aplikacja jest źródłem prawdy. Wybierz istniejącą ulicę z aplikacji, wpisz numer budynku i zaimportuj lokale bez tworzenia duplikatów.</p>
         <div className="formRow" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
           <select className="select" value={streetId} onChange={(e) => setStreetId(e.target.value)}>
             <option value="">Wybierz ulicę</option>
@@ -114,29 +113,61 @@ export default function ImportPage() {
               onClick={async () => {
                 setMsg(null); setErr(null);
                 try {
-                  const fn = callable("importFlats");
-                  const res = await fn({
-                    communityId,
-                    rows: rows.map((row) => {
-                      const apartmentNo = String(row.flatNumber || "").trim();
-                      return {
-                        streetId,
-                        street: selectedStreet,
-                        buildingNo: buildingNo.trim(),
-                        apartmentNo,
-                        flatNumber: apartmentNo,
-                        flatLabel: `${selectedStreet} ${buildingNo.trim()}/${apartmentNo}`,
-                        flatKey: buildFlatKey(communityId, selectedStreet, buildingNo, apartmentNo),
-                        name: row.name || "",
-                        surname: row.surname || "",
-                        email: row.email || "",
-                        phone: row.phone || "",
-                        areaM2: row.areaM2 ?? null,
-                      };
-                    }),
+                  const allFlats = await getDocs(collection(db, "communities", communityId, "flats"));
+                  const existingByKey = new Map<string, any>();
+                  allFlats.docs.forEach((d) => {
+                    const x: any = d.data();
+                    const key = String(x.flatKey || buildFlatKey(communityId, String(x.street || ""), String(x.buildingNo || ""), String(x.apartmentNo || x.flatNumber || "")));
+                    existingByKey.set(key, d);
                   });
-                  const data: any = (res as any)?.data || {};
-                  setMsg(`Import zakończony. Utworzono: ${Number(data.created || 0)}, zaktualizowano: ${Number(data.updated || 0)}.`);
+                  const batch = writeBatch(db);
+                  let created = 0;
+                  let updated = 0;
+                  for (const row of rows) {
+                    const apartmentNo = String(row.flatNumber || "").trim();
+                    if (!apartmentNo) continue;
+                    const flatKey = buildFlatKey(communityId, selectedStreet, buildingNo, apartmentNo);
+                    const existing = existingByKey.get(flatKey);
+                    const flatRef = existing ? doc(db, "communities", communityId, "flats", existing.id) : doc(collection(db, "communities", communityId, "flats"));
+                    const createdAtMs = existing?.data()?.createdAtMs || Date.now();
+                    batch.set(flatRef, {
+                      communityId,
+                      streetId,
+                      street: selectedStreet,
+                      buildingNo: buildingNo.trim(),
+                      apartmentNo,
+                      flatNumber: apartmentNo,
+                      flatLabel: `${selectedStreet} ${buildingNo.trim()}/${apartmentNo}`,
+                      flatKey,
+                      name: row.name || existing?.data()?.name || "",
+                      surname: row.surname || existing?.data()?.surname || "",
+                      email: row.email || existing?.data()?.email || "",
+                      phone: row.phone || existing?.data()?.phone || "",
+                      areaM2: row.areaM2 ?? existing?.data()?.areaM2 ?? null,
+                      updatedAtMs: Date.now(),
+                      createdAtMs,
+                    }, { merge: true });
+                    const payerRef = doc(db, "communities", communityId, "payers", flatRef.id);
+                    batch.set(payerRef, {
+                      flatId: flatRef.id,
+                      streetId,
+                      street: selectedStreet,
+                      buildingNo: buildingNo.trim(),
+                      apartmentNo,
+                      flatLabel: `${selectedStreet} ${buildingNo.trim()}/${apartmentNo}`,
+                      flatKey,
+                      name: row.name || "",
+                      surname: row.surname || "",
+                      email: row.email || "",
+                      phone: row.phone || "",
+                      mailOnly: !!row.email,
+                      updatedAtMs: Date.now(),
+                      createdAtMs,
+                    }, { merge: true });
+                    if (existing) updated += 1; else created += 1;
+                  }
+                  await batch.commit();
+                  setMsg(`Import zakończony. Utworzono: ${created}, zaktualizowano: ${updated}.`);
                 } catch (e: any) {
                   setErr(e?.message || "Błąd importu");
                 }

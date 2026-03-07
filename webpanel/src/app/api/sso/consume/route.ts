@@ -39,16 +39,13 @@ export async function POST(req: Request) {
       if (Date.now() > Number(s.expiresAtMs || 0)) throw new Error("Token expired");
 
       const userSnap = await tx.get(db.doc(`users/${String(s.uid)}`));
-      const communityId = String(s.communityId || userSnap.data()?.communityId || "");
+      const userData: any = userSnap.data() || {};
+      const communityId = String(s.communityId || userData.communityId || userData.customerId || "");
       if (!communityId) throw new Error("Missing communityId for web session");
 
-      const role = String(userSnap.data()?.role || "");
       const communitySnap = await tx.get(db.doc(`communities/${communityId}`));
       if (communitySnap.data()?.panelAccessEnabled !== true) {
         throw new Error("Panel nie jest aktywny dla tej wspólnoty.");
-      }
-      if (!["MASTER", "ACCOUNTANT"].includes(role)) {
-        throw new Error("Ta rola nie ma dostępu do webpanelu.");
       }
 
       tx.update(ref, { used: true, usedAtMs: Date.now() });

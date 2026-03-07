@@ -20,7 +20,7 @@ export default function LoginPage() {
     const role = String(profile?.role || "");
     if (!["MASTER", "ACCOUNTANT"].includes(role)) {
       if (role) {
-        setErr("Ta rola nie ma dostępu do webpanelu. Lokator korzysta z aplikacji mobilnej.");
+        setErr("Ta rola nie ma dostępu do webpanelu. Dostęp mają tylko MASTER i ACCOUNTANT. Lokator oraz ADMIN korzystają z aplikacji mobilnej.");
         signOut(auth);
       }
       return;
