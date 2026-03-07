@@ -1,76 +1,59 @@
-# e-Lokator – Webpanel (MVP)
+# e-Lokator – Webpanel
 
-## Co to jest
-Webpanel (Next.js) jako drugi klient tego samego systemu (Firebase Auth + Firestore + Cloud Functions), z modułami:
-- logowanie / role (MASTER / ADMIN / ACCOUNTANT)
-- budynki, lokale (CRUD – MVP)
-- import lokali z CSV/XLSX (tworzy `flats`, zajmuje seats 1 flat = 1 seat)
-- faktury (KSeF) – MVP: pobieranie MOCK, parsowanie XML (heurystyczne), AI sugestie (heurystyka lub OpenAI), zatwierdzenie → generuje `charges` per `flatId`
-- generowanie PDF rozliczenia + wysyłka e-mail (SMTP lub MOCK)
-- SSO App → Webpanel: `/sso?token=...` wymienia token na Firebase custom token i loguje
+## Zakres w tym ZIP
+- auth + role guard (MASTER / ACCOUNTANT)
+- panel access przez `panelAccessEnabled`
+- import lokali do `communities/{communityId}/flats` + `payers`
+- budynki i lokale na istniejących danych Firebase
+- faktury / review / settlements / payments
+- nowy moduł `Liczniki`
+- PDF rozliczenia przez route Next.js
+- email rozliczenia przez SendGrid z ENV
+- SSO consume route
 
-## Struktura danych (nowe kolekcje)
-Wszystko pod `communities/{communityId}`:
-- `buildings/{buildingId}`
-- `flats/{flatId}` (payer bez UID wspierany)
-- `ksef/config` (MVP – bez tajnych tokenów)
-- `ksefInvoices/{invoiceId}`
-- `charges/{chargeId}`
+## Źródło prawdy danych
+System czyta istniejące:
+- `communities`
+- `users`
+- `communities/{communityId}/flats`
+- pola `communityId`, `flatId`, `street`, `buildingNo`, `apartmentNo`, `flatLabel`
 
-Globalne:
-- `join_codes/{code}` – join code do rejestracji (ACCOUNTANT)
-- `webSessions/{token}` – one-time token do SSO
+Nie trzeba zakładać wspólnot od nowa.
 
-## Wymagania
-- Node.js 18+ (lokalnie)
-- Firebase CLI (do emulacji / deploy Functions)
-
-## Uruchomienie lokalnie (DEV)
-1) Skopiuj env:
+## Uruchomienie lokalne
 ```bash
 cp .env.example .env.local
-```
-2) Uzupełnij w `.env.local`:
-- `NEXT_PUBLIC_FIREBASE_*` (Firebase Console → Project settings)
-- `FIREBASE_ADMIN_*` (service account JSON)
-
-3) Instalacja:
-```bash
-npm i
-```
-4) Start:
-```bash
+npm install
 npm run dev
 ```
 
-Webpanel: http://localhost:3000
+## Wymagane ENV
+Uzupełnij w `.env.local`:
+- `NEXT_PUBLIC_FIREBASE_*`
+- `FIREBASE_ADMIN_PROJECT_ID`
+- `FIREBASE_ADMIN_CLIENT_EMAIL`
+- `FIREBASE_ADMIN_PRIVATE_KEY`
+- `SENDGRID_API_KEY`
+- `SENDGRID_FROM_EMAIL`
+- opcjonalnie `SENDGRID_EU_DATA_RESIDENCY=true`
 
-## Cloud Functions – wymagane do webpanelu
-W katalogu głównym repo: `functions/`
+## SendGrid
+Email rozliczenia działa przez route:
+- `POST /api/settlements/[settlementId]/send-email`
 
-Dodane callable:
-- `createJoinCode`, `claimJoinCode`
-- `createWebSession`, `consumeWebSession` (fallback)
-- `ksefSetConfig`, `ksefFetchInvoices` (MOCK), `ksefParseInvoice`
-- `aiSuggestInvoice`
-- `approveInvoice`
-- `generateSettlementPdf`, `sendSettlementEmail`
+PDF działa przez:
+- `GET /api/settlements/[settlementId]/pdf?communityId=...`
 
-### Env Functions
-W Firebase Functions (prod) ustaw:
-- `OPENAI_API_KEY` (opcjonalnie)
-- `OPENAI_MODEL` (opcjonalnie)
-- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` (opcjonalnie)
+Klucz API wklej do `.env.local` w polu `SENDGRID_API_KEY`.
+Email nadawcy ustaw w `SENDGRID_FROM_EMAIL`.
 
-Bez SMTP email jest logowany do `communities/{communityId}/mailLogs`.
+## Liczniki
+Nowe kolekcje:
+- `communities/{communityId}/meters`
+- `communities/{communityId}/meterReadings`
 
-## KSeF (MVP)
-`ksefFetchInvoices` jest MOCK – produkcyjnie podmień implementację na realne API KSeF.
-Parser `ksefParseInvoice` jest heurystyczny (TODO: pełna zgodność z XSD / schematem KSeF).
+Import odczytów tworzy też wpisy w:
+- `communities/{communityId}/charges`
 
-## SSO z aplikacji Android
-Aplikacja powinna:
-1) wywołać callable `createWebSession({ target: "/payments" })`
-2) otworzyć w WebView URL: `${paymentsUrl}/sso?token=...`
-
-W tym ZIP-ie jest minimalna zmiana po stronie Androida, która dopina token.
+## Ograniczenia tego ZIP
+W paczce nie ma kodu Firebase Functions ani aplikacji mobilnej, więc ich wdrożenie / build trzeba dokończyć w odpowiednich repozytoriach.

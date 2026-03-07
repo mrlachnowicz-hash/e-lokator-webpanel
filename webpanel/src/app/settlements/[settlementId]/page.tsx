@@ -7,7 +7,6 @@ import { Nav } from "../../../components/Nav";
 import { RequireAuth } from "../../../components/RequireAuth";
 import { useAuth } from "../../../lib/authContext";
 import { db } from "../../../lib/firebase";
-import { callable } from "../../../lib/functions";
 
 type ChargeItem = {
   label?: string;
@@ -236,15 +235,18 @@ export default function SettlementDetailsPage({ params }: { params: { settlement
               <div style={{ borderTop: "1px solid rgba(255,255,255,.12)", paddingTop: 16, display: "flex", gap: 10, flexWrap: "wrap" }}>
                 <button className="btn" onClick={() => setTransferOpen(true)}>Dane do przelewu</button>
                 <button className="btnGhost" onClick={async () => {
-                  const res = await callable<any, any>("generateSettlementPdf")({ communityId, settlementId });
-                  const url = String((res.data as any)?.pdfUrl || "");
-                  if (url) window.open(url, "_blank");
-                  setMessage(url ? "PDF został wygenerowany." : "Nie udało się pobrać PDF.");
+                  const url = `/api/settlements/${settlementId}/pdf?communityId=${encodeURIComponent(communityId)}`;
+                  window.open(url, "_blank");
+                  setMessage("PDF został wygenerowany.");
                 }}>Pobierz PDF</button>
                 <button className="btnGhost" onClick={async () => {
-                  const res = await callable<any, any>("sendSettlementEmail")({ communityId, settlementId });
-                  const email = String((res.data as any)?.email || "");
-                  setMessage(email ? `Email zakolejkowany do: ${email}` : "Email został zakolejkowany.");
+                  const res = await fetch(`/api/settlements/${settlementId}/send-email`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ communityId }),
+                  });
+                  const data = await res.json();
+                  setMessage(res.ok ? `Email wysłany do: ${data.email || "—"}` : `Błąd email: ${data.error || "nieznany"}`);
                 }}>Wyślij email</button>
               </div>
 

@@ -7,6 +7,7 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
+import { buildFlatKey } from "../../lib/flatMapping";
 
 type Row = {
   flatNumber?: string;
@@ -31,19 +32,6 @@ function normalizeRow(r: any): Row {
   };
 }
 
-function normalizePart(value: string) {
-  return value
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, "")
-    .replace(/[^a-z0-9_-]/g, "");
-}
-
-function buildFlatKey(communityId: string, street: string, buildingNo: string, apartmentNo: string) {
-  return [communityId, street, buildingNo, apartmentNo].map(normalizePart).filter(Boolean).join("|");
-}
 
 export default function ImportPage() {
   const { profile } = useAuth();

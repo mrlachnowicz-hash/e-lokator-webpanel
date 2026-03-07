@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { collection, getDocs, onSnapshot, query, setDoc, doc } from "firebase/firestore";
+import { collection, getDocs, onSnapshot, query, setDoc, doc, writeBatch } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
+import { buildFlatKey } from "../../lib/flatMapping";
 
 type Flat = {
   id: string;
@@ -25,19 +26,6 @@ type Flat = {
   updatedAtMs?: number;
 };
 
-function normalizePart(value: string) {
-  return value
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, "")
-    .replace(/[^a-z0-9_-]/g, "");
-}
-
-function buildFlatKey(communityId: string, street: string, buildingNo: string, apartmentNo: string) {
-  return [communityId, street, buildingNo, apartmentNo].map(normalizePart).filter(Boolean).join("|");
-}
 
 export default function FlatsPage() {
   const { profile } = useAuth();
@@ -76,7 +64,8 @@ export default function FlatsPage() {
       return key === flatKey;
     });
     const ref = existing ? doc(db, "communities", communityId, "flats", existing.id) : doc(collection(db, "communities", communityId, "flats"));
-    await setDoc(ref, {
+    const batch = writeBatch(db);
+    batch.set(ref, {
       street: street.trim(),
       buildingNo: buildingNo.trim(),
       apartmentNo: apartmentNo.trim(),
@@ -90,6 +79,24 @@ export default function FlatsPage() {
       updatedAtMs: Date.now(),
       createdAtMs: existing?.data()?.createdAtMs || Date.now(),
     }, { merge: true });
+    const payerRef = doc(db, "communities", communityId, "payers", ref.id);
+    batch.set(payerRef, {
+      flatId: ref.id,
+      street: street.trim(),
+      buildingNo: buildingNo.trim(),
+      apartmentNo: apartmentNo.trim(),
+      flatNumber: apartmentNo.trim(),
+      flatLabel: `${street.trim()} ${buildingNo.trim()}/${apartmentNo.trim()}`,
+      flatKey,
+      name: name.trim(),
+      surname: surname.trim(),
+      email: email.trim(),
+      phone: phone.trim(),
+      mailOnly: !!email.trim(),
+      updatedAtMs: Date.now(),
+      createdAtMs: existing?.data()?.createdAtMs || Date.now(),
+    }, { merge: true });
+    await batch.commit();
     setStreet("");
     setBuildingNo("");
     setApartmentNo("");

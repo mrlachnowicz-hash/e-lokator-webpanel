@@ -4,12 +4,13 @@ import Link from "next/link";
 import { signOut } from "firebase/auth";
 import { auth } from "../lib/firebase";
 import { useAuth } from "../lib/authContext";
+import { isPanelEnabled } from "../lib/panelAccess";
 
 export function Nav() {
   const { profile, community } = useAuth();
   const role = profile?.role || "";
   const comm = profile?.communityId || "";
-  const panelEnabled = community?.panelAccessEnabled === true;
+  const panelEnabled = isPanelEnabled(community?.panelAccessEnabled);
 
   return (
     <div className="topBar">
@@ -28,7 +29,8 @@ export function Nav() {
             <Link href="/buildings">Budynki</Link>
             <Link href="/flats">Lokale</Link>
             <Link href="/invoices">Faktury</Link>
-            <Link href="/charges">Naliczania</Link>
+            <Link href="/charges">Rozliczenia</Link>
+            <Link href="/meters">Liczniki</Link>
             <Link href="/payments">Przelewy</Link>
             <Link href="/review">Review</Link>
           </>

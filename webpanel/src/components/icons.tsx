@@ -52,3 +52,11 @@ export const IconShield = () => (
     <path d="M9 12l2 2 4-5" />
   </Icon>
 );
+
+export const IconGauge = () => (
+  <Icon>
+    <path d="M5 16a7 7 0 1114 0" />
+    <path d="M12 13l4-4" />
+    <path d="M12 20v1" />
+  </Icon>
+);

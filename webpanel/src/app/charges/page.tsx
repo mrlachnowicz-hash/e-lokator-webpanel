@@ -7,12 +7,16 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
-import { callable } from "../../lib/functions";
 
 type Settlement = any;
 
 function money(v: any) {
-  return `${(Number(v || 0) / 100).toFixed(2)} PLN`;
+  return `${Number(v || 0).toFixed(2)} PLN`;
+}
+
+function centsOrAmount(cents: any, amount: any) {
+  if (cents != null) return Number(cents) / 100;
+  return Number(amount || 0);
 }
 
 export default function ChargesPage() {
@@ -41,9 +45,9 @@ export default function ChargesPage() {
               <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                 <b>{s.flatId}</b>
                 <span style={{ opacity: 0.75 }}>{s.period}</span>
-                <span style={{ opacity: 0.75 }}>Saldo: {money(s.balanceCents)}</span>
-                <span style={{ opacity: 0.75 }}>Opłaty: {money(s.chargesCents)}</span>
-                <span style={{ opacity: 0.75 }}>Wpłaty: {money(s.paymentsCents)}</span>
+                <span style={{ opacity: 0.75 }}>Saldo: {money(centsOrAmount(s.balanceCents, s.balance))}</span>
+                <span style={{ opacity: 0.75 }}>Opłaty: {money(centsOrAmount(s.chargesCents ?? s.totalCents, s.total))}</span>
+                <span style={{ opacity: 0.75 }}>Wpłaty: {money(centsOrAmount(s.paymentsCents, s.payments))}</span>
               </div>
               <div style={{ display: "grid", gap: 4, opacity: 0.9 }}>
                 <div>Termin płatności: {s.dueDate || "—"}</div>
@@ -55,15 +59,18 @@ export default function ChargesPage() {
                   Otwórz podgląd
                 </Link>
                 <button className="btnGhost" onClick={async () => {
-                  const res = await callable<any, any>("generateSettlementPdf")({ communityId, settlementId: s.id });
-                  const url = String((res.data as any)?.pdfUrl || "");
-                  if (url) window.open(url, "_blank");
+                  const url = `/api/settlements/${s.id}/pdf?communityId=${encodeURIComponent(communityId)}`;
+                  window.open(url, "_blank");
                   setMsg("PDF gotowy.");
                 }}>PDF</button>
                 <button className="btnGhost" onClick={async () => {
-                  const res = await callable<any, any>("sendSettlementEmail")({ communityId, settlementId: s.id });
-                  const data = (res.data as any) || {};
-                  setMsg(`Email zakolejkowany do: ${data.email || "—"}`);
+                  const res = await fetch(`/api/settlements/${s.id}/send-email`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ communityId }),
+                  });
+                  const data = await res.json();
+                  setMsg(res.ok ? `Email wysłany do: ${data.email || "—"}` : `Błąd email: ${data.error || "nieznany"}`);
                 }}>Wyślij email</button>
               </div>
             </div>

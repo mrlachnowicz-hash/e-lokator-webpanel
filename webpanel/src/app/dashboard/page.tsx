@@ -8,16 +8,17 @@ import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
 import { callable } from "../../lib/functions";
 import { Tile } from "../../components/Tile";
-import { IconSpreadsheet, IconBuilding, IconHome, IconReceipt, IconCoins, IconShield } from "../../components/icons";
+import { IconSpreadsheet, IconBuilding, IconHome, IconReceipt, IconCoins, IconShield, IconGauge } from "../../components/icons";
+import { isPanelEnabled } from "../../lib/panelAccess";
 
 export default function DashboardPage() {
   const { profile, community } = useAuth();
   const communityId = profile?.communityId || "";
   const role = String(profile?.role || "");
-  const panelEnabled = community?.panelAccessEnabled === true;
+  const panelEnabled = isPanelEnabled(community?.panelAccessEnabled);
   const [webpanelUrl, setWebpanelUrl] = useState("");
   const [joinCode, setJoinCode] = useState("");
-  const [stats, setStats] = useState({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0 });
+  const [stats, setStats] = useState({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0, meters: 0 });
 
   useEffect(() => {
     if (!communityId) return;
@@ -25,14 +26,15 @@ export default function DashboardPage() {
       const communitySnap = await getDoc(doc(db, "communities", communityId));
       setWebpanelUrl(String(communitySnap.data()?.webpanelUrl || communitySnap.data()?.paymentsUrl || ""));
       if (!panelEnabled) {
-        setStats({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0 });
+        setStats({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0, meters: 0 });
         return;
       }
-      const [flats, invoices, settlements, review] = await Promise.all([
+      const [flats, invoices, settlements, review, meters] = await Promise.all([
         getCountFromServer(collection(db, "communities", communityId, "flats")),
         getCountFromServer(collection(db, "communities", communityId, "invoices")),
         getCountFromServer(collection(db, "communities", communityId, "settlements")),
         getCountFromServer(collection(db, "communities", communityId, "reviewQueue")),
+        getCountFromServer(collection(db, "communities", communityId, "meters")),
       ]);
       setStats({
         flats: Number(flats.data().count || 0),
@@ -40,6 +42,7 @@ export default function DashboardPage() {
         settlements: Number(settlements.data().count || 0),
         review: Number(review.data().count || 0),
         unmatchedPayments: 0,
+        meters: Number(meters.data().count || 0),
       });
     })();
   }, [communityId, panelEnabled]);
@@ -63,6 +66,7 @@ export default function DashboardPage() {
     { href: "/invoices", icon: <IconReceipt />, title: "Faktury", desc: "Import, parse, review, approve" },
     { href: "/charges", icon: <IconCoins />, title: "Rozliczenia", desc: "Charges, settlements, balances" },
     { href: "/payments", icon: <IconShield />, title: "Przelewy", desc: "Import CSV/XLSX i dopasowanie po EL-xxx" },
+    { href: "/meters", icon: <IconGauge />, title: "Liczniki", desc: "Konfiguracja, odczyty, zużycie, charges" },
   ], []);
 
   return (
@@ -88,6 +92,7 @@ export default function DashboardPage() {
             <div className="card"><h3>Faktury</h3><p>{stats.invoices}</p></div>
             <div className="card"><h3>Rozliczenia</h3><p>{stats.settlements}</p></div>
             <div className="card"><h3>Review queue</h3><p>{stats.review}</p></div>
+            <div className="card"><h3>Liczniki</h3><p>{stats.meters}</p></div>
           </div>
         </>
       )}

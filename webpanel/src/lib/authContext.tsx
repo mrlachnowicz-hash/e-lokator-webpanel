@@ -4,6 +4,7 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from "
 import { onAuthStateChanged, User } from "firebase/auth";
 import { collection, doc, getDoc, getDocs, limit, onSnapshot, query, where } from "firebase/firestore";
 import { auth, db } from "./firebase";
+import { isPanelEnabled } from "./panelAccess";
 
 export type UserProfile = {
   role?: "MASTER" | "ADMIN" | "ACCOUNTANT" | "RESIDENT" | string;
@@ -58,14 +59,14 @@ async function resolveCommunity(profile: UserProfile | null, user: User | null):
     try {
       const snap = await getDoc(doc(db, "communities", communityId));
       if (snap.exists()) {
-        return snap.data() as CommunityProfile;
+        return { ...snap.data(), panelAccessEnabled: isPanelEnabled((snap.data() as any)?.panelAccessEnabled) } as CommunityProfile;
       }
     } catch {}
 
     try {
       const q = query(collection(db, "communities"), where("id", "==", communityId), limit(1));
       const qs = await getDocs(q);
-      if (!qs.empty) return qs.docs[0].data() as CommunityProfile;
+      if (!qs.empty) return { ...qs.docs[0].data(), panelAccessEnabled: isPanelEnabled((qs.docs[0].data() as any)?.panelAccessEnabled) } as CommunityProfile;
     } catch {}
   }
 
@@ -75,7 +76,7 @@ async function resolveCommunity(profile: UserProfile | null, user: User | null):
       try {
         const q = query(collection(db, "communities"), where(field, "==", email), limit(1));
         const qs = await getDocs(q);
-        if (!qs.empty) return qs.docs[0].data() as CommunityProfile;
+        if (!qs.empty) return { ...qs.docs[0].data(), panelAccessEnabled: isPanelEnabled((qs.docs[0].data() as any)?.panelAccessEnabled) } as CommunityProfile;
       } catch {}
     }
   }

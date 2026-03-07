@@ -4,6 +4,7 @@ import React, { useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { signOut } from "firebase/auth";
 import { useAuth } from "../lib/authContext";
+import { isPanelEnabled } from "../lib/panelAccess";
 import { auth } from "../lib/firebase";
 
 export function RequireAuth({ children, roles, requirePanelAccess = true }: { children: React.ReactNode; roles?: string[]; requirePanelAccess?: boolean }) {
@@ -43,7 +44,7 @@ export function RequireAuth({ children, roles, requirePanelAccess = true }: { ch
     }
   }
 
-  const panelEnabled = community?.panelAccessEnabled === true || String((community as any)?.panelAccessEnabled || "").toLowerCase() === "true";
+  const panelEnabled = isPanelEnabled(community?.panelAccessEnabled);
 
   if (requirePanelAccess && !panelEnabled) {
     return (
