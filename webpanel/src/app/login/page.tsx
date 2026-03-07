@@ -9,7 +9,7 @@ import { useAuth } from "../../lib/authContext";
 
 export default function LoginPage() {
   const router = useRouter();
-  const { user, profile, loading } = useAuth();
+  const { user, profile, community, loading } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -18,16 +18,22 @@ export default function LoginPage() {
     if (loading || !user) return;
 
     const role = String(profile?.role || "");
-    if (["MASTER", "ADMIN", "ACCOUNTANT"].includes(role)) {
-      router.replace("/dashboard");
+    if (!["MASTER", "ADMIN", "ACCOUNTANT"].includes(role)) {
+      if (role) {
+        setErr("Ta rola nie ma dostępu do webpanelu. Lokator korzysta z aplikacji mobilnej.");
+        signOut(auth);
+      }
       return;
     }
 
-    if (role) {
-      setErr("Ta rola nie ma dostępu do webpanelu. Lokator korzysta z aplikacji mobilnej.");
+    if (community?.panelAccessEnabled !== true) {
+      setErr("Panel nie jest aktywny dla tej wspólnoty. Włącz przełącznik „Udziel dostępu do panelu” w generatorze ownera.");
       signOut(auth);
+      return;
     }
-  }, [loading, user, profile, router]);
+
+    router.replace("/dashboard");
+  }, [loading, user, profile, community, router]);
 
   return (
     <div style={{ padding: 32, maxWidth: 420, margin: "0 auto" }}>

@@ -6,9 +6,10 @@ import { auth } from "../lib/firebase";
 import { useAuth } from "../lib/authContext";
 
 export function Nav() {
-  const { profile } = useAuth();
+  const { profile, community } = useAuth();
   const role = profile?.role || "";
   const comm = profile?.communityId || "";
+  const panelEnabled = community?.panelAccessEnabled === true;
 
   return (
     <div className="topBar">
@@ -16,17 +17,22 @@ export function Nav() {
         <div className="brandBadge" />
         <Link href="/dashboard">e-Lokator Webpanel</Link>
         <span className="brandMeta">({role || "—"} / {comm ? comm.slice(0, 6) : "—"})</span>
+        {!panelEnabled ? <span className="brandMeta">panel OFF</span> : null}
       </div>
 
       <div className="navLinks">
         <Link href="/dashboard">Panel</Link>
-        <Link href="/import">Import lokali</Link>
-        <Link href="/buildings">Budynki</Link>
-        <Link href="/flats">Lokale</Link>
-        <Link href="/invoices">Faktury</Link>
-        <Link href="/charges">Naliczania</Link>
-        <Link href="/payments">Przelewy</Link>
-        <Link href="/review">Review</Link>
+        {panelEnabled ? (
+          <>
+            <Link href="/import">Import lokali</Link>
+            <Link href="/buildings">Budynki</Link>
+            <Link href="/flats">Lokale</Link>
+            <Link href="/invoices">Faktury</Link>
+            <Link href="/charges">Naliczania</Link>
+            <Link href="/payments">Przelewy</Link>
+            <Link href="/review">Review</Link>
+          </>
+        ) : null}
         <button className="btnGhost" onClick={() => signOut(auth)}>
           Wyloguj
         </button>

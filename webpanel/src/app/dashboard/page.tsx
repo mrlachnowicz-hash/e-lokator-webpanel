@@ -11,9 +11,10 @@ import { Tile } from "../../components/Tile";
 import { IconSpreadsheet, IconBuilding, IconHome, IconReceipt, IconCoins, IconShield } from "../../components/icons";
 
 export default function DashboardPage() {
-  const { profile } = useAuth();
+  const { profile, community } = useAuth();
   const communityId = profile?.communityId || "";
   const role = String(profile?.role || "");
+  const panelEnabled = community?.panelAccessEnabled === true;
   const [webpanelUrl, setWebpanelUrl] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [stats, setStats] = useState({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0 });
@@ -23,6 +24,10 @@ export default function DashboardPage() {
     (async () => {
       const communitySnap = await getDoc(doc(db, "communities", communityId));
       setWebpanelUrl(String(communitySnap.data()?.webpanelUrl || communitySnap.data()?.paymentsUrl || ""));
+      if (!panelEnabled) {
+        setStats({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0 });
+        return;
+      }
       const [flats, invoices, settlements, review] = await Promise.all([
         getCountFromServer(collection(db, "communities", communityId, "flats")),
         getCountFromServer(collection(db, "communities", communityId, "invoices")),
@@ -37,7 +42,7 @@ export default function DashboardPage() {
         unmatchedPayments: 0,
       });
     })();
-  }, [communityId]);
+  }, [communityId, panelEnabled]);
 
   const saveWebpanelUrl = async () => {
     if (!communityId) return;
@@ -61,18 +66,31 @@ export default function DashboardPage() {
   ], []);
 
   return (
-    <RequireAuth roles={["MASTER", "ADMIN", "ACCOUNTANT"]}>
+    <RequireAuth roles={["MASTER", "ADMIN", "ACCOUNTANT"]} requirePanelAccess={false}>
       <Nav />
       <div className="sectionTitle">Panel rozliczeń</div>
-      <div className="grid">{cards.map((x) => <Tile key={x.href} {...x} />)}</div>
 
-      <div className="sectionTitle">Statystyki</div>
-      <div className="grid">
-        <div className="card"><h3>Lokale</h3><p>{stats.flats}</p></div>
-        <div className="card"><h3>Faktury</h3><p>{stats.invoices}</p></div>
-        <div className="card"><h3>Rozliczenia</h3><p>{stats.settlements}</p></div>
-        <div className="card"><h3>Review queue</h3><p>{stats.review}</p></div>
-      </div>
+      {!panelEnabled ? (
+        <div className="card" style={{ maxWidth: 960 }}>
+          <h3>Panel nieaktywny dla tej wspólnoty</h3>
+          <p>
+            Przełącznik <b>„Udziel dostępu do panelu”</b> jest obecnie ustawiony na OFF. Aplikacja mobilna i generator działają dalej normalnie,
+            ale moduły księgowe i rozliczeniowe webpanelu pozostają zablokowane.
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="grid">{cards.map((x) => <Tile key={x.href} {...x} />)}</div>
+
+          <div className="sectionTitle">Statystyki</div>
+          <div className="grid">
+            <div className="card"><h3>Lokale</h3><p>{stats.flats}</p></div>
+            <div className="card"><h3>Faktury</h3><p>{stats.invoices}</p></div>
+            <div className="card"><h3>Rozliczenia</h3><p>{stats.settlements}</p></div>
+            <div className="card"><h3>Review queue</h3><p>{stats.review}</p></div>
+          </div>
+        </>
+      )}
 
       <div className="sectionTitle">Konfiguracja</div>
       <div style={{ display: "grid", gap: 16, maxWidth: 960 }}>
@@ -84,7 +102,7 @@ export default function DashboardPage() {
             <button className="btn" onClick={saveWebpanelUrl} disabled={!communityId}>Zapisz</button>
           </div>
         </div>
-        {(role === "MASTER" || role === "ADMIN") && (
+        {(role === "MASTER" || role === "ADMIN") && panelEnabled && (
           <div className="card">
             <h3>Kod dla księgowej</h3>
             <p>Jednorazowy kod rejestracyjny do podpięcia roli ACCOUNTANT do tej wspólnoty.</p>

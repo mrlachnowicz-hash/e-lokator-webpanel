@@ -26,7 +26,7 @@ function SsoInner() {
         await signInWithCustomToken(auth, data.customToken);
         if (!active) return;
         setMessage("Zalogowano. Przekierowanie...");
-        router.replace(data.target || "/payments");
+        router.replace(data.target || "/dashboard");
       } catch (e: any) {
         if (!active) return;
         setMessage(`Błąd SSO: ${e?.message || String(e)}`);

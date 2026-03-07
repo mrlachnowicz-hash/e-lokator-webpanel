@@ -37,9 +37,19 @@ export async function POST(req: Request) {
       const s: any = snap.data();
       if (s.used) throw new Error("Token already used");
       if (Date.now() > Number(s.expiresAtMs || 0)) throw new Error("Token expired");
+
+      const userSnap = await tx.get(db.doc(`users/${String(s.uid)}`));
+      const communityId = String(s.communityId || userSnap.data()?.communityId || "");
+      if (!communityId) throw new Error("Missing communityId for web session");
+
+      const communitySnap = await tx.get(db.doc(`communities/${communityId}`));
+      if (communitySnap.data()?.panelAccessEnabled !== true) {
+        throw new Error("Panel nie jest aktywny dla tej wspólnoty.");
+      }
+
       tx.update(ref, { used: true, usedAtMs: Date.now() });
       const customToken = await admin.auth().createCustomToken(String(s.uid));
-      return { customToken, target: s.target || "/payments" };
+      return { customToken, target: s.target || "/dashboard" };
     });
 
     return NextResponse.json(out);
