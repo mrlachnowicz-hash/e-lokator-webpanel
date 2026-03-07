@@ -54,6 +54,8 @@ type ImportRow = {
   date?: string;
 };
 
+type AnomalyResult = { anomaly?: boolean; confidence?: number; reason?: string };
+
 function normalizeMeterType(value: unknown) {
   const raw = String(value ?? "").trim().toLowerCase();
   if (raw.includes("wod")) return "water";
@@ -76,6 +78,13 @@ function normalizeImportRow(row: any): ImportRow {
   };
 }
 
+function isClearlySuspicious(current: number, previous: number, consumption: number) {
+  if (current < previous) return true;
+  if (consumption > 0 && previous > 0 && consumption > previous * 5) return true;
+  if (consumption > 10000) return true;
+  return false;
+}
+
 export default function MetersPage() {
   const { profile } = useAuth();
   const communityId = profile?.communityId || "";
@@ -83,26 +92,15 @@ export default function MetersPage() {
   const [meters, setMeters] = useState<Meter[]>([]);
   const [readings, setReadings] = useState<Reading[]>([]);
   const [message, setMessage] = useState<string | null>(null);
-  const [form, setForm] = useState({
-    flatId: "",
-    street: "",
-    buildingNo: "",
-    apartmentNo: "",
-    type: "water",
-    serialNumber: "",
-    unit: "m3",
-  });
+  const [anomalies, setAnomalies] = useState<Array<{ label: string; result: AnomalyResult }>>([]);
+  const [form, setForm] = useState({ flatId: "", street: "", buildingNo: "", apartmentNo: "", type: "water", serialNumber: "", unit: "m3" });
 
   useEffect(() => {
     if (!communityId) return;
     const unsubFlats = onSnapshot(collection(db, "communities", communityId, "flats"), (snap) => setFlats(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }))));
     const unsubMeters = onSnapshot(query(collection(db, "communities", communityId, "meters"), orderBy("updatedAtMs", "desc")), (snap) => setMeters(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }))));
     const unsubReadings = onSnapshot(query(collection(db, "communities", communityId, "meterReadings"), orderBy("createdAtMs", "desc")), (snap) => setReadings(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }))));
-    return () => {
-      unsubFlats();
-      unsubMeters();
-      unsubReadings();
-    };
+    return () => { unsubFlats(); unsubMeters(); unsubReadings(); };
   }, [communityId]);
 
   const flatOptions = useMemo(() => flats.map((flat) => ({
@@ -111,13 +109,7 @@ export default function MetersPage() {
     flatKey: buildFlatKey(communityId, flat.street, flat.buildingNo, flat.apartmentNo),
   })), [communityId, flats]);
 
-  const tariffByType: Record<string, number> = {
-    water: 12,
-    heat: 18,
-    gas: 4,
-    electricity: 1.2,
-    other: 1,
-  };
+  const tariffByType: Record<string, number> = { water: 12, heat: 18, gas: 4, electricity: 1.2, other: 1 };
 
   async function saveMeter() {
     if (!communityId) return;
@@ -129,20 +121,8 @@ export default function MetersPage() {
     if (!flatId || !street || !buildingNo || !apartmentNo) return;
 
     await addDoc(collection(db, "communities", communityId, "meters"), {
-      id: undefined,
-      communityId,
-      flatId,
-      street,
-      buildingNo,
-      apartmentNo,
-      type: form.type,
-      serialNumber: form.serialNumber.trim(),
-      unit: form.unit.trim() || "m3",
-      isActive: true,
-      createdAtMs: Date.now(),
-      updatedAtMs: Date.now(),
+      communityId, flatId, street, buildingNo, apartmentNo, type: form.type, serialNumber: form.serialNumber.trim(), unit: form.unit.trim() || "m3", isActive: true, createdAtMs: Date.now(), updatedAtMs: Date.now(),
     });
-
     setForm({ flatId: "", street: "", buildingNo: "", apartmentNo: "", type: "water", serialNumber: "", unit: "m3" });
     setMessage("Dodano licznik.");
   }
@@ -162,75 +142,81 @@ export default function MetersPage() {
     let imported = 0;
     let generatedCharges = 0;
     let skipped = 0;
+    const anomalyList: Array<{ label: string; result: AnomalyResult }> = [];
 
     for (const row of rows) {
       const street = row.street || "";
       const buildingNo = row.buildingNo || "";
       const apartmentNo = normalizeApartmentNo(row.apartmentNo);
       const key = buildFlatKey(communityId, street, buildingNo, apartmentNo);
-      const flat = flatsByKey.get(key)
-        || flatOptions.find((item) => normalizePart(item.apartmentNo) === normalizePart(apartmentNo) && normalizePart(item.buildingNo) === normalizePart(buildingNo) && (!street || normalizePart(item.street) === normalizePart(street)));
-      if (!flat || row.value == null || !row.date) {
-        skipped += 1;
-        continue;
-      }
+      const flat = flatsByKey.get(key) || flatOptions.find((item) => normalizePart(item.apartmentNo) === normalizePart(apartmentNo) && normalizePart(item.buildingNo) === normalizePart(buildingNo) && (!street || normalizePart(item.street) === normalizePart(street)));
+      if (!flat || row.value == null || !row.date) { skipped += 1; continue; }
 
       const meterType = normalizeMeterType(row.meterType);
-      const meter = activeMeters.find((item) => item.flatId === flat.id && normalizeMeterType(item.type) === meterType)
-        || activeMeters.find((item) => item.flatId === flat.id);
-      if (!meter) {
-        skipped += 1;
-        continue;
-      }
+      const meter = activeMeters.find((item) => item.flatId === flat.id && normalizeMeterType(item.type) === meterType) || activeMeters.find((item) => item.flatId === flat.id);
+      if (!meter) { skipped += 1; continue; }
 
-      const previous = allReadings
-        .filter((item) => item.meterId === meter.id)
-        .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")))[0];
-      const consumption = Math.max(0, Number(row.value) - Number(previous?.value || 0));
+      const previous = allReadings.filter((item) => item.meterId === meter.id).sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")))[0];
+      const currentValue = Number(row.value);
+      const previousValue = Number(previous?.value || 0);
+      const consumption = Math.max(0, currentValue - previousValue);
       const tariff = tariffByType[meterType] ?? tariffByType.other;
       const chargeAmount = Number((consumption * tariff).toFixed(2));
       const period = String(row.date).slice(0, 7);
 
       const readingRef = doc(collection(db, "communities", communityId, "meterReadings"));
       batch.set(readingRef, {
-        meterId: meter.id,
-        flatId: flat.id,
-        value: Number(row.value),
-        date: row.date,
-        source: "import",
-        createdAtMs: Date.now(),
-        consumption,
-        chargeAmount,
-        chargeAmountCents: Math.round(chargeAmount * 100),
-        period,
-        meterType,
-        serialNumber: meter.serialNumber || "",
+        meterId: meter.id, flatId: flat.id, value: currentValue, date: row.date, source: "import", createdAtMs: Date.now(), consumption, chargeAmount, chargeAmountCents: Math.round(chargeAmount * 100), period, meterType, serialNumber: meter.serialNumber || "",
       });
       imported += 1;
 
       if (chargeAmount > 0) {
         const chargeRef = doc(collection(db, "communities", communityId, "charges"));
         batch.set(chargeRef, {
-          communityId,
-          flatId: flat.id,
-          meterId: meter.id,
-          source: "meterReadingImport",
-          category: `MEDIA_${meterType.toUpperCase()}`,
-          label: `Zużycie ${meterType}`,
-          amount: chargeAmount,
-          amountCents: Math.round(chargeAmount * 100),
-          tariff,
-          period,
-          date: row.date,
-          createdAtMs: Date.now(),
-          updatedAtMs: Date.now(),
+          communityId, flatId: flat.id, meterId: meter.id, source: "meterReadingImport", category: `MEDIA_${meterType.toUpperCase()}`, label: `Zużycie ${meterType}`, amount: chargeAmount, amountCents: Math.round(chargeAmount * 100), tariff, period, date: row.date, createdAtMs: Date.now(), updatedAtMs: Date.now(),
         });
         generatedCharges += 1;
+      }
+
+      const suspicious = isClearlySuspicious(currentValue, previousValue, consumption);
+      if (suspicious) {
+        try {
+          const res = await fetch("/api/ai/meter-anomaly", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              flatId: flat.id,
+              flatLabel: flat.label,
+              meterType,
+              currentValue,
+              previousValue,
+              consumption,
+              readingDate: row.date,
+            }),
+          });
+          const result = await res.json();
+          anomalyList.push({ label: `${flat.label || flat.id} · ${meterType}`, result });
+          await addDoc(collection(db, "communities", communityId, "reviewQueue"), {
+            type: "METER_READING_REVIEW",
+            status: "OPEN",
+            flatId: flat.id,
+            period,
+            meterId: meter.id,
+            label: `${flat.label || flat.id} · ${meterType}`,
+            readingDate: row.date,
+            consumption,
+            currentValue,
+            previousValue,
+            ai: result,
+            createdAtMs: Date.now(),
+          });
+        } catch {}
       }
     }
 
     await batch.commit();
-    setMessage(`Import liczników zakończony. Odczyty: ${imported}, naliczenia: ${generatedCharges}, pominięte: ${skipped}.`);
+    setAnomalies(anomalyList);
+    setMessage(`Import liczników zakończony. Odczyty: ${imported}, naliczenia: ${generatedCharges}, pominięte: ${skipped}, anomalie: ${anomalyList.length}.`);
   }
 
   return (
@@ -238,20 +224,14 @@ export default function MetersPage() {
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 16 }}>
         <h2>Liczniki</h2>
-        <p style={{ opacity: 0.8 }}>Moduł działa na istniejących danych communityId + flatId. Licznik i odczyt są przypinane do lokalu z subkolekcji <code>communities/{communityId}/flats</code>.</p>
+        <p style={{ opacity: 0.8 }}>Liczenie zużycia i naliczeń robi system. AI włącza się tylko wtedy, gdy odczyt wygląda podejrzanie i trzeba go wyjaśnić księgowo.</p>
 
         <div className="card" style={{ display: "grid", gap: 12 }}>
           <h3>Konfiguracja licznika</h3>
           <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
             <select className="select" value={form.flatId} onChange={(e) => {
               const flat = flatOptions.find((item) => item.id === e.target.value);
-              setForm((prev) => ({
-                ...prev,
-                flatId: e.target.value,
-                street: flat?.street || prev.street,
-                buildingNo: flat?.buildingNo || prev.buildingNo,
-                apartmentNo: flat?.apartmentNo || prev.apartmentNo,
-              }));
+              setForm((prev) => ({ ...prev, flatId: e.target.value, street: flat?.street || prev.street, buildingNo: flat?.buildingNo || prev.buildingNo, apartmentNo: flat?.apartmentNo || prev.apartmentNo }));
             }}>
               <option value="">Wybierz lokal</option>
               {flatOptions.map((flat) => <option key={flat.id} value={flat.id}>{flat.label || flat.id}</option>)}
@@ -269,22 +249,32 @@ export default function MetersPage() {
             <input className="input" placeholder="Numer seryjny" value={form.serialNumber} onChange={(e) => setForm((prev) => ({ ...prev, serialNumber: e.target.value }))} />
             <input className="input" placeholder="Jednostka" value={form.unit} onChange={(e) => setForm((prev) => ({ ...prev, unit: e.target.value }))} />
           </div>
-          <div>
-            <button className="btn" onClick={saveMeter}>Dodaj licznik</button>
-          </div>
+          <div><button className="btn" onClick={saveMeter}>Dodaj licznik</button></div>
         </div>
 
         <div className="card" style={{ display: "grid", gap: 12 }}>
           <h3>Import odczytów</h3>
-          <p style={{ opacity: 0.78 }}>CSV/XLSX: street, buildingNo, apartmentNo, meterType, value, date. System dopasowuje lokal po istniejących danych, licznik po flatId + type, liczy zużycie i tworzy charge.</p>
+          <p style={{ opacity: 0.78 }}>CSV/XLSX: street, buildingNo, apartmentNo, meterType, value, date. System przypina lokal i liczy naliczenie. AI analizuje tylko podejrzane rekordy.</p>
           <input type="file" accept=".csv,.xlsx,.xls" onChange={async (e) => {
             const file = e.target.files?.[0];
-            if (!file) return;
-            await importReadings(file);
+            if (file) await importReadings(file);
           }} />
         </div>
 
         {message ? <div style={{ color: "#8ef0c8", fontWeight: 700 }}>{message}</div> : null}
+
+        {anomalies.length > 0 ? (
+          <div className="card" style={{ display: "grid", gap: 10 }}>
+            <h3>Wykryte anomalie</h3>
+            {anomalies.map((item, index) => (
+              <div key={`${item.label}-${index}`} style={{ borderTop: "1px solid rgba(255,255,255,.08)", paddingTop: 10 }}>
+                <strong>{item.label}</strong>
+                <div>AI: {item.result.reason || "brak"}</div>
+                <div>Confidence: {Number(item.result.confidence || 0).toFixed(2)}</div>
+              </div>
+            ))}
+          </div>
+        ) : null}
 
         <div className="card" style={{ display: "grid", gap: 10 }}>
           <h3>Lista liczników</h3>

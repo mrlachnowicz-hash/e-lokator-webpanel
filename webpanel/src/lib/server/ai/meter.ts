@@ -1,9 +1,12 @@
 import { getOpenAI, isAIEnabled } from "./openai";
+import { safeParseJson } from "./json";
+
+const FALLBACK = { anomaly: false, confidence: 0.1, reason: "AI disabled" };
 
 export async function detectMeterAnomaly(payload: Record<string, any>) {
-  if (!isAIEnabled()) return { anomaly: false, confidence: 0.1, reason: "AI disabled" };
+  if (!isAIEnabled()) return FALLBACK;
   const client = getOpenAI();
-  if (!client) return { anomaly: false, confidence: 0.1, reason: "AI disabled" };
+  if (!client) return FALLBACK;
 
   const response = await client.responses.create({
     model: process.env.OPENAI_MODEL_FAST || "gpt-5-mini",
@@ -14,5 +17,5 @@ export async function detectMeterAnomaly(payload: Record<string, any>) {
     ]
   });
 
-  try { return JSON.parse(response.output_text || "{}"); } catch { return { anomaly: false, confidence: 0.2, reason: response.output_text || "No parse" }; }
+  return safeParseJson(response.output_text || "", FALLBACK);
 }

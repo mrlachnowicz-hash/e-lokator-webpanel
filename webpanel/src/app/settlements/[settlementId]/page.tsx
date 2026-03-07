@@ -17,6 +17,7 @@ type ChargeItem = {
 type Settlement = {
   id?: string;
   flatId?: string;
+  flatLabel?: string;
   residentName?: string;
   period?: string;
   dueDate?: string;
@@ -28,6 +29,7 @@ type Settlement = {
   balanceCents?: number;
   charges?: ChargeItem[];
   chargesBreakdown?: ChargeItem[];
+  isPublished?: boolean;
 };
 
 type Payment = {
@@ -43,6 +45,7 @@ type Payment = {
   status?: string;
   settlementId?: string;
   flatId?: string;
+  flatLabel?: string;
   period?: string;
   transferTitle?: string;
 };
@@ -54,6 +57,7 @@ type ReviewItem = {
   type?: string;
   status?: string;
   flatId?: string;
+  flatLabel?: string;
   settlementId?: string;
   period?: string;
   amount?: number;
