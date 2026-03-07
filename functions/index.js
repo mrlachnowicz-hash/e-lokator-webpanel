@@ -7,11 +7,9 @@ const PDFDocument = require("pdfkit");
 const nodemailer = require("nodemailer");
 
 let OpenAI = null;
-try {
-  OpenAI = require("openai").default;
-} catch (e) {
-  /* optional */
-}
+let pdfParse = null;
+try { OpenAI = require("openai").default; } catch (e) {}
+try { pdfParse = require("pdf-parse"); } catch (e) {}
 
 setGlobalOptions({ region: "europe-west1" });
 
@@ -24,11 +22,25 @@ try {
 const db = admin.firestore();
 
 // =========================================================
-// HELPERS
+// BASIC HELPERS
 // =========================================================
 
 function nowMs() {
   return Date.now();
+}
+
+function safeString(v) {
+  return String(v || "").trim();
+}
+
+function normalizeStreetName(name) {
+  return safeString(name)
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function randomCode(len = 10) {
@@ -38,22 +50,11 @@ function randomCode(len = 10) {
   return out;
 }
 
-function randomToken(len = 32) {
+function randomToken(len = 48) {
   const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   let out = "";
   for (let i = 0; i < len; i++) out += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
   return out;
-}
-
-function normalizeStreetName(name) {
-  return String(name || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
 }
 
 function toCents(value) {
@@ -68,9 +69,8 @@ function fromCents(cents) {
 }
 
 function monthFromDateStr(yyyyMmDd) {
-  if (!yyyyMmDd) return "";
-  const s = String(yyyyMmDd);
-  return s.length >= 7 ? s.slice(0, 7) : s;
+  const s = safeString(yyyyMmDd);
+  return s.length >= 7 ? s.slice(0, 7) : "";
 }
 
 function formatMoney(cents) {
@@ -82,8 +82,21 @@ function formatMoney(cents) {
   return `${sign}${z},${g} PLN`;
 }
 
-function safeString(v) {
-  return String(v || "").trim();
+function valueOr(a, b) {
+  return safeString(a) || safeString(b);
+}
+
+function paymentCodeForFlat(flat) {
+  return safeString(flat.paymentCode || flat.flatLabel || `${flat.street || ""}-${flat.buildingNo || ""}-${flat.apartmentNo || ""}`)
+    .replace(/\s+/g, "-")
+    .replace(/[^\w\-\/]/g, "")
+    .toUpperCase();
+}
+
+function getOpenAIClient() {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key || !OpenAI) return null;
+  return new OpenAI({ apiKey: key });
 }
 
 // =========================================================
@@ -134,6 +147,12 @@ async function assertMaster(request) {
   return me;
 }
 
+async function assertSameCommunity(me, communityId) {
+  if (!communityId || communityId !== me.communityId) {
+    throw new HttpsError("permission-denied", "Inna wspólnota.");
+  }
+}
+
 const OWNER_UIDS = ["C4NPiqCNCChdDZ0s54di5g8Mt5l2"];
 const OWNER_EMAILS = ["mrlachnowicz@gmail.com"];
 
@@ -145,21 +164,76 @@ function assertOwner(request) {
   if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień Ownera.");
 }
 
+// =========================================================
+// COMMUNITY / FLATS / USERS HELPERS
+// =========================================================
+
 async function getCommunity(communityId) {
   const snap = await db.doc(`communities/${communityId}`).get();
   return snap.exists ? snap.data() : null;
 }
 
-async function assertSameCommunity(me, communityId) {
-  if (!communityId || communityId !== me.communityId) {
-    throw new HttpsError("permission-denied", "Inna wspólnota.");
-  }
+async function getFlat(communityId, flatId) {
+  const snap = await db.doc(`communities/${communityId}/flats/${flatId}`).get();
+  return snap.exists ? { id: snap.id, ...snap.data() } : null;
 }
 
-function ensureOpenAI() {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key || !OpenAI) return null;
-  return new OpenAI({ apiKey: key });
+async function listFlats(communityId, buildingId = null) {
+  let q = db.collection(`communities/${communityId}/flats`);
+  if (buildingId) q = q.where("buildingId", "==", buildingId);
+  const snap = await q.get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+async function getFlatResidents(communityId, flatId) {
+  const snap = await db.collection("users")
+    .where("communityId", "==", communityId)
+    .where("flatId", "==", flatId)
+    .where("role", "==", "RESIDENT")
+    .get();
+  return snap.docs.map(d => ({ uid: d.id, ...d.data() }));
+}
+
+async function registerStreet(communityId, streetName, createdByUid = "") {
+  const name = safeString(streetName);
+  if (!name) return null;
+  const slug = normalizeStreetName(name);
+  if (!slug) return null;
+  const ref = db.doc(`communities/${communityId}/streets/${slug}`);
+  await ref.set({
+    id: slug,
+    communityId,
+    name,
+    normalizedName: slug,
+    isActive: true,
+    updatedAtMs: nowMs(),
+    createdAtMs: nowMs(),
+    createdByUid
+  }, { merge: true });
+  return slug;
+}
+
+async function decrementSeatsUsed(communityId) {
+  await db.doc(`communities/${communityId}`).set({
+    seatsUsed: admin.firestore.FieldValue.increment(-1),
+    updatedAtMs: nowMs()
+  }, { merge: true });
+}
+
+async function incrementSeatsUsed(communityId) {
+  await db.doc(`communities/${communityId}`).set({
+    seatsUsed: admin.firestore.FieldValue.increment(1),
+    updatedAtMs: nowMs()
+  }, { merge: true });
+}
+
+async function ensureSeatAvailable(communityId) {
+  const community = await getCommunity(communityId);
+  const total = Number(community?.seatsTotal || 0);
+  const used = Number(community?.seatsUsed || 0);
+  if (total > 0 && used >= total) {
+    throw new HttpsError("resource-exhausted", "Wykorzystano limit seats.");
+  }
 }
 
 // =========================================================
@@ -178,15 +252,6 @@ async function getCommunityAdmins(communityId) {
     .where("role", "in", ["ADMIN", "MASTER"])
     .get();
   return snap.docs.map(d => d.data().fcmToken).filter(Boolean);
-}
-
-async function getFlatResidents(communityId, flatId) {
-  const snap = await db.collection("users")
-    .where("communityId", "==", communityId)
-    .where("flatId", "==", flatId)
-    .where("role", "==", "RESIDENT")
-    .get();
-  return snap.docs.map(d => ({ uid: d.id, ...d.data() }));
 }
 
 async function sendToToken(token, type, title, body, extraData = {}) {
@@ -294,41 +359,35 @@ exports.onCorrespondenceMessageCreated = onDocumentCreated("communities/{communi
   }
 });
 
-exports.onVoteCreated = onDocumentCreated("communities/{communityId}/votes/{voteId}", async (event) => {
+exports.onDueCreated = onDocumentCreated("communities/{communityId}/dues/{dueId}", async (event) => {
   const data = event.data.data();
-  await sendToTopic(`community_${event.params.communityId}`, "vote_new", "Nowe głosowanie", data.title, { senderUid: data.createdByUid });
+  await sendToTopic(`community_${event.params.communityId}`, "due_created", "Nowa płatność", data.title, { senderUid: data.createdByUid });
 });
 
-// Powiadom dopiero, gdy settlement zostanie opublikowany.
 exports.onSettlementPublished = onDocumentUpdated("communities/{communityId}/settlements/{settlementId}", async (event) => {
   const before = event.data.before.data();
   const after = event.data.after.data();
-  const wasPublished = before?.isPublished === true;
-  const isPublished = after?.isPublished === true;
-
-  if (wasPublished || !isPublished) return;
+  if (before?.isPublished === true || after?.isPublished !== true) return;
 
   const communityId = event.params.communityId;
   const residents = await getFlatResidents(communityId, after.flatId);
   const tokens = residents.map(r => r.fcmToken).filter(Boolean);
 
-  if (tokens.length > 0) {
-    await sendToTokens(
-      tokens,
-      "settlement_ready",
-      "Nowe rozliczenie",
-      `${after.period || ""} • ${after.flatLabel || after.flatId || ""}`,
-      {
-        settlementId: event.params.settlementId,
-        flatId: after.flatId || "",
-        period: after.period || ""
-      }
-    );
-  }
+  await sendToTokens(
+    tokens,
+    "settlement_ready",
+    "Nowe rozliczenie",
+    `${after.period || ""} • ${after.flatLabel || after.flatId || ""}`,
+    {
+      settlementId: event.params.settlementId,
+      flatId: after.flatId || "",
+      period: after.period || ""
+    }
+  );
 });
 
 // =========================================================
-// BASIC CALLABLES
+// BASIC SYSTEM CALLABLES
 // =========================================================
 
 exports.createActivationCode = onCall(async (request) => {
@@ -361,66 +420,23 @@ exports.createActivationCode = onCall(async (request) => {
   throw new HttpsError("resource-exhausted", "Błąd generowania kodu.");
 });
 
-exports.createInvite = onCall(async (request) => {
-  if (!request.auth) throw new HttpsError("unauthenticated", "Zaloguj się.");
-  const data = request.data || {};
-  const meSnap = await db.doc(`users/${request.auth.uid}`).get();
-  const me = meSnap.data() || {};
-
-  const invite = {
-    customerId: me.customerId || me.communityId,
-    communityId: me.communityId,
-    role: data.role || "RESIDENT",
-    status: "active",
-    createdAtMs: Date.now(),
-    expiresAtMs: Number(data.expiresAtMs || 0)
-  };
-  const ref = await db.collection("invites").add(invite);
-  return { inviteId: ref.id };
-});
-
-exports.claimInvite = onCall(async (request) => {
-  if (!request.auth) throw new HttpsError("unauthenticated", "Zaloguj się.");
-  const inviteId = safeString(request.data?.inviteId);
-
-  return await db.runTransaction(async (tx) => {
-    const snap = await tx.get(db.doc(`invites/${inviteId}`));
-    if (!snap.exists) throw new HttpsError("not-found", "Invite nie istnieje.");
-    const inv = snap.data();
-    tx.set(db.doc(`users/${request.auth.uid}`), {
-      role: inv.role,
-      communityId: inv.communityId,
-      customerId: inv.customerId,
-      updatedAtMs: Date.now()
-    }, { merge: true });
-    tx.update(db.doc(`invites/${inviteId}`), {
-      status: "used",
-      usedByUid: request.auth.uid
-    });
-    return { ok: true };
-  });
-});
-
 exports.activateCommunity = onCall(async (request) => {
-  if (!request.auth || !request.auth.uid) {
-    throw new HttpsError("unauthenticated", "Zaloguj się.");
-  }
+  if (!request.auth?.uid) throw new HttpsError("unauthenticated", "Zaloguj się.");
   const { code, nip, name } = request.data || {};
   if (!safeString(code) || !safeString(nip) || !safeString(name)) {
     throw new HttpsError("invalid-argument", "Brak danych aktywacji.");
   }
 
-  const communityDoc = db.collection("communities").doc();
+  const communityRef = db.collection("communities").doc();
 
   return await db.runTransaction(async (tx) => {
     const codeRef = db.doc(`activation_codes/${code}`);
     const codeSnap = await tx.get(codeRef);
     if (!codeSnap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
-    const codeData = codeSnap.data();
-    if (codeData.used === true) throw new HttpsError("failed-precondition", "Kod już użyty.");
+    if (codeSnap.data().used === true) throw new HttpsError("failed-precondition", "Kod już użyty.");
 
-    tx.set(communityDoc, {
-      id: communityDoc.id,
+    tx.set(communityRef, {
+      id: communityRef.id,
       name: safeString(name),
       nip: String(nip).replace(/\D/g, ""),
       createdAtMs: nowMs(),
@@ -434,23 +450,154 @@ exports.activateCommunity = onCall(async (request) => {
 
     tx.set(db.doc(`users/${request.auth.uid}`), {
       role: "MASTER",
-      communityId: communityDoc.id,
-      customerId: communityDoc.id,
+      communityId: communityRef.id,
+      customerId: communityRef.id,
       updatedAtMs: nowMs()
     }, { merge: true });
 
     tx.update(codeRef, {
       used: true,
       usedAtMs: nowMs(),
-      communityId: communityDoc.id
+      communityId: communityRef.id
     });
 
-    return { communityId: communityDoc.id };
+    return { ok: true, communityId: communityRef.id };
+  });
+});
+
+exports.createInvite = onCall(async (request) => {
+  const me = await assertSignedIn(request);
+  const data = request.data || {};
+  const invite = {
+    customerId: me.customerId || me.communityId,
+    communityId: me.communityId,
+    role: safeString(data.role || "RESIDENT"),
+    status: "active",
+    createdAtMs: nowMs(),
+    expiresAtMs: Number(data.expiresAtMs || 0)
+  };
+  const ref = await db.collection("invites").add(invite);
+  return { ok: true, inviteId: ref.id };
+});
+
+exports.claimInvite = onCall(async (request) => {
+  if (!request.auth?.uid) throw new HttpsError("unauthenticated", "Zaloguj się.");
+  const inviteId = safeString(request.data?.inviteId);
+  if (!inviteId) throw new HttpsError("invalid-argument", "Brak inviteId.");
+
+  return await db.runTransaction(async (tx) => {
+    const inviteRef = db.doc(`invites/${inviteId}`);
+    const snap = await tx.get(inviteRef);
+    if (!snap.exists) throw new HttpsError("not-found", "Invite nie istnieje.");
+    const inv = snap.data();
+    tx.set(db.doc(`users/${request.auth.uid}`), {
+      role: inv.role,
+      communityId: inv.communityId,
+      customerId: inv.customerId,
+      updatedAtMs: nowMs()
+    }, { merge: true });
+    tx.update(inviteRef, {
+      status: "used",
+      usedByUid: request.auth.uid,
+      usedAtMs: nowMs()
+    });
+    return { ok: true };
+  });
+});
+
+async function ensureCommunityJoinCode(communityId, role) {
+  const code = randomCode(10);
+  const ref = db.doc(`join_codes/${code}`);
+  await ref.create({
+    code,
+    communityId,
+    role,
+    createdAtMs: nowMs(),
+    status: "ACTIVE"
+  });
+  return code;
+}
+
+exports.createJoinCode = onCall(async (request) => {
+  const me = await assertAdminOrMaster(request);
+  const role = safeString(request.data?.role || "ACCOUNTANT").toUpperCase();
+  if (!["ACCOUNTANT", "ADMIN", "RESIDENT"].includes(role)) {
+    throw new HttpsError("invalid-argument", "Nieobsługiwana rola.");
+  }
+  const communityId = safeString(request.data?.communityId || me.communityId);
+  await assertSameCommunity(me, communityId);
+  const code = await ensureCommunityJoinCode(communityId, role);
+  return { ok: true, code, communityId, role };
+});
+
+exports.claimJoinCode = onCall(async (request) => {
+  const me = await assertSignedIn(request);
+  const code = safeString(request.data?.code);
+  if (!code) throw new HttpsError("invalid-argument", "Podaj kod.");
+
+  const ref = db.doc(`join_codes/${code}`);
+  return await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
+    const jc = snap.data();
+    if (jc.status !== "ACTIVE") throw new HttpsError("failed-precondition", "Kod nieważny.");
+
+    tx.update(ref, {
+      status: "USED",
+      usedAtMs: nowMs(),
+      usedByUid: request.auth.uid
+    });
+
+    tx.set(db.doc(`users/${request.auth.uid}`), {
+      role: jc.role,
+      communityId: jc.communityId,
+      customerId: jc.communityId,
+      updatedAtMs: nowMs(),
+      staffSeat: true
+    }, { merge: true });
+
+    return { ok: true, communityId: jc.communityId, role: jc.role };
+  });
+});
+
+exports.createWebSession = onCall(async (request) => {
+  const me = await assertSignedIn(request);
+  const token = randomToken(48);
+  const target = safeString(request.data?.target || "/payments");
+  const expiresAtMs = nowMs() + 2 * 60 * 1000;
+
+  await db.doc(`webSessions/${token}`).set({
+    token,
+    uid: request.auth.uid,
+    communityId: me.communityId || "",
+    createdAtMs: nowMs(),
+    expiresAtMs,
+    used: false,
+    target
+  });
+
+  return { ok: true, token, expiresAtMs, target };
+});
+
+exports.consumeWebSession = onCall(async (request) => {
+  const token = safeString(request.data?.token);
+  if (!token) throw new HttpsError("invalid-argument", "Brak token.");
+
+  return await db.runTransaction(async (tx) => {
+    const ref = db.doc(`webSessions/${token}`);
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new HttpsError("not-found", "Token nie istnieje.");
+    const s = snap.data();
+    if (s.used) throw new HttpsError("failed-precondition", "Token zużyty.");
+    if (nowMs() > Number(s.expiresAtMs || 0)) throw new HttpsError("failed-precondition", "Token wygasł.");
+    tx.update(ref, { used: true, usedAtMs: nowMs() });
+    const customToken = await admin.auth().createCustomToken(String(s.uid));
+    return { ok: true, customToken, uid: s.uid, target: s.target || "/payments" };
   });
 });
 
 // =========================================================
-// USER / STREET MANAGEMENT
+// USER / STREET / SEATS CALLABLES
 // =========================================================
 
 exports.removeUser = onCall(async (request) => {
@@ -491,7 +638,6 @@ exports.setUserBlocked = onCall(async (request) => {
   const targetRef = db.doc(`users/${targetUid}`);
   const targetSnap = await targetRef.get();
   if (!targetSnap.exists) throw new HttpsError("not-found", "Użytkownik nie istnieje.");
-
   const target = targetSnap.data();
   if (target.communityId !== me.communityId) throw new HttpsError("permission-denied", "Inna wspólnota.");
 
@@ -508,132 +654,44 @@ exports.addStreet = onCall(async (request) => {
   const me = await assertMaster(request);
   const communityId = safeString(request.data?.communityId || me.communityId);
   const name = safeString(request.data?.name || request.data?.street);
-  if (!communityId || !name) throw new HttpsError("invalid-argument", "Brak communityId lub nazwy ulicy.");
   await assertSameCommunity(me, communityId);
+  if (!name) throw new HttpsError("invalid-argument", "Brak nazwy ulicy.");
 
-  const slug = normalizeStreetName(name);
-  if (!slug) throw new HttpsError("invalid-argument", "Nieprawidłowa nazwa ulicy.");
-
-  const ref = db.doc(`communities/${communityId}/streets/${slug}`);
-  await ref.set({
-    id: slug,
-    name,
-    normalizedName: slug,
-    communityId,
-    isActive: true,
-    updatedAtMs: nowMs(),
-    createdAtMs: nowMs(),
-    createdByUid: request.auth.uid
-  }, { merge: true });
-
-  return { ok: true, streetId: slug, name };
+  const streetId = await registerStreet(communityId, name, request.auth.uid);
+  return { ok: true, streetId, name };
 });
 
-// =========================================================
-// JOIN CODES / SSO
-// =========================================================
+exports.removeFlatSafe = onCall(async (request) => {
+  const me = await assertStaff(request);
+  const communityId = safeString(request.data?.communityId || me.communityId);
+  const flatId = safeString(request.data?.flatId);
+  await assertSameCommunity(me, communityId);
+  if (!flatId) throw new HttpsError("invalid-argument", "Brak flatId.");
 
-async function ensureCommunityJoinCode(communityId, role) {
-  const code = randomCode(10);
-  const ref = db.doc(`join_codes/${code}`);
-  await ref.create({
-    code,
-    communityId,
-    role,
-    createdAtMs: nowMs(),
-    status: "ACTIVE"
-  });
-  return code;
-}
+  const flatRef = db.doc(`communities/${communityId}/flats/${flatId}`);
+  const flatSnap = await flatRef.get();
+  if (!flatSnap.exists) throw new HttpsError("not-found", "Brak lokalu.");
 
-exports.createJoinCode = onCall(async (request) => {
-  const me = await assertAdminOrMaster(request);
-  const role = safeString(request.data?.role || "ACCOUNTANT").toUpperCase();
-  if (!["ACCOUNTANT", "ADMIN", "RESIDENT"].includes(role)) {
-    throw new HttpsError("invalid-argument", "Nieobsługiwana rola.");
+  const residents = await getFlatResidents(communityId, flatId);
+  for (const res of residents) {
+    await db.doc(`users/${res.uid}`).set({
+      role: "REMOVED",
+      appBlocked: true,
+      flatId: admin.firestore.FieldValue.delete(),
+      flatLabel: admin.firestore.FieldValue.delete(),
+      removedAtMs: nowMs(),
+      removedByUid: request.auth.uid
+    }, { merge: true });
   }
 
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
-  await assertSameCommunity(me, communityId);
+  await flatRef.delete();
+  await decrementSeatsUsed(communityId);
 
-  const code = await ensureCommunityJoinCode(communityId, role);
-  return { code, communityId, role };
-});
-
-exports.claimJoinCode = onCall(async (request) => {
-  const me = await assertSignedIn(request);
-  const code = safeString(request.data?.code);
-  if (!code) throw new HttpsError("invalid-argument", "Podaj kod.");
-
-  const ref = db.doc(`join_codes/${code}`);
-  return await db.runTransaction(async (tx) => {
-    const snap = await tx.get(ref);
-    if (!snap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
-    const jc = snap.data();
-    if (jc.status !== "ACTIVE") throw new HttpsError("failed-precondition", "Kod nieważny.");
-
-    tx.update(ref, {
-      status: "USED",
-      usedAtMs: nowMs(),
-      usedByUid: request.auth.uid
-    });
-
-    tx.set(db.doc(`users/${request.auth.uid}`), {
-      role: jc.role,
-      communityId: jc.communityId,
-      customerId: jc.communityId,
-      updatedAtMs: nowMs(),
-      staffSeat: true
-    }, { merge: true });
-
-    return { ok: true, communityId: jc.communityId, role: jc.role };
-  });
-});
-
-exports.createWebSession = onCall(async (request) => {
-  const me = await assertSignedIn(request);
-  const target = safeString(request.data?.target || "/payments");
-  const token = randomToken(48);
-  const expiresAtMs = nowMs() + 2 * 60 * 1000;
-
-  await db.doc(`webSessions/${token}`).set({
-    token,
-    uid: request.auth.uid,
-    communityId: me.communityId || "",
-    createdAtMs: nowMs(),
-    expiresAtMs,
-    used: false,
-    target
-  });
-
-  return { token, expiresAtMs, target };
-});
-
-exports.consumeWebSession = onCall(async (request) => {
-  const token = safeString(request.data?.token);
-  if (!token) throw new HttpsError("invalid-argument", "Brak token.");
-
-  return await db.runTransaction(async (tx) => {
-    const ref = db.doc(`webSessions/${token}`);
-    const snap = await tx.get(ref);
-    if (!snap.exists) throw new HttpsError("not-found", "Token nie istnieje.");
-    const s = snap.data();
-    if (s.used) throw new HttpsError("failed-precondition", "Token zużyty.");
-    if (nowMs() > Number(s.expiresAtMs || 0)) throw new HttpsError("failed-precondition", "Token wygasł.");
-
-    tx.update(ref, {
-      used: true,
-      usedAtMs: nowMs()
-    });
-
-    const customToken = await admin.auth().createCustomToken(String(s.uid));
-    return { customToken, uid: s.uid, target: s.target || "/payments" };
-  });
+  return { ok: true };
 });
 
 // =========================================================
-// KSeF / PARSE
+// KSeF / XML / OCR HELPERS
 // =========================================================
 
 const xmlParser = new XMLParser({
@@ -648,7 +706,6 @@ function parseInvoiceXmlBasic(xml) {
   const total = totalCandidates.length ? totalCandidates[totalCandidates.length - 1] : "0.00";
   const dateMatch = raw.match(/(20\d{2}-\d{2}-\d{2})/);
   const issueDate = dateMatch ? dateMatch[1] : "";
-
   return {
     issueDate,
     period: monthFromDateStr(issueDate),
@@ -661,19 +718,155 @@ function parseInvoiceXmlBasic(xml) {
   };
 }
 
+async function extractPdfText(base64Pdf) {
+  if (!pdfParse) {
+    throw new HttpsError("failed-precondition", "Brak pdf-parse w functions. Doinstaluj pdf-parse.");
+  }
+  const buffer = Buffer.from(String(base64Pdf || ""), "base64");
+  const parsed = await pdfParse(buffer);
+  return String(parsed?.text || "").replace(/\u0000/g, " ").trim();
+}
+
+// =========================================================
+// AI HELPERS
+// =========================================================
+
+function heuristicCategory(text) {
+  const t = String(text || "").toLowerCase();
+  if (t.includes("woda") || t.includes("ściek") || t.includes("kanal")) return "WODA";
+  if (t.includes("gaz")) return "GAZ";
+  if (t.includes("energia") || t.includes("prąd") || t.includes("tauron") || t.includes("enea")) return "PRAD";
+  if (t.includes("sprząt") || t.includes("czysto")) return "SPRZATANIE";
+  if (t.includes("remont") || t.includes("napraw") || t.includes("modern")) return "REMONT";
+  return "INNE";
+}
+
+async function askAiForJson(prompt, model = null, fallback = null) {
+  const client = getOpenAIClient();
+  if (!client) return fallback;
+
+  try {
+    const resp = await client.chat.completions.create({
+      model: model || process.env.OPENAI_MODEL_FAST || "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.1,
+      response_format: { type: "json_object" }
+    });
+
+    const content = resp.choices?.[0]?.message?.content || "";
+    return JSON.parse(content);
+  } catch (e) {
+    console.error("OpenAI error:", e);
+    return fallback;
+  }
+}
+
+async function aiSuggestInvoice(invoiceText) {
+  const prompt = [
+    "Jesteś asystentem księgowej wspólnoty mieszkaniowej.",
+    "Zwróć wyłącznie JSON:",
+    "{",
+    '  "category":"PRAD|WODA|GAZ|SPRZATANIE|REMONT|INNE",',
+    '  "scope":"COMMON|FLAT",',
+    '  "period":"YYYY-MM",',
+    '  "confidence":0.0,',
+    '  "needsReview":true,',
+    '  "reason":"..."',
+    "}",
+    "",
+    "FAKTURA:",
+    invoiceText
+  ].join("\n");
+
+  return await askAiForJson(prompt, process.env.OPENAI_MODEL_FAST || "gpt-4o-mini", null);
+}
+
+async function aiExplainReview(input) {
+  const prompt = [
+    "Wyjaśnij księgowej prostym językiem, dlaczego sprawa trafiła do review queue.",
+    "Zwróć wyłącznie JSON:",
+    "{",
+    '  "summary":"...",',
+    '  "reason":"...",',
+    '  "recommendedChecks":["...", "..."]',
+    "}",
+    "",
+    JSON.stringify(input)
+  ].join("\n");
+
+  return await askAiForJson(prompt, process.env.OPENAI_MODEL_SMART || process.env.OPENAI_MODEL_FAST || "gpt-4o-mini", null);
+}
+
+async function aiMatchPayment({ title, amount, candidates }) {
+  const prompt = [
+    "Dopasuj przelew do najlepszego kandydata.",
+    "Zwróć wyłącznie JSON:",
+    "{",
+    '  "suggestedFlatId":"...",',
+    '  "suggestedSettlementId":"...",',
+    '  "confidence":0.0,',
+    '  "needsReview":true,',
+    '  "reason":"..."',
+    "}",
+    "",
+    `Tytuł: ${title}`,
+    `Kwota: ${amount}`,
+    `Kandydaci: ${JSON.stringify(candidates)}`
+  ].join("\n");
+
+  return await askAiForJson(prompt, process.env.OPENAI_MODEL_FAST || "gpt-4o-mini", null);
+}
+
+async function aiAnalyzeMeter({ currentValue, prevValue, meterType, unit, flatLabel }) {
+  const prompt = [
+    "Oceń czy odczyt licznika wygląda podejrzanie.",
+    "Zwróć wyłącznie JSON:",
+    "{",
+    '  "anomaly":true,',
+    '  "confidence":0.0,',
+    '  "needsReview":true,',
+    '  "reason":"..."',
+    "}",
+    "",
+    `Typ licznika: ${meterType}`,
+    `Jednostka: ${unit}`,
+    `Lokal: ${flatLabel}`,
+    `Poprzedni odczyt: ${prevValue}`,
+    `Nowy odczyt: ${currentValue}`
+  ].join("\n");
+
+  return await askAiForJson(prompt, process.env.OPENAI_MODEL_FAST || "gpt-4o-mini", null);
+}
+
+// =========================================================
+// REVIEW QUEUE HELPERS
+// =========================================================
+
+async function createReviewItem(communityId, data) {
+  const ref = await db.collection(`communities/${communityId}/reviewQueue`).add({
+    status: "OPEN",
+    createdAtMs: nowMs(),
+    ...data
+  });
+  return ref.id;
+}
+
+// =========================================================
+// KSeF / OCR / AI FACTURE FLOW
+// =========================================================
+
 exports.ksefSetConfig = onCall(async (request) => {
   const me = await assertStaff(request);
   const communityId = safeString(request.data?.communityId || me.communityId);
   await assertSameCommunity(me, communityId);
 
-  const cfg = {
+  await db.doc(`communities/${communityId}/ksef/config`).set({
     mode: safeString(request.data?.mode || "MOCK"),
-    identifier: safeString(request.data?.identifier),
+    identifier: safeString(request.data?.identifier || ""),
     updatedAtMs: nowMs(),
     updatedByUid: request.auth.uid
-  };
+  }, { merge: true });
 
-  await db.doc(`communities/${communityId}/ksef/config`).set(cfg, { merge: true });
   return { ok: true };
 });
 
@@ -697,13 +890,13 @@ exports.ksefFetchInvoices = onCall(async (request) => {
   <Items><Item><Name>Energia elektryczna</Name><Amount>1234.56</Amount></Item></Items>
 </Invoice>`;
 
-    const basic = parseInvoiceXmlBasic(xml);
+    const parsed = parseInvoiceXmlBasic(xml);
     const ref = await db.collection(`communities/${communityId}/ksefInvoices`).add({
       createdAtMs: nowMs(),
       status: "NOWA",
       source: "MOCK",
       xml,
-      parsed: basic,
+      parsed,
       ksefNumber,
       assigned: { scope: null },
       ai: { status: "PENDING" }
@@ -725,8 +918,7 @@ exports.ksefParseInvoice = onCall(async (request) => {
   const snap = await ref.get();
   if (!snap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
 
-  const inv = snap.data();
-  const xml = safeString(inv.xml);
+  const xml = safeString(snap.data().xml);
   const parsed = parseInvoiceXmlBasic(xml);
 
   await ref.set({
@@ -737,102 +929,64 @@ exports.ksefParseInvoice = onCall(async (request) => {
   return { ok: true, parsed };
 });
 
-// =========================================================
-// AI HELPERS
-// =========================================================
+exports.aiParseInvoicePdf = onCall(async (request) => {
+  const me = await assertStaff(request);
+  const communityId = safeString(request.data?.communityId || me.communityId);
+  const fileBase64 = safeString(request.data?.fileBase64);
+  const filename = safeString(request.data?.filename || "invoice.pdf");
+  await assertSameCommunity(me, communityId);
+  if (!fileBase64) throw new HttpsError("invalid-argument", "Brak pliku PDF.");
 
-function heuristicCategory(text) {
-  const t = String(text || "").toLowerCase();
-  if (t.includes("woda") || t.includes("ściek") || t.includes("kanal")) return "WODA";
-  if (t.includes("gaz")) return "GAZ";
-  if (t.includes("energia") || t.includes("prąd") || t.includes("tauron") || t.includes("enea")) return "PRAD";
-  if (t.includes("sprząt") || t.includes("czysto")) return "SPRZATANIE";
-  if (t.includes("remont") || t.includes("napraw") || t.includes("modern")) return "REMONT";
-  return "INNE";
-}
+  const text = await extractPdfText(fileBase64);
+  const heuristic = {
+    category: heuristicCategory(text),
+    scope: "COMMON",
+    period: monthFromDateStr((text.match(/20\d{2}-\d{2}-\d{2}/) || [])[0] || ""),
+    confidence: 0.55,
+    needsReview: true,
+    reason: "Heurystyka OCR/PDF"
+  };
 
-async function openAiJson(prompt, fallback = null) {
-  const client = ensureOpenAI();
-  if (!client) return fallback;
+  const ai = await aiSuggestInvoice(text);
+  const suggestion = ai || heuristic;
 
-  try {
-    const resp = await client.chat.completions.create({
-      model: process.env.OPENAI_MODEL_FAST || "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.1,
-      response_format: { type: "json_object" }
+  const ref = await db.collection(`communities/${communityId}/ksefInvoices`).add({
+    createdAtMs: nowMs(),
+    status: "NOWA",
+    source: "PDF_OCR",
+    filename,
+    extractedText: text,
+    parsed: {
+      issueDate: "",
+      period: suggestion.period || "",
+      totalGrossCents: 0,
+      currency: "PLN",
+      sellerName: "",
+      buyerName: "",
+      ksefNumber: "",
+      items: []
+    },
+    assigned: { scope: null },
+    ai: {
+      status: "READY",
+      suggestion,
+      suggestedAtMs: nowMs(),
+      by: ai ? "AI" : "HEURISTIC"
+    }
+  });
+
+  if (suggestion.needsReview || Number(suggestion.confidence || 0) < 0.85) {
+    await createReviewItem(communityId, {
+      type: "INVOICE_PDF",
+      invoiceId: ref.id,
+      title: `OCR faktury: ${filename}`,
+      reason: suggestion.reason || "Wymaga sprawdzenia",
+      confidence: Number(suggestion.confidence || 0)
     });
-
-    const content = resp.choices?.[0]?.message?.content || "";
-    return JSON.parse(content);
-  } catch (e) {
-    console.error("OpenAI error:", e);
-    return fallback;
   }
-}
 
-async function openAiSuggestInvoice({ invoiceText }) {
-  const prompt = [
-    "Jesteś asystentem księgowej wspólnoty mieszkaniowej.",
-    "Na podstawie tekstu faktury zaproponuj JSON:",
-    "{",
-    '  "category":"PRAD|WODA|GAZ|SPRZATANIE|REMONT|INNE",',
-    '  "scope":"COMMON|FLAT",',
-    '  "period":"YYYY-MM",',
-    '  "confidence":0.0,',
-    '  "reason":"krótkie uzasadnienie"',
-    "}",
-    "",
-    "FAKTURA:",
-    invoiceText
-  ].join("\n");
-
-  return await openAiJson(prompt, null);
-}
-
-async function openAiMatchPayment({ title, amount, candidates }) {
-  const prompt = [
-    "Dopasuj przelew do najlepszego kandydata.",
-    "Zwróć wyłącznie JSON:",
-    "{",
-    '  "suggestedFlatId":"...",',
-    '  "suggestedSettlementId":"...",',
-    '  "confidence":0.0,',
-    '  "needsReview":true,',
-    '  "reason":"..."',
-    "}",
-    "",
-    `Tytuł: ${title}`,
-    `Kwota: ${amount}`,
-    `Kandydaci: ${JSON.stringify(candidates)}`
-  ].join("\n");
-
-  return await openAiJson(prompt, null);
-}
-
-async function openAiMeterAnomaly({ currentValue, prevValue, meterType, unit, flatLabel }) {
-  const prompt = [
-    "Oceń, czy odczyt licznika wygląda podejrzanie.",
-    "Zwróć wyłącznie JSON:",
-    "{",
-    '  "anomaly":true,',
-    '  "confidence":0.0,',
-    '  "reason":"..."',
-    "}",
-    "",
-    `Typ: ${meterType}`,
-    `Jednostka: ${unit}`,
-    `Lokal: ${flatLabel}`,
-    `Poprzedni odczyt: ${prevValue}`,
-    `Nowy odczyt: ${currentValue}`
-  ].join("\n");
-
-  return await openAiJson(prompt, null);
-}
-
-// =========================================================
-// AI CALLABLES
-// =========================================================
+  return { ok: true, invoiceId: ref.id, suggestion };
+});
 
 exports.aiSuggestInvoice = onCall(async (request) => {
   const me = await assertStaff(request);
@@ -847,16 +1001,22 @@ exports.aiSuggestInvoice = onCall(async (request) => {
 
   const inv = snap.data();
   const parsed = inv.parsed || {};
-  const invoiceText = `${inv.ksefNumber || ""} ${parsed.sellerName || ""} ${parsed.buyerName || ""} ${JSON.stringify(parsed.items || [])}`;
+  const invoiceText = [
+    inv.ksefNumber || "",
+    parsed.sellerName || "",
+    parsed.buyerName || "",
+    JSON.stringify(parsed.items || []),
+    inv.extractedText || ""
+  ].join(" ");
 
-  let suggestion = await openAiSuggestInvoice({ invoiceText });
+  let suggestion = await aiSuggestInvoice(invoiceText);
   if (!suggestion) {
-    const category = heuristicCategory(invoiceText);
     suggestion = {
-      category,
+      category: heuristicCategory(invoiceText),
       scope: "COMMON",
       period: parsed.period || "",
       confidence: 0.55,
+      needsReview: true,
       reason: "Heurystyka słownikowa"
     };
   }
@@ -866,115 +1026,26 @@ exports.aiSuggestInvoice = onCall(async (request) => {
       status: "READY",
       suggestion,
       suggestedAtMs: nowMs(),
-      by: "AI"
+      by: suggestion.reason === "Heurystyka słownikowa" ? "HEURISTIC" : "AI"
     }
   }, { merge: true });
+
+  if (suggestion.needsReview || Number(suggestion.confidence || 0) < 0.85) {
+    await createReviewItem(communityId, {
+      type: "INVOICE_ASSIGNMENT",
+      invoiceId,
+      title: `Weryfikacja faktury ${invoiceId}`,
+      reason: suggestion.reason || "Wymaga sprawdzenia",
+      confidence: Number(suggestion.confidence || 0)
+    });
+  }
 
   return { ok: true, suggestion };
 });
 
-exports.aiMatchPayment = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const title = safeString(request.data?.title);
-  const amount = Number(request.data?.amount || 0);
-  await assertSameCommunity(me, communityId);
-  if (!title) throw new HttpsError("invalid-argument", "Brak tytułu.");
-
-  const settlementsSnap = await db.collection(`communities/${communityId}/settlements`)
-    .where("isPublished", "==", true)
-    .limit(50)
-    .get();
-
-  const candidates = settlementsSnap.docs.map(d => {
-    const x = d.data();
-    return {
-      settlementId: d.id,
-      flatId: x.flatId || "",
-      flatLabel: x.flatLabel || "",
-      period: x.period || "",
-      totalDueCents: x.totalDueCents || 0,
-      paymentTitle: x.paymentTitle || ""
-    };
-  });
-
-  let result = await openAiMatchPayment({ title, amount, candidates });
-
-  if (!result) {
-    const lower = title.toLowerCase();
-    const match = candidates.find(c =>
-      lower.includes(String(c.paymentTitle || "").toLowerCase()) ||
-      lower.includes(String(c.flatLabel || "").toLowerCase())
-    );
-
-    result = match ? {
-      suggestedFlatId: match.flatId,
-      suggestedSettlementId: match.settlementId,
-      confidence: 0.72,
-      needsReview: false,
-      reason: "Dopasowanie heurystyczne po tytule"
-    } : {
-      suggestedFlatId: "",
-      suggestedSettlementId: "",
-      confidence: 0.2,
-      needsReview: true,
-      reason: "Brak pewnego dopasowania"
-    };
-  }
-
-  return { ok: true, result };
-});
-
-exports.aiMeterAnomaly = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  await assertSameCommunity(me, communityId);
-
-  const currentValue = Number(request.data?.currentValue || 0);
-  const prevValue = Number(request.data?.prevValue || 0);
-  const meterType = safeString(request.data?.meterType);
-  const unit = safeString(request.data?.unit);
-  const flatLabel = safeString(request.data?.flatLabel);
-
-  const diff = currentValue - prevValue;
-  if (diff < 0) {
-    return {
-      ok: true,
-      result: {
-        anomaly: true,
-        confidence: 0.99,
-        reason: "Nowy odczyt jest mniejszy od poprzedniego."
-      }
-    };
-  }
-
-  let result = await openAiMeterAnomaly({ currentValue, prevValue, meterType, unit, flatLabel });
-  if (!result) {
-    result = {
-      anomaly: diff > Math.max(prevValue * 0.5, 500),
-      confidence: diff > Math.max(prevValue * 0.5, 500) ? 0.78 : 0.45,
-      reason: "Reguła progowa"
-    };
-  }
-
-  return { ok: true, result };
-});
-
 // =========================================================
-// CHARGES / SETTLEMENTS
+// APPROVAL / CHARGES / SETTLEMENTS
 // =========================================================
-
-async function listFlats(communityId, buildingId = null) {
-  let q = db.collection(`communities/${communityId}/flats`);
-  if (buildingId) q = q.where("buildingId", "==", buildingId);
-  const snap = await q.get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
-
-async function getFlat(communityId, flatId) {
-  const snap = await db.doc(`communities/${communityId}/flats/${flatId}`).get();
-  return snap.exists ? { id: snap.id, ...snap.data() } : null;
-}
 
 async function recalcSettlement(communityId, flatId, period) {
   const flat = await getFlat(communityId, flatId);
@@ -997,25 +1068,15 @@ async function recalcSettlement(communityId, flatId, period) {
   const totalPaymentsCents = payments.reduce((s, x) => s + Number(x.amountCents || 0), 0);
   const balanceCents = totalChargesCents - totalPaymentsCents;
 
-  const titleCode = safeString(flat.paymentCode || flat.flatLabel || flatId)
-    .replace(/\s+/g, "-")
-    .toUpperCase();
-
   const community = await getCommunity(communityId);
-  const paymentTitle = `EL-${titleCode} ${period}`;
+  const settlementId = `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
+  const paymentTitle = `EL-${paymentCodeForFlat(flat)} ${period}`;
 
-  const settlementDocId = `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
-  const ref = db.doc(`communities/${communityId}/settlements/${settlementDocId}`);
-
-  const transferName = safeString(flat.recipientName || community?.recipientName || community?.name);
-  const transferAddress = safeString(flat.recipientAddress || community?.recipientAddress || "");
-  const accountNumber = safeString(flat.accountNumber || community?.defaultAccountNumber || community?.accountNumber || "");
-
-  await ref.set({
-    id: settlementDocId,
+  await db.doc(`communities/${communityId}/settlements/${settlementId}`).set({
+    id: settlementId,
     communityId,
     flatId,
-    flatLabel: safeString(flat.flatLabel || `${flat.street || ""} ${flat.buildingNo || ""}/${flat.apartmentNo || ""}`.trim()),
+    flatLabel: valueOr(flat.flatLabel, `${flat.street || ""} ${flat.buildingNo || ""}/${flat.apartmentNo || ""}`.trim()),
     street: flat.street || "",
     buildingNo: flat.buildingNo || "",
     apartmentNo: flat.apartmentNo || "",
@@ -1026,31 +1087,25 @@ async function recalcSettlement(communityId, flatId, period) {
     totalDueCents: balanceCents,
     dueDate: `${period}-15`,
     paymentTitle,
-    transferName,
-    transferAddress,
-    accountNumber,
-    residentName: safeString(flat.name || flat.payerName || ""),
-    residentEmail: safeString(flat.email || flat.payerEmail || ""),
+    transferName: valueOr(flat.recipientName, valueOr(community?.recipientName, community?.name)),
+    transferAddress: valueOr(flat.recipientAddress, community?.recipientAddress),
+    accountNumber: valueOr(flat.accountNumber, valueOr(community?.defaultAccountNumber, community?.accountNumber)),
+    residentName: valueOr(flat.name, flat.payerName),
+    residentEmail: valueOr(flat.email, flat.payerEmail),
     status: "DRAFT",
     isPublished: false,
     updatedAtMs: nowMs(),
     createdAtMs: nowMs()
   }, { merge: true });
 
-  return {
-    settlementId: settlementDocId,
-    totalChargesCents,
-    totalPaymentsCents,
-    balanceCents
-  };
+  return { settlementId, totalChargesCents, totalPaymentsCents, balanceCents };
 }
 
 async function recalcAllSettlementsForPeriod(communityId, period) {
   const flats = await listFlats(communityId);
   const out = [];
   for (const flat of flats) {
-    const res = await recalcSettlement(communityId, flat.id, period);
-    out.push(res);
+    out.push(await recalcSettlement(communityId, flat.id, period));
   }
   return out;
 }
@@ -1070,7 +1125,7 @@ exports.approveInvoice = onCall(async (request) => {
   const inv = snap.data();
   const parsed = inv.parsed || {};
   const totalCents = Number(parsed.totalGrossCents || 0);
-  const period = safeString(assignment.period || parsed.period);
+  const period = safeString(assignment.period || parsed.period || inv.ai?.suggestion?.period);
   const category = safeString(assignment.category || inv.ai?.suggestion?.category || "INNE");
   const scope = safeString(assignment.scope || inv.ai?.suggestion?.scope || "COMMON");
   const buildingId = assignment.buildingId || null;
@@ -1112,8 +1167,8 @@ exports.approveInvoice = onCall(async (request) => {
     ? flats.reduce((s, f) => s + Math.max(0, Number(f.areaM2 || 0)), 0)
     : flats.length;
 
-  let allocated = 0;
   const chargeIds = [];
+  let allocated = 0;
 
   for (let i = 0; i < flats.length; i++) {
     const f = flats[i];
@@ -1142,8 +1197,19 @@ exports.approveInvoice = onCall(async (request) => {
   return { ok: true, chargesCreated: chargeIds.length, chargeIds };
 });
 
+exports.rebuildSettlementsForPeriod = onCall(async (request) => {
+  const me = await assertStaff(request);
+  const communityId = safeString(request.data?.communityId || me.communityId);
+  const period = safeString(request.data?.period);
+  await assertSameCommunity(me, communityId);
+  if (!period) throw new HttpsError("invalid-argument", "Brak period.");
+
+  const out = await recalcAllSettlementsForPeriod(communityId, period);
+  return { ok: true, count: out.length };
+});
+
 // =========================================================
-// PDF / EMAIL
+// PDF / EMAIL / PUBLISH FLOW
 // =========================================================
 
 async function buildSettlementPdfBuffer({ communityId, flatId, period, charges, settlement }) {
@@ -1164,43 +1230,17 @@ async function buildSettlementPdfBuffer({ communityId, flatId, period, charges, 
   if (settlement?.transferAddress) doc.text(`Adres odbiorcy: ${settlement.transferAddress}`);
   doc.moveDown();
 
-  let sum = 0;
-  charges.forEach(c => { sum += Number(c.amountCents || 0); });
-
-  doc.text(`Suma naliczeń: ${formatMoney(sum)}`);
-  doc.text(`Saldo: ${formatMoney(settlement?.balanceCents || sum)}`);
+  const totalCharges = charges.reduce((s, c) => s + Number(c.amountCents || 0), 0);
+  doc.text(`Suma naliczeń: ${formatMoney(totalCharges)}`);
+  doc.text(`Saldo: ${formatMoney(settlement?.balanceCents || totalCharges)}`);
   doc.moveDown();
   doc.text("Pozycje:");
-  charges.forEach(c => {
-    doc.text(`- ${c.category || "INNE"}: ${formatMoney(Number(c.amountCents || 0))}`);
-  });
+  charges.forEach(c => doc.text(`- ${c.category || "INNE"}: ${formatMoney(Number(c.amountCents || 0))}`));
 
   doc.end();
   await done;
   return Buffer.concat(chunks);
 }
-
-exports.generateSettlementPdf = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const flatId = safeString(request.data?.flatId);
-  const period = safeString(request.data?.period);
-  await assertSameCommunity(me, communityId);
-  if (!flatId || !period) throw new HttpsError("invalid-argument", "Brak flatId/period.");
-
-  const chargesSnap = await db.collection(`communities/${communityId}/charges`)
-    .where("flatId", "==", flatId)
-    .where("period", "==", period)
-    .get();
-
-  const charges = chargesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-  const settlementId = `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
-  const settlementSnap = await db.doc(`communities/${communityId}/settlements/${settlementId}`).get();
-  const settlement = settlementSnap.exists ? settlementSnap.data() : null;
-
-  const pdf = await buildSettlementPdfBuffer({ communityId, flatId, period, charges, settlement });
-  return { ok: true, base64: pdf.toString("base64"), mime: "application/pdf" };
-});
 
 async function sendSettlementEmailInternal({ communityId, flatId, period }) {
   const settlementId = `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
@@ -1224,7 +1264,6 @@ async function sendSettlementEmailInternal({ communityId, flatId, period }) {
     .where("flatId", "==", flatId)
     .where("period", "==", period)
     .get();
-
   const charges = chargesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
   const pdf = await buildSettlementPdfBuffer({ communityId, flatId, period, charges, settlement });
 
@@ -1263,7 +1302,7 @@ async function sendSettlementEmailInternal({ communityId, flatId, period }) {
   return { ok: true, mode: "SMTP" };
 }
 
-exports.sendSettlementEmail = onCall(async (request) => {
+exports.generateSettlementPdf = onCall(async (request) => {
   const me = await assertStaff(request);
   const communityId = safeString(request.data?.communityId || me.communityId);
   const flatId = safeString(request.data?.flatId);
@@ -1271,12 +1310,29 @@ exports.sendSettlementEmail = onCall(async (request) => {
   await assertSameCommunity(me, communityId);
   if (!flatId || !period) throw new HttpsError("invalid-argument", "Brak flatId/period.");
 
-  return await sendSettlementEmailInternal({ communityId, flatId, period });
+  const settlementId = `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
+  const settlementSnap = await db.doc(`communities/${communityId}/settlements/${settlementId}`).get();
+  const settlement = settlementSnap.exists ? settlementSnap.data() : null;
+
+  const chargesSnap = await db.collection(`communities/${communityId}/charges`)
+    .where("flatId", "==", flatId)
+    .where("period", "==", period)
+    .get();
+  const charges = chargesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+  const pdf = await buildSettlementPdfBuffer({ communityId, flatId, period, charges, settlement });
+  return { ok: true, base64: pdf.toString("base64"), mime: "application/pdf" };
 });
 
-// =========================================================
-// PUBLISH FLOW
-// =========================================================
+exports.sendSettlementEmail = onCall(async (request) => {
+  const me = await assertStaff(request);
+  const communityId = safeString(request.data?.communityId || me.communityId);
+  const flatId = safeString(request.data?.flatId);
+  const period = safeString(request.data?.period);
+  await assertSameCommunity(me, communityId);
+  if (!flatId || !period) throw new HttpsError("invalid-argument", "Brak flatId/period.");
+  return await sendSettlementEmailInternal({ communityId, flatId, period });
+});
 
 exports.publishSettlement = onCall(async (request) => {
   const me = await assertStaff(request);
@@ -1291,7 +1347,6 @@ exports.publishSettlement = onCall(async (request) => {
   if (!snap.exists) throw new HttpsError("not-found", "Rozliczenie nie istnieje.");
 
   const settlement = snap.data();
-
   await ref.set({
     status: "PUBLISHED",
     isPublished: true,
@@ -1349,38 +1404,234 @@ exports.publishAllDraftSettlements = onCall(async (request) => {
 });
 
 // =========================================================
-// OPTIONAL: RECALC / REVIEW HELPERS
+// PAYMENTS + AI MATCH FLOW
 // =========================================================
 
-exports.rebuildSettlementsForPeriod = onCall(async (request) => {
+exports.aiMatchPayment = onCall(async (request) => {
   const me = await assertStaff(request);
   const communityId = safeString(request.data?.communityId || me.communityId);
-  const period = safeString(request.data?.period);
+  const title = safeString(request.data?.title);
+  const amount = Number(request.data?.amount || 0);
   await assertSameCommunity(me, communityId);
-  if (!period) throw new HttpsError("invalid-argument", "Brak period.");
+  if (!title) throw new HttpsError("invalid-argument", "Brak tytułu.");
 
-  const out = await recalcAllSettlementsForPeriod(communityId, period);
-  return { ok: true, count: out.length };
+  const settlementsSnap = await db.collection(`communities/${communityId}/settlements`)
+    .where("isPublished", "==", true)
+    .limit(100)
+    .get();
+
+  const candidates = settlementsSnap.docs.map(d => {
+    const x = d.data();
+    return {
+      settlementId: d.id,
+      flatId: x.flatId || "",
+      flatLabel: x.flatLabel || "",
+      period: x.period || "",
+      totalDueCents: x.totalDueCents || 0,
+      paymentTitle: x.paymentTitle || ""
+    };
+  });
+
+  let result = await aiMatchPayment({ title, amount, candidates });
+
+  if (!result) {
+    const lower = title.toLowerCase();
+    const match = candidates.find(c =>
+      lower.includes(String(c.paymentTitle || "").toLowerCase()) ||
+      lower.includes(String(c.flatLabel || "").toLowerCase())
+    );
+
+    result = match ? {
+      suggestedFlatId: match.flatId,
+      suggestedSettlementId: match.settlementId,
+      confidence: 0.72,
+      needsReview: false,
+      reason: "Dopasowanie heurystyczne po tytule"
+    } : {
+      suggestedFlatId: "",
+      suggestedSettlementId: "",
+      confidence: 0.2,
+      needsReview: true,
+      reason: "Brak pewnego dopasowania"
+    };
+  }
+
+  if (result.needsReview || Number(result.confidence || 0) < 0.85) {
+    await createReviewItem(communityId, {
+      type: "PAYMENT_MATCH",
+      title: "Weryfikacja dopasowania przelewu",
+      reason: result.reason || "AI nie ma wysokiej pewności",
+      paymentTitle: title,
+      amountCents: toCents(amount),
+      confidence: Number(result.confidence || 0),
+      suggestedFlatId: result.suggestedFlatId || "",
+      suggestedSettlementId: result.suggestedSettlementId || ""
+    });
+  }
+
+  return { ok: true, result };
 });
 
-exports.createMeterReviewItem = onCall(async (request) => {
+exports.autoMatchImportedPayment = onCall(async (request) => {
+  const me = await assertStaff(request);
+  const communityId = safeString(request.data?.communityId || me.communityId);
+  const paymentId = safeString(request.data?.paymentId);
+  await assertSameCommunity(me, communityId);
+  if (!paymentId) throw new HttpsError("invalid-argument", "Brak paymentId.");
+
+  const paymentRef = db.doc(`communities/${communityId}/payments/${paymentId}`);
+  const paymentSnap = await paymentRef.get();
+  if (!paymentSnap.exists) throw new HttpsError("not-found", "Przelew nie istnieje.");
+
+  const payment = paymentSnap.data();
+  const title = safeString(payment.title || payment.transferTitle || payment.description);
+  const amount = fromCents(payment.amountCents || 0);
+
+  const ai = await exports.aiMatchPayment.run({
+    auth: request.auth,
+    data: { communityId, title, amount }
+  });
+
+  const result = ai.data?.result || ai.result || ai;
+  if (result?.suggestedFlatId) {
+    const settlementId = safeString(result.suggestedSettlementId);
+    await paymentRef.set({
+      flatId: result.suggestedFlatId,
+      settlementId,
+      matchedBy: Number(result.confidence || 0) >= 0.85 ? "AI" : "REVIEW",
+      matchedAtMs: nowMs()
+    }, { merge: true });
+
+    const period = settlementId.split("_").slice(1).join("_").replace(/_/g, "-");
+    if (result.suggestedFlatId && period) {
+      try { await recalcSettlement(communityId, result.suggestedFlatId, period); } catch (e) {}
+    }
+  }
+
+  return { ok: true, result };
+});
+
+// =========================================================
+// METERS + AI ANOMALY FLOW
+// =========================================================
+
+exports.aiMeterAnomaly = onCall(async (request) => {
   const me = await assertStaff(request);
   const communityId = safeString(request.data?.communityId || me.communityId);
   await assertSameCommunity(me, communityId);
 
-  const payload = {
-    type: "METER_ANOMALY",
-    communityId,
-    meterId: safeString(request.data?.meterId),
-    flatId: safeString(request.data?.flatId),
-    period: safeString(request.data?.period),
-    title: safeString(request.data?.title || "Podejrzany odczyt licznika"),
-    reason: safeString(request.data?.reason),
-    status: "OPEN",
-    createdAtMs: nowMs(),
-    createdByUid: request.auth.uid
+  const currentValue = Number(request.data?.currentValue || 0);
+  const prevValue = Number(request.data?.prevValue || 0);
+  const meterType = safeString(request.data?.meterType);
+  const unit = safeString(request.data?.unit);
+  const flatLabel = safeString(request.data?.flatLabel);
+
+  if (currentValue < prevValue) {
+    const result = {
+      anomaly: true,
+      confidence: 0.99,
+      needsReview: true,
+      reason: "Nowy odczyt jest mniejszy od poprzedniego."
+    };
+    await createReviewItem(communityId, {
+      type: "METER_ANOMALY",
+      title: `Podejrzany odczyt licznika ${flatLabel}`,
+      reason: result.reason,
+      confidence: result.confidence
+    });
+    return { ok: true, result };
+  }
+
+  let result = await aiAnalyzeMeter({ currentValue, prevValue, meterType, unit, flatLabel });
+  if (!result) {
+    const diff = currentValue - prevValue;
+    result = {
+      anomaly: diff > Math.max(prevValue * 0.5, 500),
+      confidence: diff > Math.max(prevValue * 0.5, 500) ? 0.78 : 0.45,
+      needsReview: diff > Math.max(prevValue * 0.5, 500),
+      reason: "Reguła progowa"
+    };
+  }
+
+  if (result.anomaly || result.needsReview || Number(result.confidence || 0) < 0.85) {
+    await createReviewItem(communityId, {
+      type: "METER_ANOMALY",
+      title: `Podejrzany odczyt licznika ${flatLabel}`,
+      reason: result.reason || "Wymaga sprawdzenia",
+      confidence: Number(result.confidence || 0),
+      meterType,
+      unit,
+      currentValue,
+      prevValue
+    });
+  }
+
+  return { ok: true, result };
+});
+
+exports.reviewImportedMeterReading = onCall(async (request) => {
+  const me = await assertStaff(request);
+  const communityId = safeString(request.data?.communityId || me.communityId);
+  const meterId = safeString(request.data?.meterId);
+  const readingId = safeString(request.data?.readingId);
+  await assertSameCommunity(me, communityId);
+  if (!meterId || !readingId) throw new HttpsError("invalid-argument", "Brak meterId/readingId.");
+
+  const meterSnap = await db.doc(`communities/${communityId}/meters/${meterId}`).get();
+  const readingSnap = await db.doc(`communities/${communityId}/meterReadings/${readingId}`).get();
+  if (!meterSnap.exists || !readingSnap.exists) throw new HttpsError("not-found", "Brak licznika lub odczytu.");
+
+  const meter = meterSnap.data();
+  const reading = readingSnap.data();
+
+  const prevSnap = await db.collection(`communities/${communityId}/meterReadings`)
+    .where("meterId", "==", meterId)
+    .where("date", "<", reading.date)
+    .orderBy("date", "desc")
+    .limit(1)
+    .get();
+
+  const prevValue = prevSnap.empty ? 0 : Number(prevSnap.docs[0].data().value || 0);
+  const currentValue = Number(reading.value || 0);
+
+  return await exports.aiMeterAnomaly.run({
+    auth: request.auth,
+    data: {
+      communityId,
+      currentValue,
+      prevValue,
+      meterType: meter.type || "",
+      unit: meter.unit || "",
+      flatLabel: meter.flatLabel || ""
+    }
+  });
+});
+
+// =========================================================
+// REVIEW EXPLAIN
+// =========================================================
+
+exports.aiExplainReview = onCall(async (request) => {
+  const me = await assertStaff(request);
+  const communityId = safeString(request.data?.communityId || me.communityId);
+  const reviewId = safeString(request.data?.reviewId);
+  await assertSameCommunity(me, communityId);
+  if (!reviewId) throw new HttpsError("invalid-argument", "Brak reviewId.");
+
+  const snap = await db.doc(`communities/${communityId}/reviewQueue/${reviewId}`).get();
+  if (!snap.exists) throw new HttpsError("not-found", "Review item nie istnieje.");
+
+  const item = snap.data();
+  const explanation = await aiExplainReview(item) || {
+    summary: "Sprawa wymaga weryfikacji ręcznej.",
+    reason: item.reason || "Brak wysokiej pewności systemu.",
+    recommendedChecks: ["Sprawdź dane źródłowe", "Porównaj z lokalem i kwotą"]
   };
 
-  const ref = await db.collection(`communities/${communityId}/reviewQueue`).add(payload);
-  return { ok: true, reviewId: ref.id };
+  await snap.ref.set({
+    aiExplanation: explanation,
+    aiExplainedAtMs: nowMs()
+  }, { merge: true });
+
+  return { ok: true, explanation };
 });
