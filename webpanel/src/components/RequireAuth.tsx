@@ -43,7 +43,9 @@ export function RequireAuth({ children, roles, requirePanelAccess = true }: { ch
     }
   }
 
-  if (requirePanelAccess && community?.panelAccessEnabled !== true) {
+  const panelEnabled = community?.panelAccessEnabled === true || String((community as any)?.panelAccessEnabled || "").toLowerCase() === "true";
+
+  if (requirePanelAccess && !panelEnabled) {
     return (
       <div style={{ padding: 24, display: "grid", gap: 12, maxWidth: 640 }}>
         <h2 style={{ margin: 0 }}>Panel nie jest aktywny</h2>

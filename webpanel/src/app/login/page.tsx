@@ -21,14 +21,13 @@ export default function LoginPage() {
     if (!["MASTER", "ACCOUNTANT"].includes(role)) {
       if (role) {
         setErr("Ta rola nie ma dostępu do webpanelu. Dostęp mają tylko MASTER i ACCOUNTANT. Lokator oraz ADMIN korzystają z aplikacji mobilnej.");
-        signOut(auth);
       }
       return;
     }
 
-    if (community?.panelAccessEnabled !== true) {
+    const panelEnabled = community?.panelAccessEnabled === true || String((community as any)?.panelAccessEnabled || "").toLowerCase() === "true";
+    if (!panelEnabled) {
       setErr("Panel nie jest aktywny dla tej wspólnoty. Włącz przełącznik „Udziel dostępu do panelu” w generatorze ownera.");
-      signOut(auth);
       return;
     }
 
