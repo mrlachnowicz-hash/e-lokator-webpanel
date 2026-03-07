@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAdminApp, getAdminDb } from "../../../lib/server/firebaseAdmin";
 import { buildFlatKey } from "../../../lib/flatMapping";
+import { canCreateFlat, getSeatState } from "../../../lib/server/seatLimits";
 
 type Row = {
   street?: string;
@@ -59,7 +60,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "communityId nie zgadza się z profilem użytkownika." }, { status: 403 });
     }
 
-    const flatsSnap = await db.collection("communities").doc(communityId).collection("flats").get();
+    const communityRef = db.collection("communities").doc(communityId);
+    const [communitySnap, flatsSnap] = await Promise.all([
+      communityRef.get(),
+      communityRef.collection("flats").get(),
+    ]);
+    const communityData = communitySnap.data() || {};
     const existingByKey = new Map<string, FirebaseFirestore.QueryDocumentSnapshot>();
     flatsSnap.docs.forEach((d) => {
       const x: any = d.data();
@@ -85,6 +91,7 @@ export async function POST(req: NextRequest) {
     const now = Date.now();
     const batch = db.batch();
     const seenKeys = new Set<string>();
+    let plannedCreates = 0;
 
     for (const row of rows) {
       const street = String(row.street || fallbackStreetName || "").trim();
@@ -137,10 +144,19 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
+      if (!existing) {
+        const seatStateNow = getSeatState(communityData as any, flatsSnap.size + plannedCreates);
+        if (!canCreateFlat(seatStateNow)) {
+          invalid += 1;
+          details.push(`Brak seats: ${street} ${buildingNo}/${apartmentNo}. Limit: ${seatStateNow.limit}, wykorzystane: ${seatStateNow.used}.`);
+          continue;
+        }
+      }
+
       const streetId = streetIdByName.get(street.toLowerCase()) || fallbackStreetId || street;
       const flatRef = existing
-        ? db.collection("communities").doc(communityId).collection("flats").doc(existing.id)
-        : db.collection("communities").doc(communityId).collection("flats").doc();
+        ? communityRef.collection("flats").doc(existing.id)
+        : communityRef.collection("flats").doc();
       const createdAtMs = Number(existingData.createdAtMs || now);
       const flatLabel = `${street} ${buildingNo}/${apartmentNo}`;
 
@@ -167,7 +183,7 @@ export async function POST(req: NextRequest) {
         { merge: true },
       );
 
-      const payerRef = db.collection("communities").doc(communityId).collection("payers").doc(flatRef.id);
+      const payerRef = communityRef.collection("payers").doc(flatRef.id);
       batch.set(
         payerRef,
         {
@@ -195,12 +211,14 @@ export async function POST(req: NextRequest) {
         details.push(`Zaktualizowano: ${street} ${buildingNo}/${apartmentNo}.`);
       } else {
         created += 1;
+        plannedCreates += 1;
         details.push(`Utworzono: ${street} ${buildingNo}/${apartmentNo}.`);
       }
     }
 
     await batch.commit();
-    return NextResponse.json({ ok: true, created, updated, skipped, invalid, duplicateInFile, details });
+    const seatStateEnd = getSeatState(communityData as any, flatsSnap.size + plannedCreates);
+    return NextResponse.json({ ok: true, created, updated, skipped, invalid, duplicateInFile, details, seatLimit: seatStateEnd.limit, seatUsed: seatStateEnd.used, seatRemaining: seatStateEnd.remaining, seatSource: seatStateEnd.source });
   } catch (error: any) {
     return NextResponse.json({ error: error?.message || "Błąd importu serwerowego." }, { status: 500 });
   }

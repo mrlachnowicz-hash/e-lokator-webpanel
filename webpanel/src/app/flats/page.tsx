@@ -5,17 +5,16 @@ import {
   collection,
   deleteDoc,
   doc,
-  getDocs,
+  getDoc,
   onSnapshot,
   query,
   where,
-  writeBatch,
 } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
-import { buildFlatKey, buildFlatLabel } from "../../lib/flatMapping";
+import { buildFlatLabel } from "../../lib/flatMapping";
 
 type Flat = {
   id: string;
@@ -50,6 +49,13 @@ type FormState = {
   surname: string;
   email: string;
   phone: string;
+};
+
+type SeatInfo = {
+  limit: number | null;
+  used: number;
+  remaining: number | null;
+  source?: string | null;
 };
 
 const emptyForm: FormState = {
@@ -92,6 +98,7 @@ export default function FlatsPage() {
   const [items, setItems] = useState<Flat[]>([]);
   const [form, setForm] = useState<FormState>(emptyForm);
   const [msg, setMsg] = useState<string | null>(null);
+  const [seatInfo, setSeatInfo] = useState<SeatInfo>({ limit: null, used: 0, remaining: null, source: null });
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -132,8 +139,27 @@ export default function FlatsPage() {
       setItems(sortList(merged));
     };
 
-    const unsubFlats = onSnapshot(query(collection(db, "communities", communityId, "flats")), (snap) => {
+    const unsubFlats = onSnapshot(query(collection(db, "communities", communityId, "flats")), async (snap) => {
       flatsCache = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+      try {
+        const communitySnap = await getDoc(doc(db, "communities", communityId));
+        const c: any = communitySnap.data() || {};
+        const keys = ["panelSeats", "panelSeatsLimit", "seats", "seatsLimit", "totalSeats", "maxSeats", "purchasedSeats", "seatsPurchased", "flatsLimit", "localsLimit", "localiLimit", "unitsLimit", "licenses", "seatCount"];
+        let limit: number | null = null;
+        let source: string | null = null;
+        for (const key of keys) {
+          const raw = c[key];
+          const num = typeof raw === "number" ? raw : (typeof raw === "string" && raw.trim() !== "" && Number.isFinite(Number(raw)) ? Number(raw) : null);
+          if (num != null) {
+            limit = Math.max(0, Math.floor(num));
+            source = key;
+            break;
+          }
+        }
+        setSeatInfo({ limit, used: snap.size, remaining: limit == null ? null : limit - snap.size, source });
+      } catch {
+        setSeatInfo({ limit: null, used: snap.size, remaining: null, source: null });
+      }
       mergeAndSet();
     });
 
@@ -188,63 +214,23 @@ export default function FlatsPage() {
     setBusy(true);
     setMsg(null);
     try {
-      const flatKey = buildFlatKey(communityId, form.street, form.buildingNo, form.apartmentNo);
-      const allSnap = await getDocs(collection(db, "communities", communityId, "flats"));
-      const existing = allSnap.docs.find((d) => {
-        if (form.id && d.id === form.id) return true;
-        const x: any = d.data();
-        const key = String(
-          x.flatKey ||
-            buildFlatKey(communityId, String(x.street || ""), String(x.buildingNo || ""), String(x.apartmentNo || x.flatNumber || "")),
-        );
-        return key === flatKey;
+      const token = await (await import("firebase/auth")).getAuth().currentUser?.getIdToken();
+      if (!token) throw new Error("Brak aktywnej sesji Firebase.");
+      const response = await fetch("/api/upsert-flat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ communityId, ...form }),
       });
-      const ref = existing ? doc(db, "communities", communityId, "flats", existing.id) : doc(collection(db, "communities", communityId, "flats"));
-      const now = Date.now();
-      const flatLabel = buildFlatLabel(form.street, form.buildingNo, form.apartmentNo);
-      const batch = writeBatch(db);
-      batch.set(
-        ref,
-        {
-          street: form.street.trim(),
-          buildingNo: form.buildingNo.trim(),
-          apartmentNo: form.apartmentNo.trim(),
-          flatNumber: form.apartmentNo.trim(),
-          flatLabel,
-          flatKey,
-          name: form.name.trim(),
-          surname: form.surname.trim(),
-          residentName: [form.name.trim(), form.surname.trim()].filter(Boolean).join(" "),
-          email: form.email.trim(),
-          phone: form.phone.trim(),
-          updatedAtMs: now,
-          createdAtMs: existing?.data()?.createdAtMs || now,
-        },
-        { merge: true },
-      );
-      const payerRef = doc(db, "communities", communityId, "payers", ref.id);
-      batch.set(
-        payerRef,
-        {
-          flatId: ref.id,
-          street: form.street.trim(),
-          buildingNo: form.buildingNo.trim(),
-          apartmentNo: form.apartmentNo.trim(),
-          flatNumber: form.apartmentNo.trim(),
-          flatLabel,
-          flatKey,
-          name: form.name.trim(),
-          surname: form.surname.trim(),
-          email: form.email.trim(),
-          phone: form.phone.trim(),
-          mailOnly: !existing?.data()?.residentUid && !!form.email.trim(),
-          updatedAtMs: now,
-          createdAtMs: existing?.data()?.createdAtMs || now,
-        },
-        { merge: true },
-      );
+      const data = await response.json().catch(() => ({} as any));
+      if (!response.ok) throw new Error(data?.error || "Błąd zapisu lokalu.");
+      setSeatInfo({ limit: data.seatLimit ?? seatInfo.limit, used: data.seatUsed ?? seatInfo.used, remaining: data.seatRemaining ?? seatInfo.remaining, source: seatInfo.source });
       resetForm();
-      setMsg(existing ? "Zaktualizowano istniejący lokal." : "Dodano nowy lokal.");
+      setMsg(data?.message || "Zapisano lokal.");
+    } catch (e: any) {
+      setMsg(e?.message || "Błąd zapisu lokalu.");
     } finally {
       setBusy(false);
     }
@@ -280,6 +266,8 @@ export default function FlatsPage() {
               <div><b>Łącznie lokali:</b> {stats.total}</div>
               <div><b>Z przypisanym mieszkańcem:</b> {stats.withResidents}</div>
               <div><b>Z adresem email:</b> {stats.withEmail}</div>
+              <div><b>Seats:</b> {seatInfo.limit == null ? `${seatInfo.used} / brak limitu` : `${seatInfo.used} / ${seatInfo.limit}`}</div>
+              <div><b>Pozostało:</b> {seatInfo.remaining == null ? '—' : seatInfo.remaining}</div>
             </div>
           </div>
 
@@ -296,10 +284,11 @@ export default function FlatsPage() {
                 <input placeholder="Telefon" value={form.phone} onChange={(e) => setField("phone", e.target.value)} />
               </div>
               <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
-                <button onClick={saveFlat} disabled={busy}>{form.id ? "Zapisz zmiany" : "Zapisz"}</button>
+                <button onClick={saveFlat} disabled={busy || (!form.id && seatInfo.limit != null && (seatInfo.remaining ?? 0) <= 0)}>{form.id ? "Zapisz zmiany" : (seatInfo.limit != null && (seatInfo.remaining ?? 0) <= 0 ? "Brak wolnych seats" : "Zapisz")}</button>
                 {form.id ? <button onClick={resetForm} disabled={busy}>Anuluj edycję</button> : null}
               </div>
-              {msg ? <div style={{ marginTop: 10, color: "#9ae6b4" }}>{msg}</div> : null}
+              {msg ? <div style={{ marginTop: 10, color: msg.toLowerCase().includes("błąd") || msg.toLowerCase().includes("brak") ? "#fca5a5" : "#9ae6b4" }}>{msg}</div> : null}
+              {!form.id && seatInfo.limit != null && (seatInfo.remaining ?? 0) <= 0 ? <div style={{ marginTop: 10, color: "#fca5a5" }}>Limit seats został wykorzystany. Ręczne dodanie nowego lokalu jest zablokowane.</div> : null}
             </div>
           )}
         </div>
