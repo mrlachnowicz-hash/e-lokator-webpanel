@@ -8,6 +8,7 @@ import {
   getDocs,
   onSnapshot,
   query,
+  where,
   writeBatch,
 } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
@@ -28,6 +29,7 @@ type Flat = {
   surname?: string;
   lastName?: string;
   residentName?: string;
+  displayName?: string;
   email?: string;
   phone?: string;
   areaM2?: number;
@@ -64,6 +66,8 @@ const emptyForm: FormState = {
 function getResidentName(flat: Flat) {
   const direct = String(flat.residentName || "").trim();
   if (direct) return direct;
+  const display = String(flat.displayName || "").trim();
+  if (display) return display;
   const first = String(flat.name || flat.firstName || "").trim();
   const last = String(flat.surname || flat.lastName || "").trim();
   return [first, last].filter(Boolean).join(" ").trim();
@@ -92,19 +96,61 @@ export default function FlatsPage() {
 
   useEffect(() => {
     if (!communityId) return;
-    const q = query(collection(db, "communities", communityId, "flats"));
-    return onSnapshot(q, (snap) => {
-      const list = snap.docs
-        .map((d) => ({ id: d.id, ...(d.data() as any) }))
-        .sort((a: any, b: any) => {
-          const streetCmp = String(a.street || "").localeCompare(String(b.street || ""), "pl");
-          if (streetCmp !== 0) return streetCmp;
-          const buildingCmp = String(a.buildingNo || "").localeCompare(String(b.buildingNo || ""), "pl", { numeric: true });
-          if (buildingCmp !== 0) return buildingCmp;
-          return getApartmentNo(a).localeCompare(getApartmentNo(b), "pl", { numeric: true });
-        });
-      setItems(list);
+
+    let flatsCache: Flat[] = [];
+    let usersByFlatId = new Map<string, any>();
+
+    const sortList = (list: Flat[]) =>
+      [...list].sort((a: any, b: any) => {
+        const streetCmp = String(a.street || "").localeCompare(String(b.street || ""), "pl");
+        if (streetCmp !== 0) return streetCmp;
+        const buildingCmp = String(a.buildingNo || "").localeCompare(String(b.buildingNo || ""), "pl", { numeric: true });
+        if (buildingCmp !== 0) return buildingCmp;
+        return getApartmentNo(a).localeCompare(getApartmentNo(b), "pl", { numeric: true });
+      });
+
+    const mergeAndSet = () => {
+      const merged = flatsCache.map((flat) => {
+        const linkedUser = usersByFlatId.get(flat.id);
+        if (!linkedUser) return flat;
+        return {
+          ...flat,
+          residentUid: flat.residentUid || linkedUser.uid || linkedUser.id || null,
+          userId: flat.userId || linkedUser.uid || linkedUser.id || null,
+          displayName: flat.displayName || linkedUser.displayName || "",
+          name: flat.name || flat.firstName || linkedUser.firstName || "",
+          surname: flat.surname || flat.lastName || linkedUser.lastName || "",
+          email: flat.email || linkedUser.email || "",
+          phone: flat.phone || linkedUser.phone || "",
+          residentName:
+            flat.residentName ||
+            [linkedUser.firstName || "", linkedUser.lastName || ""].filter(Boolean).join(" ") ||
+            linkedUser.displayName ||
+            "",
+        } as Flat;
+      });
+      setItems(sortList(merged));
+    };
+
+    const unsubFlats = onSnapshot(query(collection(db, "communities", communityId, "flats")), (snap) => {
+      flatsCache = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+      mergeAndSet();
     });
+
+    const unsubUsers = onSnapshot(query(collection(db, "users"), where("communityId", "==", communityId)), (snap) => {
+      usersByFlatId = new Map(
+        snap.docs
+          .map((d) => ({ id: d.id, ...(d.data() as any) }))
+          .filter((u: any) => String(u.flatId || "").trim())
+          .map((u: any) => [String(u.flatId), u]),
+      );
+      mergeAndSet();
+    });
+
+    return () => {
+      unsubFlats();
+      unsubUsers();
+    };
   }, [communityId]);
 
   const stats = useMemo(() => {
