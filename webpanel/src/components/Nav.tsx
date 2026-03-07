@@ -26,6 +26,7 @@ export function Nav() {
         {panelEnabled ? (
           <>
             <Link href="/import">Import lokali</Link>
+            <Link href="/streets">Ulice</Link>
             <Link href="/buildings">Budynki</Link>
             <Link href="/flats">Lokale</Link>
             <Link href="/invoices">Faktury</Link>

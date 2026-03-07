@@ -14,7 +14,9 @@ export async function POST(req: Request) {
     const ref = adminDb.doc(`communities/${communityId}/settlements/${settlementId}`);
     const snap = await ref.get();
     if (!snap.exists) return NextResponse.json({ error: "Settlement not found" }, { status: 404 });
-    await ref.set({ isPublished: true, status: "PUBLISHED", publishedAtMs: Date.now(), updatedAtMs: Date.now() }, { merge: true });
+    const data = snap.data() || {};
+    const period = String((data as any).period || "").trim();
+    await ref.set({ isPublished: true, status: "PUBLISHED", publishedAtMs: Date.now(), updatedAtMs: Date.now(), archiveMonth: period }, { merge: true });
     return NextResponse.json({ ok: true, settlementId });
   } catch (error: any) {
     return NextResponse.json({ error: error?.message || "Publish error" }, { status: 500 });

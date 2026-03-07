@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
-import { addDoc, collection, onSnapshot, orderBy, query } from "firebase/firestore";
+import { addDoc, collection, deleteDoc, doc, onSnapshot, orderBy, query, updateDoc } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
@@ -84,9 +84,10 @@ export default function InvoicesPage() {
   }, [communityId]);
 
   const stats = useMemo(() => ({
-    total: items.length,
-    staged: items.filter((x) => String(x.status || "").includes("STAGED")).length,
-    review: items.filter((x) => x.ai?.suggestion?.needsReview || x.parsed?.needsReview).length,
+    total: items.filter((x) => !x.archivedAtMs).length,
+    archived: items.filter((x) => !!x.archivedAtMs).length,
+    staged: items.filter((x) => !x.archivedAtMs && String(x.status || "").includes("STAGED")).length,
+    review: items.filter((x) => !x.archivedAtMs && (x.ai?.suggestion?.needsReview || x.parsed?.needsReview)).length,
   }), [items]);
 
   async function handlePdf(file: File) {
@@ -160,6 +161,7 @@ export default function InvoicesPage() {
           <div>Łącznie: <strong>{stats.total}</strong></div>
           <div>W szkicu / staged: <strong>{stats.staged}</strong></div>
           <div>Do review: <strong>{stats.review}</strong></div>
+          <div>Archiwum: <strong>{stats.archived}</strong></div>
         </div>
 
         <div className="card" style={{ display: "grid", gap: 12, minWidth: 0 }}>
@@ -179,6 +181,8 @@ export default function InvoicesPage() {
               <div><strong>Confidence:</strong> {Number(ocrResult.confidence || 0).toFixed(2)}</div>
               <div><strong>Powód:</strong> {ocrResult.reason || "—"}</div>
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <button className="btnGhost" onClick={async () => updateDoc(doc(db, "communities", communityId, "invoices", inv.id), { archivedAtMs: inv.archivedAtMs ? null : Date.now(), updatedAtMs: Date.now() })}>{inv.archivedAtMs ? "Przywróć" : "Archiwizuj"}</button>
+        <button className="btnGhost" onClick={async () => { if (window.confirm(`Usunąć fakturę ${inv.title || inv.id}?`)) await deleteDoc(doc(db, "communities", communityId, "invoices", inv.id)); }}>Kosz</button>
                 <button className="btn" onClick={saveOcrDraft}>Zapisz szkic z OCR</button>
                 <button className="btnGhost" onClick={() => setOcrResult(null)}>Wyczyść</button>
               </div>
@@ -231,7 +235,8 @@ export default function InvoicesPage() {
         {msg ? <div style={{ color: "#8ef0c8", fontWeight: 700 }}>{msg}</div> : null}
 
         <div style={{ display: "grid", gap: 12, minWidth: 0 }}>
-          {items.map((inv) => <InvoiceCard key={inv.id} inv={inv} communityId={communityId} />)}
+          {items.filter((x) => !x.archivedAtMs).map((inv) => <InvoiceCard key={inv.id} inv={inv} communityId={communityId} />)}
+          {items.some((x) => !!x.archivedAtMs) ? <div className="card" style={{ marginTop: 8, display: "grid", gap: 10 }}><h3>Archiwum faktur</h3>{items.filter((x) => !!x.archivedAtMs).map((inv) => <InvoiceCard key={inv.id} inv={inv} communityId={communityId} />)}</div> : null}
         </div>
       </div>
     </RequireAuth>

@@ -12,7 +12,7 @@ export async function POST(req: Request) {
     const adminDb = getAdminDb();
     const snap = await adminDb.collection(`communities/${communityId}/settlements`).where("isPublished", "!=", true).limit(500).get();
     const batch = adminDb.batch();
-    snap.docs.forEach((doc) => batch.set(doc.ref, { isPublished: true, status: "PUBLISHED", publishedAtMs: Date.now(), updatedAtMs: Date.now() }, { merge: true }));
+    snap.docs.forEach((doc) => { const data:any = doc.data() || {}; const period = String(data.period || "").trim(); batch.set(doc.ref, { isPublished: true, status: "PUBLISHED", publishedAtMs: Date.now(), updatedAtMs: Date.now(), archiveMonth: period }, { merge: true }); });
     await batch.commit();
     return NextResponse.json({ ok: true, published: snap.size });
   } catch (error: any) {
