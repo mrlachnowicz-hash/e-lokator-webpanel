@@ -4,6 +4,15 @@ function asNum(value: unknown): number | null {
   return null;
 }
 
+function pickFirstNumber(source: Record<string, any> | null | undefined, keys: string[]): number | null {
+  if (!source) return null;
+  for (const key of keys) {
+    const value = asNum(source[key]);
+    if (value != null) return value;
+  }
+  return null;
+}
+
 export type SeatState = {
   limit: number | null;
   used: number;
@@ -12,7 +21,6 @@ export type SeatState = {
 };
 
 const LIMIT_KEYS = [
-  'seatsTotal',
   'panelSeats',
   'panelSeatsLimit',
   'seats',
@@ -29,9 +37,7 @@ const LIMIT_KEYS = [
   'seatCount',
 ];
 
-const USED_KEYS = ['seatsUsed'];
-
-export function getSeatState(communityData: Record<string, any> | null | undefined, fallbackUsed: number): SeatState {
+export function getSeatState(communityData: Record<string, any> | null | undefined, used: number): SeatState {
   let source: string | null = null;
   let limit: number | null = null;
   if (communityData) {
@@ -44,11 +50,6 @@ export function getSeatState(communityData: Record<string, any> | null | undefin
       }
     }
   }
-
-  const explicitUsed = communityData
-    ? USED_KEYS.map((key) => asNum(communityData[key])).find((value) => value != null) ?? null
-    : null;
-  const used = Math.max(0, Math.floor(explicitUsed != null ? explicitUsed : fallbackUsed));
 
   if (limit == null) {
     return { limit: null, used, remaining: null, source: null };

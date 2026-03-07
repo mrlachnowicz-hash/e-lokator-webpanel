@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getAdminApp, getAdminDb } from '../../../lib/server/firebaseAdmin';
 import { buildFlatKey } from '../../../lib/flatMapping';
 import { canCreateFlat, getSeatState } from '../../../lib/server/seatLimits';
-import { ensureStreetDoc } from '../../../lib/server/streetRegistry';
 
 function splitDisplayName(displayName: string) {
   const parts = String(displayName || '').trim().split(/\s+/).filter(Boolean);
@@ -56,9 +55,13 @@ export async function POST(req: NextRequest) {
     }
 
     const communityRef = db.collection('communities').doc(communityId);
-    const flatsCol = communityRef.collection('flats');
+    const [communitySnap, flatsSnap] = await Promise.all([
+      communityRef.get(),
+      communityRef.collection('flats').get(),
+    ]);
+    const communityData = communitySnap.data() || {};
+
     const flatKey = buildFlatKey(communityId, street, buildingNo, apartmentNo);
-    const flatsSnap = await flatsCol.get();
     const existing = flatsSnap.docs.find((d) => {
       if (flatId && d.id === flatId) return true;
       const x: any = d.data();
@@ -66,96 +69,70 @@ export async function POST(req: NextRequest) {
       return key === flatKey;
     });
 
-    const ref = existing ? flatsCol.doc(existing.id) : (flatId ? flatsCol.doc(flatId) : flatsCol.doc());
-    const payerRef = communityRef.collection('payers').doc(ref.id);
-    const now = Date.now();
-    const result = await db.runTransaction(async (tx) => {
-      const [communitySnap, currentFlatSnap, currentPayerSnap] = await Promise.all([
-        tx.get(communityRef),
-        tx.get(ref),
-        tx.get(payerRef),
-      ]);
-      const communityData = communitySnap.data() || {};
-      const alreadyExists = currentFlatSnap.exists;
-      const currentFlat: any = currentFlatSnap.data() || {};
-      const seatState = getSeatState(communityData as any, flatsSnap.size);
-      if (!alreadyExists && !canCreateFlat(seatState)) {
-        throw new Error(`Brak wolnych seats. Limit: ${seatState.limit}, wykorzystane: ${seatState.used}.`);
-      }
-
-      const streetMeta = await ensureStreetDoc(tx, communityRef, street, uid);
-      const streetId = String(streetMeta?.streetId || currentFlat.streetId || '');
-      const flatLabel = `${street} ${buildingNo}/${apartmentNo}`;
-      const mergedDisplayName = displayNameRaw || [firstName, lastName].filter(Boolean).join(' ');
-      const createdAtMs = Number(currentFlat.createdAtMs || now);
-
-      tx.set(ref, {
-        communityId,
-        streetId,
-        street,
-        buildingNo,
-        apartmentNo,
-        flatNumber: apartmentNo,
-        flatLabel,
-        flatKey,
-        name: firstName || currentFlat.name || '',
-        surname: lastName || currentFlat.surname || '',
-        residentName: [firstName || currentFlat.name || '', lastName || currentFlat.surname || ''].filter(Boolean).join(' '),
-        displayName: mergedDisplayName || currentFlat.displayName || '',
-        email: email || currentFlat.email || '',
-        phone: phone || currentFlat.phone || '',
-        createdAtMs,
-        updatedAtMs: now,
-      }, { merge: true });
-
-      tx.set(payerRef, {
-        flatId: ref.id,
-        communityId,
-        streetId,
-        street,
-        buildingNo,
-        apartmentNo,
-        flatNumber: apartmentNo,
-        flatLabel,
-        flatKey,
-        name: firstName || currentFlat.name || '',
-        surname: lastName || currentFlat.surname || '',
-        displayName: mergedDisplayName || currentFlat.displayName || '',
-        email: email || currentFlat.email || '',
-        phone: phone || currentFlat.phone || '',
-        mailOnly: !currentFlat.residentUid && !!(email || currentFlat.email),
-        createdAtMs: Number((currentPayerSnap.data() as any)?.createdAtMs || createdAtMs),
-        updatedAtMs: now,
-      }, { merge: true });
-
-      if (!alreadyExists) {
-        const nextUsed = Math.max(seatState.used + 1, Number(communityData.seatsUsed || 0) + 1);
-        tx.set(communityRef, {
-          seatsUsed: nextUsed,
-          updatedAtMs: now,
-        }, { merge: true });
-      }
-
-      return {
-        created: !alreadyExists,
+    const seatState = getSeatState(communityData as any, flatsSnap.size);
+    if (!existing && !canCreateFlat(seatState)) {
+      return NextResponse.json({
+        error: `Brak wolnych seats. Limit: ${seatState.limit}, wykorzystane: ${seatState.used}.`,
         seatLimit: seatState.limit,
-        seatUsed: !alreadyExists ? seatState.used + 1 : seatState.used,
-        seatRemaining: seatState.limit == null ? null : seatState.limit - (!alreadyExists ? seatState.used + 1 : seatState.used),
-      };
-    });
+        seatUsed: seatState.used,
+        seatRemaining: seatState.remaining,
+      }, { status: 409 });
+    }
+
+    const now = Date.now();
+    const existingData: any = existing?.data() || {};
+    const ref = existing ? communityRef.collection('flats').doc(existing.id) : communityRef.collection('flats').doc();
+    const flatLabel = `${street} ${buildingNo}/${apartmentNo}`;
+    const mergedDisplayName = displayNameRaw || [firstName, lastName].filter(Boolean).join(' ');
+    await ref.set({
+      communityId,
+      street,
+      buildingNo,
+      apartmentNo,
+      flatNumber: apartmentNo,
+      flatLabel,
+      flatKey,
+      name: firstName || existingData.name || '',
+      surname: lastName || existingData.surname || '',
+      residentName: [firstName || existingData.name || '', lastName || existingData.surname || ''].filter(Boolean).join(' '),
+      displayName: mergedDisplayName || existingData.displayName || '',
+      email: email || existingData.email || '',
+      phone: phone || existingData.phone || '',
+      createdAtMs: Number(existingData.createdAtMs || now),
+      updatedAtMs: now,
+    }, { merge: true });
+
+    await communityRef.collection('payers').doc(ref.id).set({
+      flatId: ref.id,
+      street,
+      buildingNo,
+      apartmentNo,
+      flatNumber: apartmentNo,
+      flatLabel,
+      flatKey,
+      name: firstName || existingData.name || '',
+      surname: lastName || existingData.surname || '',
+      displayName: mergedDisplayName || existingData.displayName || '',
+      email: email || existingData.email || '',
+      phone: phone || existingData.phone || '',
+      mailOnly: !existingData.residentUid && !!(email || existingData.email),
+      createdAtMs: Number(existingData.createdAtMs || now),
+      updatedAtMs: now,
+    }, { merge: true });
+
+    const usedAfter = existing ? flatsSnap.size : flatsSnap.size + 1;
+    const stateAfter = getSeatState(communityData as any, usedAfter);
 
     return NextResponse.json({
       ok: true,
-      created: result.created,
+      created: !existing,
       id: ref.id,
-      message: result.created ? 'Dodano nowy lokal.' : 'Zaktualizowano istniejący lokal.',
-      seatLimit: result.seatLimit,
-      seatUsed: result.seatUsed,
-      seatRemaining: result.seatRemaining,
+      message: existing ? 'Zaktualizowano istniejący lokal.' : 'Dodano nowy lokal.',
+      seatLimit: stateAfter.limit,
+      seatUsed: stateAfter.used,
+      seatRemaining: stateAfter.remaining,
     });
   } catch (error: any) {
-    const message = error?.message || 'Błąd zapisu lokalu.';
-    const status = /Brak wolnych seats/i.test(message) ? 409 : 500;
-    return NextResponse.json({ error: message }, { status });
+    return NextResponse.json({ error: error?.message || 'Błąd zapisu lokalu.' }, { status: 500 });
   }
 }

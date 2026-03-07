@@ -209,7 +209,8 @@ export default function SettlementDetailsPage({ params }: { params: { settlement
           <>
             <div className="card" style={{ maxWidth: 760, display: "grid", gap: 18 }}>
               <div style={{ display: "grid", gap: 6 }}>
-                <div><strong>Lokal:</strong> {settlement.flatId || "—"}</div>
+                <div><strong>Lokal:</strong> {settlement.flatLabel || settlement.flatId || "—"}</div>
+                <div><strong>Status:</strong> {settlement.isPublished ? "WYSŁANE" : "SZKIC"}</div>
                 <div><strong>Lokator:</strong> {settlement.residentName || "—"}</div>
               </div>
 
@@ -233,7 +234,18 @@ export default function SettlementDetailsPage({ params }: { params: { settlement
               </div>
 
               <div style={{ borderTop: "1px solid rgba(255,255,255,.12)", paddingTop: 16, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <button className="btn" onClick={() => setTransferOpen(true)}>Dane do przelewu</button>
+                {!settlement.isPublished ? (
+                  <button className="btn" onClick={async () => {
+                    const res = await fetch(`/api/settlements/publish`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ communityId, settlementId }),
+                    });
+                    const data = await res.json();
+                    setMessage(res.ok ? `Rozliczenie ${data.settlementId} wysłane do lokatora.` : `Błąd publikacji: ${data.error || "nieznany"}`);
+                  }}>Wyślij do lokatora</button>
+                ) : null}
+                <button className="btnGhost" onClick={() => setTransferOpen(true)}>Dane do przelewu</button>
                 <button className="btnGhost" onClick={async () => {
                   const url = `/api/settlements/${settlementId}/pdf?communityId=${encodeURIComponent(communityId)}`;
                   window.open(url, "_blank");

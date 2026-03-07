@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
-import { addDoc, collection, doc, getDocs, onSnapshot, orderBy, query, writeBatch } from "firebase/firestore";
+import { addDoc, collection, doc, getDocs, onSnapshot, orderBy, query, setDoc, writeBatch } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
@@ -155,18 +155,12 @@ export default function MetersPage() {
 
     const flatsByKey = new Map(flatOptions.map((flat) => [buildFlatKey(communityId, flat.street, flat.buildingNo, flat.apartmentNo), flat]));
     const activeMeters = meters.filter((meter) => meter.isActive !== false);
-    const [readingsSnap, settlementsSnap] = await Promise.all([
-      getDocs(collection(db, "communities", communityId, "meterReadings")),
-      getDocs(collection(db, "communities", communityId, "settlements")),
-    ]);
+    const readingsSnap = await getDocs(collection(db, "communities", communityId, "meterReadings"));
     const allReadings = readingsSnap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as Reading[];
-    const existingSettlements = new Map(settlementsSnap.docs.map((d) => [d.id, { id: d.id, ...(d.data() as any) }]));
     const batch = writeBatch(db);
 
     let imported = 0;
     let generatedCharges = 0;
-    let autoCreatedMeters = 0;
-    let generatedSettlements = 0;
     let skipped = 0;
 
     for (const row of rows) {
@@ -182,26 +176,11 @@ export default function MetersPage() {
       }
 
       const meterType = normalizeMeterType(row.meterType);
-      let meter = activeMeters.find((item) => item.flatId === flat.id && normalizeMeterType(item.type) === meterType);
+      const meter = activeMeters.find((item) => item.flatId === flat.id && normalizeMeterType(item.type) === meterType)
+        || activeMeters.find((item) => item.flatId === flat.id);
       if (!meter) {
-        const meterRef = doc(collection(db, "communities", communityId, "meters"));
-        meter = {
-          id: meterRef.id,
-          communityId,
-          flatId: flat.id,
-          street: flat.street,
-          buildingNo: flat.buildingNo,
-          apartmentNo: flat.apartmentNo,
-          type: meterType,
-          serialNumber: `AUTO-${meterType}-${flat.id}`,
-          unit: meterType === "electricity" ? "kWh" : meterType === "gas" ? "m3" : meterType === "heat" ? "GJ" : "m3",
-          isActive: true,
-          createdAtMs: Date.now(),
-          updatedAtMs: Date.now(),
-        } as Meter;
-        batch.set(meterRef, meter);
-        activeMeters.push(meter);
-        autoCreatedMeters += 1;
+        skipped += 1;
+        continue;
       }
 
       const previous = allReadings
@@ -231,7 +210,6 @@ export default function MetersPage() {
 
       if (chargeAmount > 0) {
         const chargeRef = doc(collection(db, "communities", communityId, "charges"));
-        const amountCents = Math.round(chargeAmount * 100);
         batch.set(chargeRef, {
           communityId,
           flatId: flat.id,
@@ -240,7 +218,7 @@ export default function MetersPage() {
           category: `MEDIA_${meterType.toUpperCase()}`,
           label: `Zużycie ${meterType}`,
           amount: chargeAmount,
-          amountCents,
+          amountCents: Math.round(chargeAmount * 100),
           tariff,
           period,
           date: row.date,
@@ -248,36 +226,11 @@ export default function MetersPage() {
           updatedAtMs: Date.now(),
         });
         generatedCharges += 1;
-
-        const settlementId = `${flat.id}_${period}`;
-        const previousSettlement: any = existingSettlements.get(settlementId) || {};
-        const nextChargesCents = Number(previousSettlement.chargesCents || 0) + amountCents;
-        const paymentsCents = Number(previousSettlement.paymentsCents || 0);
-        const dueDate = `${period}-15`;
-        const settlementDoc = {
-          communityId,
-          flatId: flat.id,
-          period,
-          title: `Rozliczenie za ${period}`,
-          chargesCents: nextChargesCents,
-          paymentsCents,
-          balanceCents: nextChargesCents - paymentsCents,
-          accountNumber: String(previousSettlement.accountNumber || ""),
-          transferTitle: String(previousSettlement.transferTitle || `EL-${flat.apartmentNo || flat.id} ${period}`),
-          dueDate,
-          dueDateMs: Number(previousSettlement.dueDateMs || (Date.parse(`${period}-15T12:00:00Z`) || Date.now())),
-          createdAtMs: Number(previousSettlement.createdAtMs || Date.now()),
-          updatedAtMs: Date.now(),
-          currency: String(previousSettlement.currency || "PLN"),
-        };
-        existingSettlements.set(settlementId, settlementDoc);
-        batch.set(doc(db, "communities", communityId, "settlements", settlementId), settlementDoc, { merge: true });
-        generatedSettlements += 1;
       }
     }
 
     await batch.commit();
-    setMessage(`Import liczników zakończony. Odczyty: ${imported}, naliczenia: ${generatedCharges}, rozliczenia: ${generatedSettlements}, auto-utworzone liczniki: ${autoCreatedMeters}, pominięte: ${skipped}.`);
+    setMessage(`Import liczników zakończony. Odczyty: ${imported}, naliczenia: ${generatedCharges}, pominięte: ${skipped}.`);
   }
 
   return (

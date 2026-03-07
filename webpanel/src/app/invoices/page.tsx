@@ -255,7 +255,15 @@ function InvoiceCard({ inv, communityId }: { inv: Invoice; communityId: string }
         <button
           className="btnGhost"
           onClick={async () => {
-            await callable("aiSuggestInvoice")({ communityId, invoiceId: inv.id });
+            const res = await fetch("/api/ai/invoice-analyze", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ communityId, invoiceId: inv.id }),
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => ({}));
+              throw new Error(data.error || "AI error");
+            }
           }}
         >
           AI sugestia
@@ -277,7 +285,7 @@ function InvoiceCard({ inv, communityId }: { inv: Invoice; communityId: string }
             });
           }}
         >
-          Zatwierdź i nalicz
+          Nalicz do szkicu
         </button>
       </div>
 
