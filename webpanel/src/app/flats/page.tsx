@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { collection, getDocs, onSnapshot, query, setDoc, doc } from "firebase/firestore";
+import { collection, onSnapshot, query } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
+import { callable } from "../../lib/functions";
 
 type Flat = {
   id: string;
@@ -43,7 +44,7 @@ export default function FlatsPage() {
   const { profile } = useAuth();
   const communityId = profile?.communityId || "";
   const role = String(profile?.role || "");
-  const canEdit = useMemo(() => ["MASTER", "ADMIN", "ACCOUNTANT"].includes(role), [role]);
+  const canEdit = useMemo(() => ["MASTER", "ACCOUNTANT"].includes(role), [role]);
 
   const [items, setItems] = useState<Flat[]>([]);
   const [street, setStreet] = useState("");
@@ -54,6 +55,7 @@ export default function FlatsPage() {
   const [email, setEmail] = useState("");
   const [phone, setPhone] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     if (!communityId) return;
@@ -68,40 +70,41 @@ export default function FlatsPage() {
 
   const saveFlat = async () => {
     if (!communityId || !street.trim() || !buildingNo.trim() || !apartmentNo.trim()) return;
-    const flatKey = buildFlatKey(communityId, street, buildingNo, apartmentNo);
-    const allSnap = await getDocs(collection(db, "communities", communityId, "flats"));
-    const existing = allSnap.docs.find((d) => {
-      const x: any = d.data();
-      const key = String(x.flatKey || buildFlatKey(communityId, String(x.street || ""), String(x.buildingNo || ""), String(x.apartmentNo || x.flatNumber || "")));
-      return key === flatKey;
-    });
-    const ref = existing ? doc(db, "communities", communityId, "flats", existing.id) : doc(collection(db, "communities", communityId, "flats"));
-    await setDoc(ref, {
-      street: street.trim(),
-      buildingNo: buildingNo.trim(),
-      apartmentNo: apartmentNo.trim(),
-      flatNumber: apartmentNo.trim(),
-      flatLabel: `${street.trim()} ${buildingNo.trim()}/${apartmentNo.trim()}`,
-      flatKey,
-      name: name.trim(),
-      surname: surname.trim(),
-      email: email.trim(),
-      phone: phone.trim(),
-      updatedAtMs: Date.now(),
-      createdAtMs: existing?.data()?.createdAtMs || Date.now(),
-    }, { merge: true });
-    setStreet("");
-    setBuildingNo("");
-    setApartmentNo("");
-    setName("");
-    setSurname("");
-    setEmail("");
-    setPhone("");
-    setMsg(existing ? "Zaktualizowano istniejący lokal." : "Dodano nowy lokal.");
+    setMsg(null);
+    setErr(null);
+    try {
+      const fn = callable("upsertFlat");
+      const res = await fn({
+        source: "WEBPANEL",
+        communityId,
+        street: street.trim(),
+        buildingNo: buildingNo.trim(),
+        apartmentNo: apartmentNo.trim(),
+        flatNumber: apartmentNo.trim(),
+        flatLabel: `${street.trim()} ${buildingNo.trim()}/${apartmentNo.trim()}`,
+        flatKey: buildFlatKey(communityId, street, buildingNo, apartmentNo),
+        name: name.trim(),
+        surname: surname.trim(),
+        email: email.trim(),
+        phone: phone.trim(),
+        withPayer: true,
+      });
+      const created = Boolean((res as any)?.data?.created);
+      setStreet("");
+      setBuildingNo("");
+      setApartmentNo("");
+      setName("");
+      setSurname("");
+      setEmail("");
+      setPhone("");
+      setMsg(created ? "Dodano nowy lokal i zużyto 1 seat." : "Zaktualizowano istniejący lokal.");
+    } catch (e: any) {
+      setErr(e?.message || "Błąd zapisu lokalu");
+    }
   };
 
   return (
-    <RequireAuth roles={["MASTER", "ADMIN", "ACCOUNTANT"]}>
+    <RequireAuth roles={["MASTER", "ACCOUNTANT"]}>
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 16 }}>
         <h2>Lokale</h2>
@@ -120,6 +123,7 @@ export default function FlatsPage() {
             </div>
             <button style={{ marginTop: 10 }} onClick={saveFlat}>Zapisz</button>
             {msg ? <div style={{ marginTop: 10, color: "green" }}>{msg}</div> : null}
+            {err ? <div style={{ marginTop: 10, color: "crimson" }}>{err}</div> : null}
           </div>
         )}
 

@@ -25,7 +25,7 @@ export function RequireAuth({ children, roles, requirePanelAccess = true }: { ch
         <div style={{ padding: 24, display: "grid", gap: 12, maxWidth: 560 }}>
           <h2 style={{ margin: 0 }}>Brak uprawnień</h2>
           <p style={{ margin: 0, opacity: 0.8 }}>
-            Ta część webpanelu jest dostępna tylko dla ról administracyjnych. Aktualna rola: {role || "?"}.
+            Ta część webpanelu jest dostępna tylko dla ról MASTER / ACCOUNTANT. Aktualna rola: {role || "?"}.
           </p>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             <button

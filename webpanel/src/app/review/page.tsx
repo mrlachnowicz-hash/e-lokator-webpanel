@@ -20,7 +20,7 @@ export default function ReviewPage() {
   }, [communityId]);
 
   return (
-    <RequireAuth roles={["MASTER", "ADMIN", "ACCOUNTANT"]}>
+    <RequireAuth roles={["MASTER", "ACCOUNTANT"]}>
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 12 }}>
         <h2>Review queue</h2>

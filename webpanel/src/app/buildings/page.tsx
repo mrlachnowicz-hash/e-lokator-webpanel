@@ -37,7 +37,7 @@ export default function BuildingsPage() {
   const total = useMemo(() => items.reduce((a, x) => a + x.flatsCount, 0), [items]);
 
   return (
-    <RequireAuth roles={["MASTER", "ADMIN", "ACCOUNTANT"]}>
+    <RequireAuth roles={["MASTER", "ACCOUNTANT"]}>
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 16 }}>
         <h2>Budynki</h2>

@@ -18,7 +18,7 @@ export default function LoginPage() {
     if (loading || !user) return;
 
     const role = String(profile?.role || "");
-    if (!["MASTER", "ADMIN", "ACCOUNTANT"].includes(role)) {
+    if (!["MASTER", "ACCOUNTANT"].includes(role)) {
       if (role) {
         setErr("Ta rola nie ma dostępu do webpanelu. Lokator korzysta z aplikacji mobilnej.");
         signOut(auth);
@@ -38,7 +38,7 @@ export default function LoginPage() {
   return (
     <div style={{ padding: 32, maxWidth: 420, margin: "0 auto" }}>
       <h2>Logowanie</h2>
-      <p style={{ opacity: 0.7 }}>MASTER / ADMIN / ACCOUNTANT</p>
+      <p style={{ opacity: 0.7 }}>MASTER / ACCOUNTANT</p>
       <div style={{ display: "grid", gap: 10 }}>
         <input className="input" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
         <input className="input" placeholder="Hasło" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />

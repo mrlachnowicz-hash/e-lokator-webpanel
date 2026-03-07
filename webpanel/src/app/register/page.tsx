@@ -17,7 +17,7 @@ export default function RegisterPage() {
     <div style={{ padding: 32, maxWidth: 520, margin: "0 auto" }}>
       <h2>Rejestracja księgowej</h2>
       <p style={{ opacity: 0.7 }}>
-        Podaj email/hasło i <b>kod wspólnoty</b> (join code) wygenerowany przez MASTER/ADMIN.
+        Podaj email/hasło i <b>kod wspólnoty</b> (join code) wygenerowany przez MASTER.
       </p>
       <div style={{ display: "grid", gap: 10 }}>
         <input placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
