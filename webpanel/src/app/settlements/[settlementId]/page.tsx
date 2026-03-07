@@ -136,12 +136,12 @@ export default function SettlementDetailsPage({ params }: { params: { settlement
 
     const paymentsRef = query(collection(db, "communities", communityId, "payments"), orderBy("createdAtMs", "desc"));
     const unsubPayments = onSnapshot(paymentsRef, (snap) => {
-      setPayments(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Payment) })));
+      setPayments(snap.docs.map((d) => ({ ...(d.data() as Payment), id: d.id })));
     });
 
     const reviewRef = query(collection(db, "communities", communityId, "reviewQueue"), orderBy("createdAtMs", "desc"));
     const unsubReview = onSnapshot(reviewRef, (snap) => {
-      setReviewItems(snap.docs.map((d) => ({ id: d.id, ...(d.data() as ReviewItem) })));
+      setReviewItems(snap.docs.map((d) => ({ ...(d.data() as ReviewItem), id: d.id })));
     });
 
     return () => {
