@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { createUserWithEmailAndPassword } from "firebase/auth";
@@ -11,34 +12,45 @@ export default function RegisterPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
+  const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   return (
     <div style={{ padding: 32, maxWidth: 520, margin: "0 auto" }}>
       <h2>Rejestracja księgowej</h2>
-      <p style={{ opacity: 0.7 }}>
-        Podaj email/hasło i <b>kod wspólnoty</b> (join code) wygenerowany przez MASTER.
+      <p style={{ opacity: 0.8, marginBottom: 16 }}>
+        Podaj email, hasło i <b>jednorazowy kod wygenerowany przez MASTERA</b> w dashboardzie webpanelu.
+        Po poprawnej rejestracji kod zostanie zużyty, a później księgowa loguje się już tylko mailem i hasłem.
       </p>
       <div style={{ display: "grid", gap: 10 }}>
-        <input placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
-        <input placeholder="Hasło" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-        <input placeholder="Kod wspólnoty" value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} />
+        <input className="input" placeholder="Email księgowej" value={email} onChange={(e) => setEmail(e.target.value)} />
+        <input className="input" placeholder="Hasło księgowej" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        <input className="input" placeholder="Jednorazowy kod od MASTERA" value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} />
         <button
+          className="btn"
+          disabled={loading || !email.trim() || !password || !code.trim()}
           onClick={async () => {
             setErr(null);
+            setLoading(true);
             try {
-              await createUserWithEmailAndPassword(auth, email, password);
+              await createUserWithEmailAndPassword(auth, email.trim(), password);
               const claim = callable<{ code: string }, any>("claimJoinCode");
-              await claim({ code });
+              await claim({ code: code.trim().toUpperCase() });
               router.replace("/dashboard");
             } catch (e: any) {
-              setErr(e?.message || "Błąd");
+              setErr(e?.message || "Błąd rejestracji");
+            } finally {
+              setLoading(false);
             }
           }}
         >
-          Utwórz konto
+          {loading ? "Rejestracja..." : "Zarejestruj księgową"}
         </button>
         {err && <div style={{ color: "crimson" }}>{err}</div>}
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <Link href="/login">Powrót do logowania</Link>
       </div>
     </div>
   );
