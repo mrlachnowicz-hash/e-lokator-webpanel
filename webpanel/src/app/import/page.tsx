@@ -2,17 +2,19 @@
 
 import { useEffect, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
-import { collection, doc, getDocs, writeBatch } from "firebase/firestore";
+import { collection, getDocs } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
-import { buildFlatKey } from "../../lib/flatMapping";
 
 type Row = {
-  flatNumber?: string;
-  name?: string;
-  surname?: string;
+  street?: string;
+  buildingNo?: string;
+  apartmentNo?: string;
+  firstName?: string;
+  lastName?: string;
+  displayName?: string;
   email?: string;
   phone?: string;
   areaM2?: number;
@@ -20,28 +22,62 @@ type Row = {
 
 type Street = { id: string; name: string };
 
+type ImportResult = {
+  ok?: boolean;
+  created?: number;
+  updated?: number;
+  skipped?: number;
+  invalid?: number;
+  duplicateInFile?: number;
+  details?: string[];
+};
+
+function pick(raw: any, keys: string[]) {
+  for (const key of keys) {
+    const direct = raw?.[key];
+    if (direct != null && String(direct).trim() !== "") return direct;
+    const match = Object.keys(raw || {}).find((k) => k.toLowerCase() === key.toLowerCase());
+    if (match) {
+      const v = raw?.[match];
+      if (v != null && String(v).trim() !== "") return v;
+    }
+  }
+  return "";
+}
+
 function normalizeRow(r: any): Row {
-  const val = (keys: string[]) => keys.map((k) => r[k]).find((v) => v != null && String(v).trim() !== "") ?? "";
+  const apartmentNo = String(
+    pick(r, ["apartmentNo", "flatNumber", "flatnumber", "nr", "lokal", "flat", "mieszkanie", "nr lokalu"]),
+  ).trim();
+  const firstName = String(pick(r, ["firstName", "name", "imie", "imię"])).trim();
+  const lastName = String(pick(r, ["lastName", "surname", "nazwisko"])).trim();
+  const displayName = String(pick(r, ["displayName", "residentName", "mieszkaniec"])).trim();
+  const areaRaw = pick(r, ["areaM2", "metraz", "metraż", "m2", "area"]);
   return {
-    flatNumber: String(val(["flatNumber", "flatnumber", "nr", "lokal", "flat", "mieszkanie", "apartmentNo"])).trim(),
-    name: String(val(["name", "imie", "imię"])).trim(),
-    surname: String(val(["surname", "nazwisko"])).trim(),
-    email: String(val(["email", "mail"])).trim(),
-    phone: String(val(["phone", "telefon", "tel"])).trim(),
-    areaM2: val(["areaM2", "metraz", "metraż", "m2", "area"]) ? Number(val(["areaM2", "metraz", "metraż", "m2", "area"])) : undefined,
+    street: String(pick(r, ["street", "ulica"])).trim(),
+    buildingNo: String(pick(r, ["buildingNo", "nr budynku", "building", "budynek"])).trim(),
+    apartmentNo,
+    firstName,
+    lastName,
+    displayName,
+    email: String(pick(r, ["email", "mail"])).trim(),
+    phone: String(pick(r, ["phone", "telefon", "tel"])).trim(),
+    areaM2: areaRaw !== "" ? Number(areaRaw) : undefined,
   };
 }
 
-
 export default function ImportPage() {
-  const { profile } = useAuth();
+  const { user, profile } = useAuth();
   const communityId = profile?.communityId || "";
   const [streets, setStreets] = useState<Street[]>([]);
   const [streetId, setStreetId] = useState("");
   const [buildingNo, setBuildingNo] = useState("");
   const [rows, setRows] = useState<Row[]>([]);
+  const [fileName, setFileName] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
+  const [details, setDetails] = useState<string[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!communityId) return;
@@ -53,19 +89,29 @@ export default function ImportPage() {
     })();
   }, [communityId, streetId]);
 
-  const preview = useMemo(() => rows.slice(0, 8), [rows]);
   const selectedStreet = streets.find((s) => s.id === streetId)?.name || "";
+  const csvHasStreet = rows.some((r) => !!r.street);
+  const csvHasBuilding = rows.some((r) => !!r.buildingNo);
+  const preview = useMemo(() => rows.slice(0, 8), [rows]);
+  const canRun = !!user && !!communityId && rows.length > 0 && (csvHasStreet || !!streetId) && (csvHasBuilding || !!buildingNo.trim());
 
   return (
     <RequireAuth roles={["MASTER", "ACCOUNTANT"]}>
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 16, maxWidth: 1100 }}>
         <h2>Import lokali</h2>
-        <p style={{ opacity: 0.75 }}>Aplikacja jest źródłem prawdy. Wybierz istniejącą ulicę z aplikacji, wpisz numer budynku i zaimportuj lokale bez tworzenia duplikatów.</p>
+        <p style={{ opacity: 0.75 }}>
+          CSV/XLSX może zawierać pełne dane: street, buildingNo, apartmentNo, firstName, lastName, displayName, email, phone, areaM2.
+          Jeśli w pliku nie ma ulicy albo numeru budynku, panel użyje wartości wybranych ręcznie poniżej.
+        </p>
         <div className="formRow" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
           <select className="select" value={streetId} onChange={(e) => setStreetId(e.target.value)}>
             <option value="">Wybierz ulicę</option>
-            {streets.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            {streets.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+              </option>
+            ))}
           </select>
           <input className="input" placeholder="Nr budynku" value={buildingNo} onChange={(e) => setBuildingNo(e.target.value)} />
           <input
@@ -74,20 +120,39 @@ export default function ImportPage() {
             onChange={async (e) => {
               const file = e.target.files?.[0];
               if (!file) return;
+              setMsg(null);
+              setErr(null);
+              setDetails([]);
+              setFileName(file.name);
               const data = await file.arrayBuffer();
               const wb = XLSX.read(data);
               const ws = wb.Sheets[wb.SheetNames[0]!];
               const json = XLSX.utils.sheet_to_json(ws, { defval: "" });
-              setRows((json as any[]).map(normalizeRow).filter((r) => !!r.flatNumber));
+              setRows((json as any[]).map(normalizeRow).filter((r) => !!r.apartmentNo));
             }}
           />
         </div>
+
+        {fileName ? (
+          <div style={{ opacity: 0.8, fontSize: 14 }}>
+            Plik: <strong>{fileName}</strong>. CSV ma własną ulicę: <strong>{csvHasStreet ? "tak" : "nie"}</strong>, własny numer budynku: <strong>{csvHasBuilding ? "tak" : "nie"}</strong>.
+          </div>
+        ) : null}
 
         {preview.length > 0 && (
           <div className="card">
             <h3>Podgląd</h3>
             <div style={{ display: "grid", gap: 8 }}>
-              {preview.map((r, idx) => <div key={idx}>{selectedStreet} {buildingNo}/{r.flatNumber} — {r.name} {r.surname} — {r.email || "brak email"}</div>)}
+              {preview.map((r, idx) => {
+                const lineStreet = r.street || selectedStreet || "[brak ulicy]";
+                const lineBuilding = r.buildingNo || buildingNo || "[brak budynku]";
+                const resident = [r.firstName, r.lastName].filter(Boolean).join(" ") || r.displayName || "brak danych";
+                return (
+                  <div key={idx}>
+                    {lineStreet} {lineBuilding}/{r.apartmentNo} — {resident} — {r.email || "brak email"}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
@@ -97,73 +162,59 @@ export default function ImportPage() {
             <strong>Wierszy: {rows.length}</strong>
             <button
               className="btn"
-              disabled={!communityId || !streetId || !buildingNo.trim() || rows.length === 0}
+              disabled={busy || !canRun}
               onClick={async () => {
-                setMsg(null); setErr(null);
+                setMsg(null);
+                setErr(null);
+                setDetails([]);
+                setBusy(true);
                 try {
-                  const allFlats = await getDocs(collection(db, "communities", communityId, "flats"));
-                  const existingByKey = new Map<string, any>();
-                  allFlats.docs.forEach((d) => {
-                    const x: any = d.data();
-                    const key = String(x.flatKey || buildFlatKey(communityId, String(x.street || ""), String(x.buildingNo || ""), String(x.apartmentNo || x.flatNumber || "")));
-                    existingByKey.set(key, d);
-                  });
-                  const batch = writeBatch(db);
-                  let created = 0;
-                  let updated = 0;
-                  for (const row of rows) {
-                    const apartmentNo = String(row.flatNumber || "").trim();
-                    if (!apartmentNo) continue;
-                    const flatKey = buildFlatKey(communityId, selectedStreet, buildingNo, apartmentNo);
-                    const existing = existingByKey.get(flatKey);
-                    const flatRef = existing ? doc(db, "communities", communityId, "flats", existing.id) : doc(collection(db, "communities", communityId, "flats"));
-                    const createdAtMs = existing?.data()?.createdAtMs || Date.now();
-                    batch.set(flatRef, {
+                  const idToken = await user!.getIdToken();
+                  const response = await fetch("/api/import-flats", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      Authorization: `Bearer ${idToken}`,
+                    },
+                    body: JSON.stringify({
                       communityId,
-                      streetId,
-                      street: selectedStreet,
-                      buildingNo: buildingNo.trim(),
-                      apartmentNo,
-                      flatNumber: apartmentNo,
-                      flatLabel: `${selectedStreet} ${buildingNo.trim()}/${apartmentNo}`,
-                      flatKey,
-                      name: row.name || existing?.data()?.name || "",
-                      surname: row.surname || existing?.data()?.surname || "",
-                      email: row.email || existing?.data()?.email || "",
-                      phone: row.phone || existing?.data()?.phone || "",
-                      areaM2: row.areaM2 ?? existing?.data()?.areaM2 ?? null,
-                      updatedAtMs: Date.now(),
-                      createdAtMs,
-                    }, { merge: true });
-                    const payerRef = doc(db, "communities", communityId, "payers", flatRef.id);
-                    batch.set(payerRef, {
-                      flatId: flatRef.id,
-                      streetId,
-                      street: selectedStreet,
-                      buildingNo: buildingNo.trim(),
-                      apartmentNo,
-                      flatLabel: `${selectedStreet} ${buildingNo.trim()}/${apartmentNo}`,
-                      flatKey,
-                      name: row.name || "",
-                      surname: row.surname || "",
-                      email: row.email || "",
-                      phone: row.phone || "",
-                      mailOnly: !!row.email,
-                      updatedAtMs: Date.now(),
-                      createdAtMs,
-                    }, { merge: true });
-                    if (existing) updated += 1; else created += 1;
-                  }
-                  await batch.commit();
-                  setMsg(`Import zakończony. Utworzono: ${created}, zaktualizowano: ${updated}.`);
+                      fallbackStreetId: streetId || null,
+                      fallbackStreetName: selectedStreet || null,
+                      fallbackBuildingNo: buildingNo.trim() || null,
+                      rows,
+                    }),
+                  });
+                  const data: ImportResult = await response.json().catch(() => ({}));
+                  if (!response.ok) throw new Error((data as any)?.error || "Błąd importu");
+                  setMsg(
+                    `Import zakończony. Utworzono: ${data.created ?? 0}, zaktualizowano: ${data.updated ?? 0}, pominięto: ${data.skipped ?? 0}, nieprawidłowe: ${data.invalid ?? 0}, duplikaty w pliku: ${data.duplicateInFile ?? 0}.`,
+                  );
+                  setDetails(data.details || []);
                 } catch (e: any) {
                   setErr(e?.message || "Błąd importu");
+                } finally {
+                  setBusy(false);
                 }
               }}
-            >Uruchom import</button>
+            >
+              {busy ? "Importowanie..." : "Uruchom import"}
+            </button>
           </div>
+          {!canRun && rows.length > 0 ? (
+            <div style={{ color: "#d6b46b" }}>
+              Aby uruchomić import, plik musi zawierać street/buildingNo albo musisz wybrać ulicę i wpisać numer budynku ręcznie.
+            </div>
+          ) : null}
           {msg ? <div style={{ color: "green" }}>{msg}</div> : null}
           {err ? <div style={{ color: "crimson" }}>{err}</div> : null}
+          {details.length ? (
+            <div style={{ marginTop: 12, display: "grid", gap: 6, fontSize: 14, opacity: 0.9 }}>
+              {details.slice(0, 12).map((line, index) => (
+                <div key={`${line}-${index}`}>{line}</div>
+              ))}
+              {details.length > 12 ? <div>… i jeszcze {details.length - 12} pozycji.</div> : null}
+            </div>
+          ) : null}
         </div>
       </div>
     </RequireAuth>
