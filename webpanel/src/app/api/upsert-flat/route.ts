@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getAdminApp, getAdminDb } from '../../../lib/server/firebaseAdmin';
 import { buildFlatKey } from '../../../lib/flatMapping';
 import { canCreateFlat, getSeatState } from '../../../lib/server/seatLimits';
+import { ensureStreetDoc } from '../../../lib/server/streetRegistry';
 
 function splitDisplayName(displayName: string) {
   const parts = String(displayName || '').trim().split(/\s+/).filter(Boolean);
@@ -82,12 +83,15 @@ export async function POST(req: NextRequest) {
         throw new Error(`Brak wolnych seats. Limit: ${seatState.limit}, wykorzystane: ${seatState.used}.`);
       }
 
+      const streetMeta = await ensureStreetDoc(tx, communityRef, street, uid);
+      const streetId = String(streetMeta?.streetId || currentFlat.streetId || '');
       const flatLabel = `${street} ${buildingNo}/${apartmentNo}`;
       const mergedDisplayName = displayNameRaw || [firstName, lastName].filter(Boolean).join(' ');
       const createdAtMs = Number(currentFlat.createdAtMs || now);
 
       tx.set(ref, {
         communityId,
+        streetId,
         street,
         buildingNo,
         apartmentNo,
@@ -107,6 +111,7 @@ export async function POST(req: NextRequest) {
       tx.set(payerRef, {
         flatId: ref.id,
         communityId,
+        streetId,
         street,
         buildingNo,
         apartmentNo,

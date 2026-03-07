@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from "react";
 import * as XLSX from "xlsx";
-import { collection, onSnapshot, orderBy, query } from "firebase/firestore";
+import { collection, getDocs, onSnapshot, orderBy, query } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
+import { buildFlatLabel } from "../../lib/flatMapping";
 import { callable } from "../../lib/functions";
 
 type Payment = any;
@@ -35,11 +36,22 @@ export default function PaymentsPage() {
   const communityId = profile?.communityId || "";
   const [items, setItems] = useState<Payment[]>([]);
   const [msg, setMsg] = useState("");
+  const [flatLabels, setFlatLabels] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (!communityId) return;
     const q = query(collection(db, "communities", communityId, "payments"), orderBy("createdAtMs", "desc"));
-    return onSnapshot(q, (snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }))));
+    return onSnapshot(q, async (snap) => {
+      const data = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+      setItems(data);
+      const flatSnap = await getDocs(collection(db, "communities", communityId, "flats"));
+      const labelMap: Record<string, string> = {};
+      flatSnap.docs.forEach((docSnap) => {
+        const flat: any = docSnap.data() || {};
+        labelMap[docSnap.id] = String(flat.flatLabel || buildFlatLabel(flat.street, flat.buildingNo, flat.apartmentNo) || docSnap.id);
+      });
+      setFlatLabels(labelMap);
+    });
   }, [communityId]);
 
   return (
@@ -72,7 +84,7 @@ export default function PaymentsPage() {
         <div style={{ display: "grid", gap: 10 }}>
           {items.slice(0, 200).map((p) => (
             <div key={p.id} className="card" style={{ display: "flex", gap: 12 }}>
-              <strong>{p.flatId || "brak dopasowania"}</strong>
+              <strong>{flatLabels[String(p.flatId || "")] || p.flatLabel || p.flatId || "brak dopasowania"}</strong>
               <span>{p.period || "—"}</span>
               <span>{p.title || p.source || "Wpłata"}</span>
               <span>{(Number(p.amountCents || 0) / 100).toFixed(2)} PLN</span>

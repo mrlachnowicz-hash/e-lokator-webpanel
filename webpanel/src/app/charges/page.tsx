@@ -2,11 +2,12 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { collection, onSnapshot, orderBy, query } from "firebase/firestore";
+import { collection, getDocs, onSnapshot, orderBy, query } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
+import { buildFlatLabel } from "../../lib/flatMapping";
 
 type Settlement = any;
 
@@ -24,11 +25,24 @@ export default function ChargesPage() {
   const communityId = profile?.communityId || "";
   const [items, setItems] = useState<Settlement[]>([]);
   const [msg, setMsg] = useState<string | null>(null);
+  const [flatLabels, setFlatLabels] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (!communityId) return;
     const q = query(collection(db, "communities", communityId, "settlements"), orderBy("updatedAtMs", "desc"));
-    return onSnapshot(q, (snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }))));
+    return onSnapshot(q, async (snap) => {
+      const data = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+      setItems(data);
+      const missing = Array.from(new Set(data.map((item: any) => String(item.flatId || "").trim()).filter(Boolean))).filter((flatId) => !flatLabels[flatId]);
+      if (!missing.length) return;
+      const flatSnap = await getDocs(collection(db, "communities", communityId, "flats"));
+      const labelMap: Record<string, string> = {};
+      flatSnap.docs.forEach((docSnap) => {
+        const flat: any = docSnap.data() || {};
+        labelMap[docSnap.id] = String(flat.flatLabel || buildFlatLabel(flat.street, flat.buildingNo, flat.apartmentNo) || docSnap.id);
+      });
+      setFlatLabels((prev) => ({ ...prev, ...labelMap }));
+    });
   }, [communityId]);
 
   return (
@@ -43,7 +57,7 @@ export default function ChargesPage() {
           {items.slice(0, 200).map((s) => (
             <div key={s.id} className="card" style={{ display: "grid", gap: 10 }}>
               <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-                <b>{s.flatId}</b>
+                <b>{flatLabels[String(s.flatId || "")] || s.flatLabel || s.flatId || "Lokal"}</b>
                 <span style={{ opacity: 0.75 }}>{s.period}</span>
                 <span style={{ opacity: 0.75 }}>Saldo: {money(centsOrAmount(s.balanceCents, s.balance))}</span>
                 <span style={{ opacity: 0.75 }}>Opłaty: {money(centsOrAmount(s.chargesCents ?? s.totalCents, s.total))}</span>

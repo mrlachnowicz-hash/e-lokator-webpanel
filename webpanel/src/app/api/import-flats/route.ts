@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getAdminApp, getAdminDb } from "../../../lib/server/firebaseAdmin";
 import { buildFlatKey } from "../../../lib/flatMapping";
 import { canCreateFlat, getSeatState } from "../../../lib/server/seatLimits";
+import { buildStreetId } from "../../../lib/server/streetRegistry";
 
 type Row = {
   street?: string;
@@ -90,6 +91,7 @@ export async function POST(req: NextRequest) {
     const details: string[] = [];
     const now = Date.now();
     const batch = db.batch();
+    const streetsToEnsure = new Map<string, string>();
     const seenKeys = new Set<string>();
     let plannedCreates = 0;
 
@@ -153,7 +155,8 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      const streetId = streetIdByName.get(street.toLowerCase()) || fallbackStreetId || street;
+      const streetId = streetIdByName.get(street.toLowerCase()) || fallbackStreetId || buildStreetId(street);
+      streetsToEnsure.set(streetId, street);
       const flatRef = existing
         ? communityRef.collection("flats").doc(existing.id)
         : communityRef.collection("flats").doc();
@@ -220,6 +223,15 @@ export async function POST(req: NextRequest) {
       batch.set(communityRef, {
         seatsUsed: Math.max(Number((communityData as any)?.seatsUsed || 0), flatsSnap.size) + plannedCreates,
         updatedAtMs: now,
+      }, { merge: true });
+    }
+    for (const [streetId, streetName] of streetsToEnsure.entries()) {
+      batch.set(communityRef.collection("streets").doc(streetId), {
+        name: streetName,
+        nameNorm: buildStreetId(streetName),
+        createdAtMs: now,
+        updatedAtMs: now,
+        updatedByUid: uid,
       }, { merge: true });
     }
     await batch.commit();
