@@ -11,13 +11,23 @@ export type SettlementRecord = {
   residentName?: string;
   period?: string;
   dueDate?: string;
+
   bankAccount?: string;
   accountNumber?: string;
-  paymentTitle?: string;
+
+  transferName?: string;
+  transferAddress?: string;
   transferTitle?: string;
+  paymentTitle?: string;
+
+  receiverName?: string;
+  receiverAddress?: string;
+
   email?: string;
+
   charges?: ChargeItem[];
   chargesBreakdown?: ChargeItem[];
+
   chargesCents?: number;
   paymentsCents?: number;
   balanceCents?: number;
@@ -40,7 +50,6 @@ export type PaymentRecord = {
   flatId?: string;
   period?: string;
   transferTitle?: string;
-  paymentTitle?: string;
   createdAtMs?: number;
 };
 
@@ -69,28 +78,44 @@ export function inferSettlementTotal(settlement: SettlementRecord | null | undef
 
 export function inferRelatedPayments(payments: PaymentRecord[], settlement: SettlementRecord | null | undefined) {
   if (!settlement) return [];
+
   const transferTitle = String(settlement.transferTitle || settlement.paymentTitle || "").toLowerCase();
   const flatId = String(settlement.flatId || "").toLowerCase();
   const period = String(settlement.period || "").toLowerCase();
   const settlementId = String(settlement.id || "");
 
   return payments.filter((p) => {
-    const title = `${p.title || ""} ${p.source || ""} ${p.transferTitle || ""} ${p.paymentTitle || ""}`.toLowerCase();
-    return p.settlementId === settlementId
-      || (!!flatId && String(p.flatId || "").toLowerCase() === flatId)
-      || (!!transferTitle && title.includes(transferTitle))
-      || (!!period && !!flatId && String(p.period || "").toLowerCase() === period && title.includes(flatId));
+    const title = `${p.title || ""} ${p.source || ""} ${p.transferTitle || ""}`.toLowerCase();
+
+    return (
+      p.settlementId === settlementId ||
+      (!!flatId && String(p.flatId || "").toLowerCase() === flatId) ||
+      (!!transferTitle && title.includes(transferTitle)) ||
+      (!!period && !!flatId && String(p.period || "").toLowerCase() === period && title.includes(flatId))
+    );
   });
 }
 
 export function sumPayments(payments: PaymentRecord[]) {
-  return payments.reduce((sum, p) => sum + (p.amountCents != null ? Number(p.amountCents) / 100 : Number(p.amount || 0)), 0);
+  return payments.reduce(
+    (sum, p) => sum + (p.amountCents != null ? Number(p.amountCents) / 100 : Number(p.amount || 0)),
+    0
+  );
 }
 
 export function getSettlementBalance(settlement: SettlementRecord | null | undefined, payments: PaymentRecord[]) {
   if (!settlement) return 0;
   if (settlement.balanceCents != null) return Number(settlement.balanceCents) / 100;
-  const charges = settlement.chargesCents != null ? Number(settlement.chargesCents) / 100 : inferSettlementTotal(settlement);
-  const paid = settlement.paymentsCents != null ? Number(settlement.paymentsCents) / 100 : sumPayments(payments);
+
+  const charges =
+    settlement.chargesCents != null
+      ? Number(settlement.chargesCents) / 100
+      : inferSettlementTotal(settlement);
+
+  const paid =
+    settlement.paymentsCents != null
+      ? Number(settlement.paymentsCents) / 100
+      : sumPayments(payments);
+
   return charges - paid;
 }
