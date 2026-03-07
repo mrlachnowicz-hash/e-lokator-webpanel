@@ -11,6 +11,14 @@ import { callable } from "../../lib/functions";
 
 type Payment = any;
 
+function paymentStatusLabel(p: any) {
+  const raw = String(p.status || p.matchedBy || "").toUpperCase();
+  if (raw === "CODE" || raw === "MATCHED") return "CODE · dopasowane";
+  if (raw === "AI_HINT" || raw === "AI" || raw.includes("AI")) return "AI_HINT · dopasowane AI";
+  if (p.matched) return "CODE · dopasowane";
+  return "REVIEW · do sprawdzenia";
+}
+
 function normalizePaymentRow(r: any) {
   const pick = (...keys: string[]) => keys.map((k) => r[k]).find((v) => v != null && String(v).trim() !== "") ?? "";
   return {
@@ -39,6 +47,7 @@ export default function PaymentsPage() {
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 16 }}>
         <h2>Import przelewów</h2>
+        <p style={{ opacity: 0.8, marginTop: -8 }}>Kolejność dopasowania: 1) tytuł przelewu, 2) numer lokalu, 3) nazwisko, 4) adres, 5) kwota równa sumie rozliczenia. Nierozpoznane wpłaty trafiają do reviewQueue.</p>
         <div className="card" style={{ display: "grid", gap: 12 }}>
           <p>System dopasowuje przelewy najpierw po kodzie <code>EL-xxx</code>, a gdy go brakuje lub jest błędny, próbuje dopasować wpłatę po numerze lokalu, nazwisku, adresie i treści przelewu. Dopiero nierozpoznane wpłaty trafiają do reviewQueue.</p>
           <input
@@ -68,7 +77,7 @@ export default function PaymentsPage() {
               <span>{p.title || p.source || "Wpłata"}</span>
               <span>{(Number(p.amountCents || 0) / 100).toFixed(2)} PLN</span>
               <span>{p.code || "—"}</span>
-              <span>{p.matchedBy || (p.matched ? "CODE" : "REVIEW")}</span>
+              <span>{paymentStatusLabel(p)}</span>
             </div>
           ))}
         </div>

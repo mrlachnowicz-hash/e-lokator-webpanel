@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import { collection, onSnapshot, orderBy, query } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
@@ -50,13 +51,16 @@ export default function ChargesPage() {
                 <div>Tytuł przelewu: {s.transferTitle || "—"}</div>
               </div>
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <button className="btn" onClick={async () => {
+                <Link href={`/settlements/${s.id}`} className="btn" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
+                  Otwórz podgląd
+                </Link>
+                <button className="btnGhost" onClick={async () => {
                   const res = await callable<any, any>("generateSettlementPdf")({ communityId, settlementId: s.id });
                   const url = String((res.data as any)?.pdfUrl || "");
                   if (url) window.open(url, "_blank");
                   setMsg("PDF gotowy.");
                 }}>PDF</button>
-                <button className="btn" onClick={async () => {
+                <button className="btnGhost" onClick={async () => {
                   const res = await callable<any, any>("sendSettlementEmail")({ communityId, settlementId: s.id });
                   const data = (res.data as any) || {};
                   setMsg(`Email zakolejkowany do: ${data.email || "—"}`);
