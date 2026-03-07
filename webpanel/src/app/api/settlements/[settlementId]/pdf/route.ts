@@ -27,7 +27,7 @@ export async function GET(req: Request, context: { params: { settlementId: strin
       `Lokator: ${settlement.residentName || [flat?.name, flat?.surname].filter(Boolean).join(" ") || [payer?.name, payer?.surname].filter(Boolean).join(" ") || "-"}`,
       `Termin platnosci: ${settlement.dueDate || "-"}`,
       `Numer konta: ${settlement.bankAccount || settlement.accountNumber || "-"}`,
-      `Tytul przelewu: ${settlement.transferTitle || "-"}`,
+      `Tytul przelewu: ${settlement.transferTitle || settlement.paymentTitle || "-"}`,
       " ",
       "Pozycje:",
       ...((settlement.charges || settlement.chargesBreakdown || []).map((item, index) => `${index + 1}. ${item.label || item.category || "Pozycja"}: ${formatMoney(getChargeAmount(item))}`)),

@@ -84,7 +84,7 @@ export default function InvoicesPage() {
   }, [communityId]);
 
   const stats = useMemo(() => ({
-    total: items.filter((x) => !x.archivedAtMs).length,
+    total: items.filter((x) => !x.archivedAtMs && x.deletedAtMs !== true).length,
     archived: items.filter((x) => !!x.archivedAtMs).length,
     staged: items.filter((x) => !x.archivedAtMs && String(x.status || "").includes("STAGED")).length,
     review: items.filter((x) => !x.archivedAtMs && (x.ai?.suggestion?.needsReview || x.parsed?.needsReview)).length,
@@ -181,8 +181,6 @@ export default function InvoicesPage() {
               <div><strong>Confidence:</strong> {Number(ocrResult.confidence || 0).toFixed(2)}</div>
               <div><strong>Powód:</strong> {ocrResult.reason || "—"}</div>
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-        <button className="btnGhost" onClick={async () => updateDoc(doc(db, "communities", communityId, "invoices", inv.id), { archivedAtMs: inv.archivedAtMs ? null : Date.now(), updatedAtMs: Date.now() })}>{inv.archivedAtMs ? "Przywróć" : "Archiwizuj"}</button>
-        <button className="btnGhost" onClick={async () => { if (window.confirm(`Usunąć fakturę ${inv.title || inv.id}?`)) await deleteDoc(doc(db, "communities", communityId, "invoices", inv.id)); }}>Kosz</button>
                 <button className="btn" onClick={saveOcrDraft}>Zapisz szkic z OCR</button>
                 <button className="btnGhost" onClick={() => setOcrResult(null)}>Wyczyść</button>
               </div>
@@ -228,6 +226,7 @@ export default function InvoicesPage() {
             }}>Dodaj fakturę</button>
             <button className="btnGhost" onClick={async () => {
               await callable("ksefFetchInvoices")({ communityId, period: form.period });
+              setMsg("Pobrano przykładowe faktury KSeF do kolekcji ksefInvoices.");
             }}>Pobierz mock KSeF</button>
           </div>
         </div>
@@ -314,6 +313,14 @@ function InvoiceCard({ inv, communityId }: { inv: Invoice; communityId: string }
             },
           });
         }}>Nalicz do szkicu</button>
+        <button className="btnGhost" onClick={async () => {
+          await updateDoc(doc(db, "communities", communityId, "invoices", inv.id), { archivedAtMs: inv.archivedAtMs ? null : Date.now(), updatedAtMs: Date.now() });
+        }}>{inv.archivedAtMs ? "Przywróć" : "Archiwizuj"}</button>
+        <button className="btnGhost" onClick={async () => {
+          if (window.confirm(`Usunąć fakturę ${inv.title || inv.id}?`)) {
+            await updateDoc(doc(db, "communities", communityId, "invoices", inv.id), { deletedAtMs: Date.now(), archivedAtMs: Date.now(), status: "DELETED", updatedAtMs: Date.now() });
+          }
+        }}>Kosz</button>
       </div>
 
       {ai ? (

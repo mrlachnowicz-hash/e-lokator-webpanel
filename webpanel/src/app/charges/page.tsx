@@ -21,7 +21,13 @@ function monthLabel(period: string) {
 }
 function transferCode(flat: any) {
   return String(flat?.paymentCode || flat?.flatLabel || `${flat?.street || ""}-${flat?.buildingNo || ""}-${flat?.apartmentNo || ""}`)
-    .normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 36) || "LOKAL";
+    .normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 18) || "LOKAL";
+}
+
+function buildTransferTitle(flat: any, settlement: any) {
+  const period = String(settlement?.period || "").replace(/[^0-9]/g, "").slice(0, 6) || new Date().toISOString().slice(0, 7).replace(/-/g, "");
+  const suffix = String(flat?.id || settlement?.flatId || "XXXX").replace(/[^A-Za-z0-9]/g, "").slice(-4).toUpperCase() || "XXXX";
+  return `EL ${transferCode(flat || settlement)} ${period} ${suffix}`.trim();
 }
 
 export default function ChargesPage() {
@@ -115,7 +121,7 @@ function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = fal
   const [accountNumber, setAccountNumber] = useState(String(s.accountNumber || flat?.accountNumber || defaults.defaultAccountNumber || ""));
   const [transferName, setTransferName] = useState(String(s.transferName || flat?.recipientName || defaults.recipientName || ""));
   const [transferAddress, setTransferAddress] = useState(String(s.transferAddress || flat?.recipientAddress || defaults.recipientAddress || ""));
-  const [transferTitle, setTransferTitle] = useState(String(s.transferTitle || s.paymentTitle || `EL-${transferCode(flat || s)}-${String(s.period || "").replace(/[^0-9]/g, "")}`));
+  const [transferTitle, setTransferTitle] = useState(String(s.transferTitle || s.paymentTitle || buildTransferTitle(flat, s)));
   const savePaymentData = async () => {
     const payload = { accountNumber: accountNumber.trim(), transferName: transferName.trim(), transferAddress: transferAddress.trim(), transferTitle: transferTitle.trim(), paymentTitle: transferTitle.trim(), updatedAtMs: Date.now() };
     await updateDoc(doc(db, "communities", communityId, "settlements", s.id), payload);

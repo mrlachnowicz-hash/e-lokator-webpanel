@@ -49,7 +49,7 @@ export async function POST(req: Request, context: { params: { settlementId: stri
       `Lokator: ${settlement.residentName || [flat?.name, flat?.surname].filter(Boolean).join(" ") || [payer?.name, payer?.surname].filter(Boolean).join(" ") || "-"}`,
       `Termin platnosci: ${settlement.dueDate || "-"}`,
       `Numer konta: ${settlement.bankAccount || settlement.accountNumber || "-"}`,
-      `Tytul przelewu: ${settlement.transferTitle || "-"}`,
+      `Tytul przelewu: ${settlement.transferTitle || settlement.paymentTitle || "-"}`,
       ...charges.map((item, index) => `${index + 1}. ${item.label || item.category || "Pozycja"}: ${formatMoney(getChargeAmount(item))}`),
       `Suma oplat: ${formatMoney(total)}`,
       `Suma wplat: ${formatMoney(paid)}`,
@@ -87,7 +87,9 @@ export async function POST(req: Request, context: { params: { settlementId: stri
           <strong>Saldo:</strong> ${formatMoney(balance)}</p>
           <h3>Dane do przelewu</h3>
           <p><strong>Numer konta:</strong> ${settlement.bankAccount || settlement.accountNumber || "-"}<br/>
-          <strong>Tytuł przelewu:</strong> ${settlement.transferTitle || "-"}</p>
+          <strong>Odbiorca:</strong> ${settlement.transferName || "-"}<br/>
+          <strong>Adres odbiorcy:</strong> ${settlement.transferAddress || "-"}<br/>
+          <strong>Tytuł przelewu:</strong> ${settlement.transferTitle || settlement.paymentTitle || "-"}</p>
           <p>Załącznik zawiera PDF rozliczenia. Podgląd online: <a href="${pdfUrl}">${pdfUrl}</a></p>
         </div>
       `,

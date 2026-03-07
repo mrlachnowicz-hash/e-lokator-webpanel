@@ -13,6 +13,7 @@ export type SettlementRecord = {
   dueDate?: string;
   bankAccount?: string;
   accountNumber?: string;
+  paymentTitle?: string;
   transferTitle?: string;
   email?: string;
   charges?: ChargeItem[];
@@ -39,6 +40,7 @@ export type PaymentRecord = {
   flatId?: string;
   period?: string;
   transferTitle?: string;
+  paymentTitle?: string;
   createdAtMs?: number;
 };
 
@@ -67,13 +69,13 @@ export function inferSettlementTotal(settlement: SettlementRecord | null | undef
 
 export function inferRelatedPayments(payments: PaymentRecord[], settlement: SettlementRecord | null | undefined) {
   if (!settlement) return [];
-  const transferTitle = String(settlement.transferTitle || "").toLowerCase();
+  const transferTitle = String(settlement.transferTitle || settlement.paymentTitle || "").toLowerCase();
   const flatId = String(settlement.flatId || "").toLowerCase();
   const period = String(settlement.period || "").toLowerCase();
   const settlementId = String(settlement.id || "");
 
   return payments.filter((p) => {
-    const title = `${p.title || ""} ${p.source || ""} ${p.transferTitle || ""}`.toLowerCase();
+    const title = `${p.title || ""} ${p.source || ""} ${p.transferTitle || ""} ${p.paymentTitle || ""}`.toLowerCase();
     return p.settlementId === settlementId
       || (!!flatId && String(p.flatId || "").toLowerCase() === flatId)
       || (!!transferTitle && title.includes(transferTitle))

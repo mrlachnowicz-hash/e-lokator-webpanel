@@ -90,7 +90,15 @@ function paymentCodeForFlat(flat) {
   return safeString(flat.paymentCode || flat.flatLabel || `${flat.street || ""}-${flat.buildingNo || ""}-${flat.apartmentNo || ""}`)
     .replace(/\s+/g, "-")
     .replace(/[^\w\-\/]/g, "")
-    .toUpperCase();
+    .toUpperCase()
+    .slice(0, 18);
+}
+
+function buildPaymentTitle(flat, period) {
+  const code = paymentCodeForFlat(flat) || "LOKAL";
+  const compactPeriod = safeString(period).replace(/[^0-9]/g, "").slice(0, 6) || "000000";
+  const suffix = safeString(flat?.id || flat?.flatId).replace(/[^A-Za-z0-9]/g, "").slice(-4).toUpperCase() || randomCode(4);
+  return `EL ${code} ${compactPeriod} ${suffix}`;
 }
 
 function getOpenAIClient() {
@@ -995,8 +1003,12 @@ exports.aiSuggestInvoice = onCall(async (request) => {
   await assertSameCommunity(me, communityId);
   if (!invoiceId) throw new HttpsError("invalid-argument", "Brak invoiceId.");
 
-  const ref = db.doc(`communities/${communityId}/ksefInvoices/${invoiceId}`);
-  const snap = await ref.get();
+  let ref = db.doc(`communities/${communityId}/invoices/${invoiceId}`);
+  let snap = await ref.get();
+  if (!snap.exists) {
+    ref = db.doc(`communities/${communityId}/ksefInvoices/${invoiceId}`);
+    snap = await ref.get();
+  }
   if (!snap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
 
   const inv = snap.data();
@@ -1070,7 +1082,7 @@ async function recalcSettlement(communityId, flatId, period) {
 
   const community = await getCommunity(communityId);
   const settlementId = `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
-  const paymentTitle = `EL-${paymentCodeForFlat(flat)} ${period}`;
+  const paymentTitle = buildPaymentTitle({ ...flat, id: flatId }, period);
 
   await db.doc(`communities/${communityId}/settlements/${settlementId}`).set({
     id: settlementId,
@@ -1087,6 +1099,7 @@ async function recalcSettlement(communityId, flatId, period) {
     totalDueCents: balanceCents,
     dueDate: `${period}-15`,
     paymentTitle,
+    transferTitle: paymentTitle,
     transferName: valueOr(flat.recipientName, valueOr(community?.recipientName, community?.name)),
     transferAddress: valueOr(flat.recipientAddress, community?.recipientAddress),
     accountNumber: valueOr(flat.accountNumber, valueOr(community?.defaultAccountNumber, community?.accountNumber)),
@@ -1118,8 +1131,12 @@ exports.approveInvoice = onCall(async (request) => {
   await assertSameCommunity(me, communityId);
   if (!invoiceId) throw new HttpsError("invalid-argument", "Brak invoiceId.");
 
-  const ref = db.doc(`communities/${communityId}/ksefInvoices/${invoiceId}`);
-  const snap = await ref.get();
+  let ref = db.doc(`communities/${communityId}/invoices/${invoiceId}`);
+  let snap = await ref.get();
+  if (!snap.exists) {
+    ref = db.doc(`communities/${communityId}/ksefInvoices/${invoiceId}`);
+    snap = await ref.get();
+  }
   if (!snap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
 
   const inv = snap.data();
