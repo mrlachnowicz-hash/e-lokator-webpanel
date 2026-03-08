@@ -55,5 +55,4 @@ Nowe kolekcje:
 Import odczytów tworzy też wpisy w:
 - `communities/{communityId}/charges`
 
-## Ograniczenia tego ZIP
-W paczce nie ma kodu Firebase Functions ani aplikacji mobilnej, więc ich wdrożenie / build trzeba dokończyć w odpowiednich repozytoriach.
+
