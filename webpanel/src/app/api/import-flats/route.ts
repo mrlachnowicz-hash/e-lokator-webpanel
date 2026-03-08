@@ -93,7 +93,30 @@ export async function POST(req: NextRequest) {
     const batch = db.batch();
     const seenKeys = new Set<string>();
     let plannedCreates = 0;
-    const usedBefore = getSeatUsed(communityData as any, flatsSnap.size);
+    const usedBefore = Math.max(getSeatUsed(communityData as any, flatsSnap.size), flatsSnap.size);
+
+    const uniqueCreates = new Set<string>();
+    for (const row of rows) {
+      const street = String(row.street || fallbackStreetName || "").trim();
+      const buildingNo = String(row.buildingNo || fallbackBuildingNo || "").trim();
+      const apartmentNo = String(row.apartmentNo || "").trim();
+      if (!street || !buildingNo || !apartmentNo) continue;
+      const flatKey = buildFlatKey(communityId, street, buildingNo, apartmentNo);
+      if (seenKeys.has(flatKey)) continue;
+      seenKeys.add(flatKey);
+      if (!existingByKey.has(flatKey)) uniqueCreates.add(flatKey);
+    }
+    seenKeys.clear();
+
+    const seatStateBefore = getSeatState({ ...(communityData as any), seatsUsed: usedBefore }, usedBefore);
+    if (seatStateBefore.limit != null && usedBefore + uniqueCreates.size > seatStateBefore.limit) {
+      return NextResponse.json({
+        error: `Brak dostępnej ilości miejsc. Limit: ${seatStateBefore.limit}, wykorzystane: ${usedBefore}, próba importu nowych lokali: ${uniqueCreates.size}.`,
+        seatLimit: seatStateBefore.limit,
+        seatUsed: usedBefore,
+        seatRemaining: Math.max(0, (seatStateBefore.limit ?? 0) - usedBefore),
+      }, { status: 409 });
+    }
 
     for (const row of rows) {
       const street = String(row.street || fallbackStreetName || "").trim();
@@ -148,7 +171,7 @@ export async function POST(req: NextRequest) {
       }
 
       if (!existing) {
-        const seatStateNow = getSeatState(communityData as any, flatsSnap.size + plannedCreates);
+        const seatStateNow = getSeatState({ ...(communityData as any), seatsUsed: usedBefore + plannedCreates }, usedBefore + plannedCreates);
         if (!canCreateFlat(seatStateNow)) {
           invalid += 1;
           details.push(`Brak seats: ${street} ${buildingNo}/${apartmentNo}. Limit: ${seatStateNow.limit}, wykorzystane: ${seatStateNow.used}.`);

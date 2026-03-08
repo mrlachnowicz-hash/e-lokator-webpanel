@@ -48,7 +48,7 @@ export default function ChargesPage() {
     });
     getDoc(doc(db, "communities", communityId)).then((snap) => {
       const data: any = snap.data() || {};
-      setDefaults({ defaultAccountNumber: String(data.defaultAccountNumber || data.accountNumber || ""), recipientName: String(data.recipientName || data.name || ""), recipientAddress: String(data.recipientAddress || "") });
+      setDefaults({ defaultAccountNumber: String(data.defaultAccountNumber || data.accountNumber || data.bankAccount || ""), recipientName: String(data.recipientName || data.transferName || data.receiverName || data.name || ""), recipientAddress: String(data.recipientAddress || data.transferAddress || data.receiverAddress || "") });
     });
     return () => { unsubSettlements(); unsubFlats(); };
   }, [communityId]);
@@ -58,7 +58,7 @@ export default function ChargesPage() {
   const archivedGroups = useMemo(() => archived.reduce((acc: Record<string, Settlement[]>, item) => { const key = String(item.archiveMonth || item.period || "bez-daty"); (acc[key] ||= []).push(item); return acc; }, {}), [archived]);
 
   const saveDefaults = async () => {
-    await setDoc(doc(db, "communities", communityId), { defaultAccountNumber: defaults.defaultAccountNumber.trim(), accountNumber: defaults.defaultAccountNumber.trim(), recipientName: defaults.recipientName.trim(), recipientAddress: defaults.recipientAddress.trim(), updatedAtMs: Date.now() }, { merge: true });
+    await setDoc(doc(db, "communities", communityId), { defaultAccountNumber: defaults.defaultAccountNumber.trim(), accountNumber: defaults.defaultAccountNumber.trim(), bankAccount: defaults.defaultAccountNumber.trim(), recipientName: defaults.recipientName.trim(), receiverName: defaults.recipientName.trim(), transferName: defaults.recipientName.trim(), recipientAddress: defaults.recipientAddress.trim(), receiverAddress: defaults.recipientAddress.trim(), transferAddress: defaults.recipientAddress.trim(), updatedAtMs: Date.now() }, { merge: true });
     setMsg("Zapisano domyślne dane do przelewu.");
   };
 
@@ -123,9 +123,9 @@ function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = fal
   const [transferAddress, setTransferAddress] = useState(String(s.transferAddress || flat?.recipientAddress || defaults.recipientAddress || ""));
   const [transferTitle, setTransferTitle] = useState(String(s.transferTitle || s.paymentTitle || buildTransferTitle(flat, s)));
   const savePaymentData = async () => {
-    const payload = { accountNumber: accountNumber.trim(), transferName: transferName.trim(), transferAddress: transferAddress.trim(), transferTitle: transferTitle.trim(), paymentTitle: transferTitle.trim(), updatedAtMs: Date.now() };
+    const payload = { accountNumber: accountNumber.trim(), bankAccount: accountNumber.trim(), transferName: transferName.trim(), receiverName: transferName.trim(), transferAddress: transferAddress.trim(), receiverAddress: transferAddress.trim(), transferTitle: transferTitle.trim(), paymentTitle: transferTitle.trim(), updatedAtMs: Date.now() };
     await updateDoc(doc(db, "communities", communityId, "settlements", s.id), payload);
-    if (flat?.id) await setDoc(doc(db, "communities", communityId, "flats", flat.id), { accountNumber: accountNumber.trim(), recipientName: transferName.trim(), recipientAddress: transferAddress.trim(), updatedAtMs: Date.now() }, { merge: true });
+    if (flat?.id) await setDoc(doc(db, "communities", communityId, "flats", flat.id), { accountNumber: accountNumber.trim(), bankAccount: accountNumber.trim(), recipientName: transferName.trim(), receiverName: transferName.trim(), recipientAddress: transferAddress.trim(), receiverAddress: transferAddress.trim(), updatedAtMs: Date.now() }, { merge: true });
     setMsg(`Zapisano dane przelewu dla ${s.flatLabel || s.id}.`);
   };
   return (

@@ -2,33 +2,19 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { collection, onSnapshot, query, where } from "firebase/firestore";
+import { displayStreetName } from "../../lib/streetUtils";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
 
-type Flat = {
-  id: string;
-  street?: string;
-  streetId?: string;
-  streetName?: string;
-  buildingNo?: string;
-  apartmentNo?: string;
-  flatLabel?: string;
-  residentName?: string;
-  displayName?: string;
-  email?: string;
-  phone?: string;
-  residentUid?: string | null;
-  userId?: string | null;
-};
-
+type Flat = { id: string; street?: string; streetId?: string; streetName?: string; buildingNo?: string; apartmentNo?: string; flatLabel?: string; residentName?: string; displayName?: string; email?: string; phone?: string; residentUid?: string | null; userId?: string | null; };
 type User = { id: string; flatId?: string; displayName?: string; email?: string; phone?: string; street?: string; buildingNo?: string; apartmentNo?: string; role?: string };
 type BuildingRow = { key: string; street: string; buildingNo: string; flatsCount: number; flats: Flat[] };
 type StreetRow = { key: string; street: string; buildings: BuildingRow[]; flatsCount: number };
 
 function apartment(flat: Flat) { return String(flat.apartmentNo || "").trim(); }
-function flatLabel(flat: Flat) { return String(flat.flatLabel || `${flat.street || ""} ${flat.buildingNo || ""}/${apartment(flat)}`.trim()); }
+function flatLabel(flat: Flat) { return String(flat.flatLabel || `${flat.street || flat.streetName || ""} ${flat.buildingNo || ""}/${apartment(flat)}`.trim()); }
 
 export default function BuildingsPage() {
   const { profile } = useAuth();
@@ -40,26 +26,14 @@ export default function BuildingsPage() {
     if (!communityId) return;
     let flatsCache: Flat[] = [];
     let usersByFlatId = new Map<string, User>();
-    let streetNamesById = new Map<string, string>();
+    let streetsById = new Map<string, string>();
 
     const merge = () => {
       const streetsMap = new Map<string, StreetRow>();
       flatsCache.forEach((flat) => {
         const linkedUser = usersByFlatId.get(flat.id);
-        const resolvedStreet = String(flat.street || flat.streetName || streetNamesById.get(String(flat.streetId || "")) || linkedUser?.street || "").trim();
-        const merged: Flat = linkedUser
-          ? {
-              ...flat,
-              street: resolvedStreet || flat.street || flat.streetName || "",
-              displayName: flat.displayName || linkedUser.displayName || "",
-              email: flat.email || linkedUser.email || "",
-              phone: flat.phone || linkedUser.phone || "",
-              residentName: flat.residentName || linkedUser.displayName || "",
-              residentUid: flat.residentUid || linkedUser.id || null,
-              userId: flat.userId || linkedUser.id || null,
-            }
-          : { ...flat, street: resolvedStreet || flat.street || flat.streetName || "" };
-        const street = String(merged.street || "").trim();
+        const merged: Flat = linkedUser ? { ...flat, displayName: flat.displayName || linkedUser.displayName || "", email: flat.email || linkedUser.email || "", phone: flat.phone || linkedUser.phone || "", residentName: flat.residentName || linkedUser.displayName || "", residentUid: flat.residentUid || linkedUser.id || null, userId: flat.userId || linkedUser.id || null } : flat;
+        const street = String(displayStreetName(merged.street || merged.streetName || linkedUser?.street, (merged as any).streetId, streetsById) || "").trim();
         const buildingNo = String(merged.buildingNo || linkedUser?.buildingNo || "").trim();
         if (!street || !buildingNo) return;
         const streetKey = street.toLowerCase();
@@ -88,7 +62,7 @@ export default function BuildingsPage() {
       merge();
     });
     const unsubStreets = onSnapshot(query(collection(db, "communities", communityId, "streets")), (snap) => {
-      streetNamesById = new Map(snap.docs.map((d) => [d.id, String((d.data() as any).name || d.id)]));
+      streetsById = new Map(snap.docs.map((d) => [d.id, String((d.data() as any).name || d.id)]));
       merge();
     });
     const unsubUsers = onSnapshot(query(collection(db, "users"), where("communityId", "==", communityId)), (snap) => {
@@ -97,7 +71,7 @@ export default function BuildingsPage() {
       );
       merge();
     });
-    return () => { unsubFlats(); unsubStreets(); unsubUsers(); };
+    return () => { unsubFlats(); unsubUsers(); unsubStreets(); };
   }, [communityId]);
 
   const totalBuildings = useMemo(() => items.reduce((a, x) => a + x.buildings.length, 0), [items]);

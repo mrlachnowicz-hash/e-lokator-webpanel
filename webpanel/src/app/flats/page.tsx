@@ -14,6 +14,7 @@ import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
 import { buildFlatLabel } from "../../lib/flatMapping";
+import { displayStreetName } from "../../lib/streetUtils";
 
 type Flat = {
   id: string;
@@ -84,10 +85,11 @@ function getApartmentNo(flat: Flat) {
   return String(flat.apartmentNo || flat.flatNumber || "").trim();
 }
 
-function getFlatLabel(flat: Flat) {
+function getFlatLabel(flat: Flat, streetNames?: Map<string, string>) {
   const explicit = String(flat.flatLabel || "").trim();
   if (explicit) return explicit;
-  return buildFlatLabel(flat.street, flat.buildingNo, getApartmentNo(flat));
+  const street = displayStreetName(flat.street || flat.streetName, flat.streetId, streetNames);
+  return buildFlatLabel(street, flat.buildingNo, getApartmentNo(flat));
 }
 
 export default function FlatsPage() {
@@ -121,23 +123,19 @@ export default function FlatsPage() {
     const mergeAndSet = () => {
       const merged = flatsCache.map((flat) => {
         const linkedUser = usersByFlatId.get(flat.id);
-        const resolvedStreet = String(flat.street || flat.streetName || streetNamesById.get(String(flat.streetId || "")) || linkedUser?.street || "").trim();
-        const base: Flat = {
-          ...flat,
-          street: resolvedStreet || flat.street || flat.streetName || "",
-        };
-        if (!linkedUser) return base;
+        if (!linkedUser) return { ...flat, street: displayStreetName(flat.street || flat.streetName, flat.streetId, streetNamesById) };
         return {
-          ...base,
-          residentUid: base.residentUid || linkedUser.uid || linkedUser.id || null,
-          userId: base.userId || linkedUser.uid || linkedUser.id || null,
-          displayName: base.displayName || linkedUser.displayName || "",
-          name: base.name || base.firstName || linkedUser.firstName || "",
-          surname: base.surname || base.lastName || linkedUser.lastName || "",
-          email: base.email || linkedUser.email || "",
-          phone: base.phone || linkedUser.phone || "",
+          ...flat,
+          street: displayStreetName(flat.street || flat.streetName, flat.streetId || linkedUser.streetId, streetNamesById) || flat.street || linkedUser.street || "",
+          residentUid: flat.residentUid || linkedUser.uid || linkedUser.id || null,
+          userId: flat.userId || linkedUser.uid || linkedUser.id || null,
+          displayName: flat.displayName || linkedUser.displayName || "",
+          name: flat.name || flat.firstName || linkedUser.firstName || "",
+          surname: flat.surname || flat.lastName || linkedUser.lastName || "",
+          email: flat.email || linkedUser.email || "",
+          phone: flat.phone || linkedUser.phone || "",
           residentName:
-            base.residentName ||
+            flat.residentName ||
             [linkedUser.firstName || "", linkedUser.lastName || ""].filter(Boolean).join(" ") ||
             linkedUser.displayName ||
             "",
@@ -164,19 +162,19 @@ export default function FlatsPage() {
           }
         }
         const usedRaw = c.seatsUsed;
-        const used = typeof usedRaw === "number" ? Math.max(0, Math.floor(usedRaw)) : snap.size;
-        setSeatInfo({ limit, used, remaining: limit == null ? null : limit - used, source });
+        const used = typeof usedRaw === "number" ? Math.max(Math.floor(usedRaw), snap.size) : snap.size;
+        setSeatInfo({ limit, used, remaining: limit == null ? null : Math.max(0, limit - used), source });
       } catch {
         setSeatInfo({ limit: null, used: snap.size, remaining: null, source: null });
       }
       mergeAndSet();
     });
 
-
-    const unsubStreets = onSnapshot(query(collection(db, "communities", communityId, "streets")), (snap) => {
+    const unsubStreetNames = onSnapshot(query(collection(db, "communities", communityId, "streets")), (snap) => {
       streetNamesById = new Map(snap.docs.map((d) => [d.id, String((d.data() as any).name || d.id)]));
       mergeAndSet();
     });
+
     const unsubUsers = onSnapshot(query(collection(db, "users"), where("communityId", "==", communityId)), (snap) => {
       usersByFlatId = new Map(
         snap.docs
@@ -189,8 +187,8 @@ export default function FlatsPage() {
 
     return () => {
       unsubFlats();
-      unsubStreets();
       unsubUsers();
+      unsubStreetNames();
     };
   }, [communityId]);
 
@@ -241,7 +239,7 @@ export default function FlatsPage() {
       });
       const data = await response.json().catch(() => ({} as any));
       if (!response.ok) throw new Error(data?.error || "Błąd zapisu lokalu.");
-      setSeatInfo({ limit: data.seatLimit ?? seatInfo.limit, used: data.seatUsed ?? seatInfo.used, remaining: data.seatRemaining ?? seatInfo.remaining, source: seatInfo.source });
+      setSeatInfo({ limit: data.seatLimit ?? seatInfo.limit, used: data.seatUsed ?? seatInfo.used, remaining: data.seatRemaining == null ? seatInfo.remaining : Math.max(0, data.seatRemaining), source: seatInfo.source });
       resetForm();
       setMsg(data?.message || "Zapisano lokal.");
     } catch (e: any) {
@@ -270,7 +268,7 @@ export default function FlatsPage() {
       });
       const data = await response.json().catch(() => ({} as any));
       if (!response.ok) throw new Error(data?.error || "Błąd usuwania lokalu.");
-      setSeatInfo((prev) => ({ ...prev, used: data.seatUsed ?? prev.used, remaining: prev.limit == null ? null : (prev.limit - (data.seatUsed ?? prev.used)) }));
+      setSeatInfo((prev) => ({ ...prev, used: data.seatUsed ?? prev.used, remaining: prev.limit == null ? null : Math.max(0, prev.limit - (data.seatUsed ?? prev.used)) }));
       if (form.id === flat.id) resetForm();
       setMsg(`Usunięto lokal: ${getFlatLabel(flat)}`);
     } finally {
@@ -291,7 +289,7 @@ export default function FlatsPage() {
               <div><b>Z przypisanym mieszkańcem:</b> {stats.withResidents}</div>
               <div><b>Z adresem email:</b> {stats.withEmail}</div>
               <div><b>Seats:</b> {seatInfo.limit == null ? `${seatInfo.used} / brak limitu` : `${seatInfo.used} / ${seatInfo.limit}`}</div>
-              <div><b>Pozostało:</b> {seatInfo.remaining == null ? '—' : seatInfo.remaining}</div>
+              <div><b>Pozostało:</b> {seatInfo.remaining == null ? '—' : Math.max(0, seatInfo.remaining)}</div>
             </div>
           </div>
 

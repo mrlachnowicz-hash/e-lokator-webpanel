@@ -7,6 +7,7 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
+import { normalizeStreetId } from "../../lib/streetUtils";
 
 type Row = {
   street?: string;
@@ -45,20 +46,8 @@ function pick(raw: any, keys: string[]) {
   return "";
 }
 
-function normalizeStreetId(name: string) {
-  return String(name || "")
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/[^a-z0-9_-]/g, "");
-}
-
 function normalizeRow(r: any): Row {
-  const apartmentNo = String(
-    pick(r, ["apartmentNo", "flatNumber", "flatnumber", "nr", "lokal", "flat", "mieszkanie", "nr lokalu"]),
-  ).trim();
+  const apartmentNo = String(pick(r, ["apartmentNo", "flatNumber", "flatnumber", "nr", "lokal", "flat", "mieszkanie", "nr lokalu"])).trim();
   const firstName = String(pick(r, ["firstName", "name", "imie", "imię"])).trim();
   const lastName = String(pick(r, ["lastName", "surname", "nazwisko"])).trim();
   const displayName = String(pick(r, ["displayName", "residentName", "mieszkaniec"])).trim();
@@ -74,6 +63,23 @@ function normalizeRow(r: any): Row {
     phone: String(pick(r, ["phone", "telefon", "tel"])).trim(),
     areaM2: areaRaw !== "" ? Number(areaRaw) : undefined,
   };
+}
+
+async function readSheetFile(file: File) {
+  const lower = file.name.toLowerCase();
+  if (lower.endsWith(".csv")) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const utf8 = new TextDecoder("utf-8").decode(bytes);
+    const fallback1250 = new TextDecoder("windows-1250").decode(bytes);
+    const csvText = utf8.includes("�") && !fallback1250.includes("�") ? fallback1250 : utf8;
+    const wb = XLSX.read(csvText, { type: "string" });
+    const ws = wb.Sheets[wb.SheetNames[0]!];
+    return XLSX.utils.sheet_to_json(ws, { defval: "" }) as any[];
+  }
+  const data = await file.arrayBuffer();
+  const wb = XLSX.read(data, { type: "array" });
+  const ws = wb.Sheets[wb.SheetNames[0]!];
+  return XLSX.utils.sheet_to_json(ws, { defval: "" }) as any[];
 }
 
 export default function ImportPage() {
@@ -99,6 +105,7 @@ export default function ImportPage() {
       const byId = new Map<string, Street>();
       streetsSnap.docs.forEach((d) => {
         const data: any = d.data() || {};
+        if (data.deletedAtMs) return;
         byId.set(d.id, { id: d.id, name: String(data.name || d.id) });
       });
       flatsSnap.docs.forEach((d) => {
@@ -134,9 +141,7 @@ export default function ImportPage() {
           <select className="select" value={streetId} onChange={(e) => setStreetId(e.target.value)}>
             <option value="">Wybierz ulicę</option>
             {streets.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
+              <option key={s.id} value={s.id}>{s.name}</option>
             ))}
           </select>
           <input className="input" placeholder="Nr budynku" value={buildingNo} onChange={(e) => setBuildingNo(e.target.value)} />
@@ -150,20 +155,13 @@ export default function ImportPage() {
               setErr(null);
               setDetails([]);
               setFileName(file.name);
-              const data = await file.arrayBuffer();
-              const wb = XLSX.read(data);
-              const ws = wb.Sheets[wb.SheetNames[0]!];
-              const json = XLSX.utils.sheet_to_json(ws, { defval: "" });
+              const json = await readSheetFile(file);
               setRows((json as any[]).map(normalizeRow).filter((r) => !!r.apartmentNo));
             }}
           />
         </div>
 
-        {fileName ? (
-          <div style={{ opacity: 0.8, fontSize: 14 }}>
-            Plik: <strong>{fileName}</strong>. CSV ma własną ulicę: <strong>{csvHasStreet ? "tak" : "nie"}</strong>, własny numer budynku: <strong>{csvHasBuilding ? "tak" : "nie"}</strong>.
-          </div>
-        ) : null}
+        {fileName ? <div style={{ opacity: 0.8, fontSize: 14 }}>Plik: <strong>{fileName}</strong>. CSV ma własną ulicę: <strong>{csvHasStreet ? "tak" : "nie"}</strong>, własny numer budynku: <strong>{csvHasBuilding ? "tak" : "nie"}</strong>.</div> : null}
 
         {preview.length > 0 && (
           <div className="card">
@@ -173,11 +171,7 @@ export default function ImportPage() {
                 const lineStreet = r.street || selectedStreet || "[brak ulicy]";
                 const lineBuilding = r.buildingNo || buildingNo || "[brak budynku]";
                 const resident = [r.firstName, r.lastName].filter(Boolean).join(" ") || r.displayName || "brak danych";
-                return (
-                  <div key={idx}>
-                    {lineStreet} {lineBuilding}/{r.apartmentNo} — {resident} — {r.email || "brak email"}
-                  </div>
-                );
+                return <div key={idx}>{lineStreet} {lineBuilding}/{r.apartmentNo} — {resident} — {r.email || "brak email"}</div>;
               })}
             </div>
           </div>
@@ -190,57 +184,28 @@ export default function ImportPage() {
               className="btn"
               disabled={busy || !canRun}
               onClick={async () => {
-                setMsg(null);
-                setErr(null);
-                setDetails([]);
-                setBusy(true);
+                setMsg(null); setErr(null); setDetails([]); setBusy(true);
                 try {
                   const idToken = await user!.getIdToken();
                   const response = await fetch("/api/import-flats", {
                     method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                      Authorization: `Bearer ${idToken}`,
-                    },
-                    body: JSON.stringify({
-                      communityId,
-                      fallbackStreetId: streetId || null,
-                      fallbackStreetName: selectedStreet || null,
-                      fallbackBuildingNo: buildingNo.trim() || null,
-                      rows,
-                    }),
+                    headers: { "Content-Type": "application/json", Authorization: `Bearer ${idToken}` },
+                    body: JSON.stringify({ communityId, fallbackStreetId: streetId || null, fallbackStreetName: selectedStreet || null, fallbackBuildingNo: buildingNo.trim() || null, rows }),
                   });
                   const data: ImportResult = await response.json().catch(() => ({}));
                   if (!response.ok) throw new Error((data as any)?.error || "Błąd importu");
-                  setMsg(
-                    `Import zakończony. Utworzono: ${data.created ?? 0}, zaktualizowano: ${data.updated ?? 0}, pominięto: ${data.skipped ?? 0}, nieprawidłowe: ${data.invalid ?? 0}, duplikaty w pliku: ${data.duplicateInFile ?? 0}.`,
-                  );
+                  setMsg(`Import zakończony. Utworzono: ${data.created ?? 0}, zaktualizowano: ${data.updated ?? 0}, pominięto: ${data.skipped ?? 0}, nieprawidłowe: ${data.invalid ?? 0}, duplikaty w pliku: ${data.duplicateInFile ?? 0}.`);
                   setDetails(data.details || []);
                 } catch (e: any) {
                   setErr(e?.message || "Błąd importu");
-                } finally {
-                  setBusy(false);
-                }
+                } finally { setBusy(false); }
               }}
-            >
-              {busy ? "Importowanie..." : "Uruchom import"}
-            </button>
+            >{busy ? "Importowanie..." : "Uruchom import"}</button>
           </div>
-          {!canRun && rows.length > 0 ? (
-            <div style={{ color: "#d6b46b" }}>
-              Aby uruchomić import, plik musi zawierać street/buildingNo albo musisz wybrać ulicę i wpisać numer budynku ręcznie.
-            </div>
-          ) : null}
+          {!canRun && rows.length > 0 ? <div style={{ color: "#d6b46b" }}>Aby uruchomić import, plik musi zawierać street/buildingNo albo musisz wybrać ulicę i wpisać numer budynku ręcznie.</div> : null}
           {msg ? <div style={{ color: "green" }}>{msg}</div> : null}
           {err ? <div style={{ color: "crimson" }}>{err}</div> : null}
-          {details.length ? (
-            <div style={{ marginTop: 12, display: "grid", gap: 6, fontSize: 14, opacity: 0.9 }}>
-              {details.slice(0, 12).map((line, index) => (
-                <div key={`${line}-${index}`}>{line}</div>
-              ))}
-              {details.length > 12 ? <div>… i jeszcze {details.length - 12} pozycji.</div> : null}
-            </div>
-          ) : null}
+          {details.length ? <div style={{ marginTop: 12, display: "grid", gap: 6, fontSize: 14, opacity: 0.9 }}>{details.slice(0, 12).map((line, index) => <div key={`${line}-${index}`}>{line}</div>)}</div> : null}
         </div>
       </div>
     </RequireAuth>
