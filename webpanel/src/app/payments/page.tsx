@@ -70,7 +70,7 @@ export default function PaymentsPage() {
         <div className="card" style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
           <div>Łącznie: <strong>{stats.total}</strong></div>
           <div>Dopasowane: <strong>{stats.matched}</strong></div>
-          <div>Review: <strong>{stats.review}</strong></div>
+          <div>Do sprawdzenia: <strong>{stats.review}</strong></div>
         </div>
         <div className="card" style={{ display: "grid", gap: 12 }}>
           <p>System dopasowuje przelewy najpierw po kodzie, potem heurystycznie. AI uruchamiasz tylko dla nierozpoznanych wpłat.</p>

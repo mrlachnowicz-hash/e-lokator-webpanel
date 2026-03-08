@@ -23,6 +23,33 @@ const actionRowStyle: CSSProperties = { display: "flex", flexWrap: "wrap", gap: 
 const cardHeaderStyle: CSSProperties = { display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center", minWidth: 0 };
 const fieldStyle: CSSProperties = { width: "100%", minWidth: 0, boxSizing: "border-box" };
 const fromCents = (cents: unknown) => (Number(cents || 0) / 100).toFixed(2);
+const statusLabel = (value: unknown) => {
+  switch (String(value || "").toUpperCase()) {
+    case "NOWA": return "Nowa";
+    case "SUGGESTED": return "Sugestia AI";
+    case "READY_TO_STAGE": return "Gotowa do rozliczenia";
+    case "STAGED": return "W szkicu";
+    case "ZATWIERDZONA": return "Rozliczona";
+    case "DELETED": return "Usunięta";
+    default: return String(value || "—");
+  }
+};
+const sourceLabel = (value: unknown) => {
+  switch (String(value || "").toLowerCase()) {
+    case "invoices": return "Faktury";
+    case "ksefinvoices": return "KSeF";
+    default: return String(value || "—");
+  }
+};
+const allocationLabel = (value: unknown) => {
+  switch (String(value || "").toUpperCase()) {
+    case "COMMON": return "Części wspólne";
+    case "BUILDING": return "Budynek";
+    case "FLAT": return "Konkretny lokal";
+    case "UNKNOWN": return "Nieustalony";
+    default: return String(value || "—");
+  }
+};
 
 function flatLabel(flat: Flat) {
   return String(flat.flatLabel || `${flat.street || flat.streetName || ""} ${flat.buildingNo || ""}/${flat.apartmentNo || ""}`.trim());
@@ -86,7 +113,7 @@ export default function InvoicesPage() {
       if (!res.ok) throw new Error(data.error || "OCR error");
       setOcrResult(data);
       setForm((prev) => ({ ...prev, vendorName: data.supplierName || prev.vendorName, title: data.invoiceNumber || prev.title, totalGross: data.grossAmount != null ? String(data.grossAmount) : prev.totalGross, category: data.category || prev.category }));
-      setMsg(data.needsReview ? "AI odczytało dokument, ale oznaczyło go do review." : "AI odczytało dokument i przygotowało szkic.");
+      setMsg(data.needsReview ? "System odczytał dokument, ale oznaczyło go do sprawdzenia." : "System odczytał dokument i przygotowało szkic.");
     } catch (error: any) { setMsg(error?.message || "Nie udało się odczytać dokumentu."); }
     finally { setOcrBusy(false); }
   }
@@ -98,7 +125,7 @@ export default function InvoicesPage() {
       vendorName: ocrResult.supplierName || form.vendorName, title: ocrResult.invoiceNumber || form.title || "Faktura z OCR", period,
       category: ocrResult.category || form.category || "INNE", totalGrossCents: Math.round(Number(ocrResult.grossAmount || form.totalGross || 0) * 100),
       currency: ocrResult.currency || "PLN", source: "OCR_AI", status: ocrResult.needsReview ? "SUGGESTED" : "READY_TO_STAGE",
-      parsed: { period, category: ocrResult.category || form.category || "INNE", scope: ocrResult.allocationType === "FLAT" ? "FLAT" : "COMMON", buildingId: ocrResult.suggestedBuildingId || "", flatId: ocrResult.suggestedFlatId || "", amountCents: Math.round(Number(ocrResult.grossAmount || form.totalGross || 0) * 100), needsReview: Boolean(ocrResult.needsReview), reason: ocrResult.reason || "", ocrText: ocrResult.extractedText || "" },
+      parsed: { period, category: ocrResult.category || form.category || "INNE", scope: ocrResult.allocationType === "FLAT" ? "FLAT" : "COMMON", buildingId: ocrResult.suggestedBuildingId || "", flatId: ocrResult.suggestedFlatId || "", amountCents: Math.round(Number(ocrResult.grossAmount || form.totalGross || 0) * 100), totalGrossCents: Math.round(Number(ocrResult.grossAmount || form.totalGross || 0) * 100), needsReview: Boolean(ocrResult.needsReview), reason: ocrResult.reason || "", ocrText: ocrResult.extractedText || "" },
       ai: { suggestion: ocrResult, updatedAtMs: Date.now() }, createdAtMs: Date.now(), updatedAtMs: Date.now(),
     });
     setMsg("Dodano szkic faktury z OCR do panelu."); setOcrResult(null);
@@ -163,17 +190,17 @@ export default function InvoicesPage() {
       <div style={{ padding: 24, display: "grid", gap: 16, minWidth: 0 }}>
         <h2>Faktury</h2>
         <div className="card" style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
-          <div>Łącznie: <strong>{stats.total}</strong></div><div>W szkicu / staged: <strong>{stats.staged}</strong></div><div>Do review: <strong>{stats.review}</strong></div><div>Archiwum: <strong>{stats.archived}</strong></div>
+          <div>Łącznie: <strong>{stats.total}</strong></div><div>W szkicu / gotowe: <strong>{stats.staged}</strong></div><div>Do sprawdzenia: <strong>{stats.review}</strong></div><div>Archiwum: <strong>{stats.archived}</strong></div>
         </div>
         <div className="card" style={{ display: "grid", gap: 12, minWidth: 0 }}>
-          <h3>AI OCR faktury PDF / JPG / PNG</h3>
+          <h3>Automatyczny odczyt faktury PDF / JPG / PNG</h3>
           <p style={{ opacity: 0.8, marginTop: -6 }}>Możesz wrzucić PDF albo obraz faktury. Wynik trafia jako szkic i nie księguje się ślepo bez kontroli.</p>
           <div style={actionRowStyle}>
             <input type="file" accept="application/pdf,image/jpeg,image/png,image/webp" onChange={async (e) => { const file = e.target.files?.[0]; if (file) await handleDocument(file); }} />
             <button className="btn" disabled={bulkBusy || items.length === 0} onClick={bulkAutoStage}>{bulkBusy ? "Rozliczanie..." : "Rozlicz do szkicu automatycznie"}</button>
           </div>
-          {ocrBusy ? <div>Analiza AI...</div> : null}
-          {ocrResult ? <div style={{ display: "grid", gap: 10 }}><div><strong>Dostawca:</strong> {ocrResult.supplierName || "—"}</div><div><strong>Numer faktury:</strong> {ocrResult.invoiceNumber || "—"}</div><div><strong>Kategoria:</strong> {ocrResult.category || "—"}</div><div><strong>Typ alokacji:</strong> {ocrResult.allocationType || "—"}</div><div><strong>Confidence:</strong> {Number(ocrResult.confidence || 0).toFixed(2)}</div><div><strong>Powód:</strong> {ocrResult.reason || "—"}</div><div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}><button className="btn" onClick={saveOcrDraft}>Zapisz szkic z OCR</button><button className="btnGhost" onClick={() => setOcrResult(null)}>Wyczyść</button></div><details><summary>Podgląd tekstu z OCR</summary><pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", margin: 0 }}>{ocrResult.extractedText || "Brak tekstu"}</pre></details></div> : null}
+          {ocrBusy ? <div>Analiza dokumentu...</div> : null}
+          {ocrResult ? <div style={{ display: "grid", gap: 10 }}><div><strong>Dostawca:</strong> {ocrResult.supplierName || "—"}</div><div><strong>Numer faktury:</strong> {ocrResult.invoiceNumber || "—"}</div><div><strong>Kategoria:</strong> {ocrResult.category || "—"}</div><div><strong>Typ alokacji:</strong> {allocationLabel(ocrResult.allocationType || "—")}</div><div><strong>Pewność odczytu:</strong> {Number(ocrResult.confidence || 0).toFixed(2)}</div><div><strong>Powód:</strong> {ocrResult.reason || "—"}</div><div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}><button className="btn" onClick={saveOcrDraft}>Zapisz szkic z OCR</button><button className="btnGhost" onClick={() => setOcrResult(null)}>Wyczyść</button></div><details><summary>Podgląd tekstu z OCR</summary><pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", margin: 0 }}>{ocrResult.extractedText || "Brak tekstu"}</pre></details></div> : null}
         </div>
         <div className="card" style={{ display: "grid", gap: 12, minWidth: 0 }}>
           <h3>Dodaj ręcznie</h3>
@@ -238,7 +265,7 @@ function InvoiceCard({ inv, communityId, flats, streets }: { inv: Invoice; commu
 
   return (
     <div className="card" style={{ display: "grid", gap: 10, minWidth: 0 }}>
-      <div style={cardHeaderStyle}><strong>{inv.vendorName || "Faktura"}</strong><span>{inv.title || inv.id}</span><span>status: {inv.status}</span><span>{fromCents(amount)} PLN</span>{ai ? <span>AI: {Number(ai.confidence || 0).toFixed(2)}</span> : null}<span>Źródło: {docCollectionName(inv)}</span></div>
+      <div style={cardHeaderStyle}><strong>{inv.vendorName || "Faktura"}</strong><span>{inv.title || inv.id}</span><span>Status: {statusLabel(inv.status)}</span><span>{fromCents(amount)} PLN</span>{ai ? <span>AI: {Number(ai.confidence || 0).toFixed(2)}</span> : null}<span>Źródło: {sourceLabel(docCollectionName(inv))}</span></div>
       <div style={formGridStyle}>
         <input className="input" style={fieldStyle} value={period} onChange={(e) => setPeriod(e.target.value)} placeholder="YYYY-MM" />
         <select className="select" style={fieldStyle} value={category} onChange={(e) => setCategory(e.target.value)}><option value="PRAD">PRĄD</option><option value="WODA">WODA</option><option value="GAZ">GAZ</option><option value="SPRZATANIE">SPRZĄTANIE</option><option value="REMONT">REMONT</option><option value="INNE">INNE</option></select>
@@ -248,14 +275,14 @@ function InvoiceCard({ inv, communityId, flats, streets }: { inv: Invoice; commu
         {showFlatId ? <select className="select" style={fieldStyle} value={flatId} onChange={(e) => setFlatId(e.target.value)}><option value="">Wybierz lokal</option>{flatOptions.map((f) => <option key={f.id} value={f.id}>{flatLabel({ ...f, street: displayStreetName(f.street || f.streetName, f.streetId, streetMap) })}</option>)}</select> : null}
       </div>
       <div style={actionRowStyle}>
-        <button className="btnGhost" onClick={async () => { await callable("ksefParseInvoice")({ communityId, invoiceId: inv.id }); }}>Parse</button>
-        <button className="btnGhost" onClick={async () => { setBusy(true); try { const res = await fetch("/api/ai/invoice-analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ communityId, invoiceId: inv.id }) }); const data = await res.json(); if (!res.ok) throw new Error(data.error || "AI error"); } finally { setBusy(false); } }}>{busy ? "AI..." : "AI sugestia"}</button>
+        <button className="btnGhost" onClick={async () => { if (docCollectionName(inv) !== "ksefInvoices") { setBusy(true); try { const res = await fetch("/api/ai/invoice-analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ communityId, invoiceId: inv.id }) }); const data = await res.json(); if (!res.ok) throw new Error(data.error || "Błąd odczytu danych"); } finally { setBusy(false); } return; } await callable("ksefParseInvoice")({ communityId, invoiceId: inv.id }); }}>Odczytaj dane</button>
+        <button className="btnGhost" onClick={async () => { setBusy(true); try { const res = await fetch("/api/ai/invoice-analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ communityId, invoiceId: inv.id }) }); const data = await res.json(); if (!res.ok) throw new Error(data.error || "Błąd analizy"); } finally { setBusy(false); } }}>{busy ? "AI..." : "Sugestia automatyczna"}</button>
         <button className="btn" onClick={async () => { await callable("approveInvoice")({ communityId, invoiceId: inv.id, assignment: { period, category, scope, streetId: streetId || null, buildingId: buildingNo || null, flatId: showFlatId ? flatId || null : null } }); }}>Nalicz do szkicu</button>
         <button className="btnGhost" onClick={async () => { await archiveOrDelete({ archivedAtMs: inv.archivedAtMs ? null : Date.now(), updatedAtMs: Date.now() }); }}>{inv.archivedAtMs ? "Przywróć" : "Archiwizuj"}</button>
         <button className="btnGhost" onClick={async () => { if (window.confirm(`Usunąć fakturę ${inv.title || inv.id}?`)) await archiveOrDelete({ deletedAtMs: Date.now(), archivedAtMs: Date.now(), status: "DELETED", updatedAtMs: Date.now() }); }}>Kosz</button>
       </div>
-      {ai ? <div style={{ display: "grid", gap: 6 }}><div><strong>AI powód:</strong> {ai.reason || "—"}</div><div><strong>AI typ:</strong> {ai.allocationType || "—"}</div><div><strong>Review:</strong> {ai.needsReview ? "tak" : "nie"}</div></div> : null}
-      {inv.parsed?.ocrText ? <details><summary>Tekst OCR / parse</summary><pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", margin: 0 }}>{inv.parsed.ocrText}</pre></details> : null}
+      {ai ? <div style={{ display: "grid", gap: 6 }}><div><strong>AI powód:</strong> {ai.reason || "—"}</div><div><strong>AI typ:</strong> {allocationLabel(ai.allocationType || "—")}</div><div><strong>Do sprawdzenia:</strong> {ai.needsReview ? "tak" : "nie"}</div></div> : null}
+      {inv.parsed?.ocrText ? <details><summary>Tekst odczytany z dokumentu</summary><pre style={{ whiteSpace: "pre-wrap", overflowX: "auto", margin: 0 }}>{inv.parsed.ocrText}</pre></details> : null}
     </div>
   );
 }

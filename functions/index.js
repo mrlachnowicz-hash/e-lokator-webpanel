@@ -1150,7 +1150,7 @@ exports.approveInvoice = onCall(async (request) => {
 
   const inv = snap.data();
   const parsed = inv.parsed || {};
-  const totalCents = Number(parsed.totalGrossCents || 0);
+  const totalCents = Number(parsed.totalGrossCents || parsed.amountCents || inv.totalGrossCents || inv.amountCents || 0);
   const period = safeString(assignment.period || parsed.period || inv.ai?.suggestion?.period);
   const category = safeString(assignment.category || inv.ai?.suggestion?.category || "INNE");
   const scope = safeString(assignment.scope || inv.ai?.suggestion?.scope || "COMMON");

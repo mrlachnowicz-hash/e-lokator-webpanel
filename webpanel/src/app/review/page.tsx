@@ -33,11 +33,11 @@ export default function ReviewPage() {
     <RequireAuth roles={["MASTER", "ACCOUNTANT"]}>
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 12 }}>
-        <h2>Review queue</h2>
+        <h2>Kolejka sprawdzenia</h2>
         <p style={{ opacity: 0.8, marginTop: -8 }}>Tu trafiają wyjątki z reguł, heurystyk i AI. Rekord można wyjaśnić przez AI, zaakceptować, wyczyścić albo usunąć.</p>
         {items.map((item) => (
           <div key={item.id} className="card" style={{ display: "grid", gap: 10 }}>
-            <div><strong>{item.type || "ITEM"}</strong> — status: {item.status || "OPEN"}</div>
+            <div><strong>{item.type || "POZYCJA"}</strong> — status: {String(item.status || "OPEN").replace("OPEN", "OTWARTE").replace("CLOSED", "ZAMKNIĘTE").replace("ACCEPTED", "ZAAKCEPTOWANE")}</div>
             <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{JSON.stringify(item, null, 2)}</pre>
             {explains[item.id] || item.aiExplanation ? (
               <div style={{ background: "rgba(255,255,255,.05)", padding: 12, borderRadius: 12 }}>

@@ -304,14 +304,14 @@ export default function SettlementDetailsPage({ params }: { params: { settlement
             </div>
 
             <div className="card" style={{ maxWidth: 960, display: "grid", gap: 12 }}>
-              <h3 style={{ margin: 0 }}>Review queue</h3>
+              <h3 style={{ margin: 0 }}>Kolejka sprawdzenia</h3>
               {relatedReview.length === 0 ? (
                 <div style={{ opacity: 0.72 }}>Brak nieznanych przelewów dla tego rozliczenia.</div>
               ) : relatedReview.map((item) => (
                 <div key={item.id} style={{ border: "1px solid rgba(255,255,255,.08)", borderRadius: 16, padding: 14, display: "grid", gap: 6 }}>
                   <div><strong>Nieznany przelew</strong></div>
                   <div style={{ opacity: 0.78 }}>{item.title || item.description || item.type || item.id}</div>
-                  <div style={{ opacity: 0.78 }}>Status: {item.status || "OPEN"}</div>
+                  <div style={{ opacity: 0.78 }}>Status: {item.status || "OTWARTE"}</div>
                   <div style={{ opacity: 0.78 }}>Kwota: {formatMoney(item.amountCents != null ? Number(item.amountCents) / 100 : item.amount)}</div>
                   <div>
                     <Link href="/review" className="btnGhost" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}>

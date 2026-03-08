@@ -65,7 +65,7 @@ export default function DashboardPage() {
     { href: "/import", icon: <IconSpreadsheet />, title: "Import lokali", desc: "CSV/XLSX → flats + payers" },
     { href: "/buildings", icon: <IconBuilding />, title: "Budynki", desc: "Budynki utworzone przez aplikację" },
     { href: "/flats", icon: <IconHome />, title: "Lokale", desc: "Lokal jako jednostka rozliczeniowa" },
-    { href: "/invoices", icon: <IconReceipt />, title: "Faktury", desc: "Import, parse, review, approve" },
+    { href: "/invoices", icon: <IconReceipt />, title: "Faktury", desc: "Import, odczyt, sprawdzenie, rozliczenie" },
     { href: "/charges", icon: <IconCoins />, title: "Rozliczenia", desc: "Charges, settlements, balances" },
     { href: "/payments", icon: <IconShield />, title: "Przelewy", desc: "Import CSV/XLSX i dopasowanie po EL-xxx" },
     { href: "/meters", icon: <IconGauge />, title: "Liczniki", desc: "Konfiguracja, odczyty, zużycie, charges" },
@@ -93,8 +93,8 @@ export default function DashboardPage() {
             <div className="card"><h3>Lokale</h3><p>{stats.flats}</p></div>
             <div className="card"><h3>Faktury</h3><p>{stats.invoices}</p></div>
             <div className="card"><h3>Rozliczenia</h3><p>{stats.settlements}</p></div>
-            <div className="card"><h3>Review queue</h3><p>{stats.review}</p></div>
-            <div className="card"><h3>Przelewy do review</h3><p>{stats.unmatchedPayments}</p></div>
+            <div className="card"><h3>Do sprawdzenia</h3><p>{stats.review}</p></div>
+            <div className="card"><h3>Przelewy do sprawdzenia</h3><p>{stats.unmatchedPayments}</p></div>
             <div className="card"><h3>Liczniki</h3><p>{stats.meters}</p></div>
           </div>
         </>

@@ -270,7 +270,7 @@ export default function MetersPage() {
               <div key={`${item.label}-${index}`} style={{ borderTop: "1px solid rgba(255,255,255,.08)", paddingTop: 10 }}>
                 <strong>{item.label}</strong>
                 <div>AI: {item.result.reason || "brak"}</div>
-                <div>Confidence: {Number(item.result.confidence || 0).toFixed(2)}</div>
+                <div>Pewność: {Number(item.result.confidence || 0).toFixed(2)}</div>
               </div>
             ))}
           </div>

@@ -15,6 +15,7 @@ export async function POST(req: Request) {
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     const mimeType = String(file.type || "application/octet-stream");
+    const filename = String((file as any).name || "");
     const adminDb = getAdminDb();
     const flatsSnap = await adminDb.collection(`communities/${communityId}/flats`).limit(300).get();
     const knownBuildings = Array.from(new Set(flatsSnap.docs.map((d) => String(d.get("buildingId") || d.get("buildingNo") || "")).filter(Boolean)));
@@ -22,7 +23,8 @@ export async function POST(req: Request) {
 
     if (mimeType === "application/pdf") {
       const extractedText = await extractPdfText(buffer);
-      const ai = await analyzeInvoiceText({ extractedText, knownBuildings, knownFlats });
+      const seededText = [extractedText, filename].filter(Boolean).join("\n");
+      const ai = await analyzeInvoiceText({ extractedText: seededText, knownBuildings, knownFlats });
       return NextResponse.json({ ok: true, ...ai });
     }
 

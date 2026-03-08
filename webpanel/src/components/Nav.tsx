@@ -18,7 +18,7 @@ export function Nav() {
         <div className="brandBadge" />
         <Link href="/dashboard">e-Lokator Webpanel</Link>
         <span className="brandMeta">({role || "—"} / {comm ? comm.slice(0, 6) : "—"})</span>
-        {!panelEnabled ? <span className="brandMeta">panel OFF</span> : null}
+        {!panelEnabled ? <span className="brandMeta">panel wyłączony</span> : null}
       </div>
 
       <div className="navLinks">
@@ -33,7 +33,7 @@ export function Nav() {
             <Link href="/charges">Rozliczenia</Link>
             <Link href="/meters">Liczniki</Link>
             <Link href="/payments">Przelewy</Link>
-            <Link href="/review">Review</Link>
+            <Link href="/review">Przegląd</Link>
           </>
         ) : null}
         <button className="btnGhost" onClick={() => signOut(auth)}>
