@@ -62,19 +62,29 @@ export default function ChargesPage() {
   const archivedGroups = useMemo(() => archived.reduce((acc: Record<string, Settlement[]>, item) => { const key = String(item.archiveMonth || item.period || "bez-daty"); (acc[key] ||= []).push(item); return acc; }, {}), [archived]);
 
   const saveDefaults = async () => {
+    const cleanAccount = defaults.defaultAccountNumber.trim();
+    const cleanName = defaults.recipientName.trim();
+    const cleanAddress = defaults.recipientAddress.trim();
     const payload = {
-      defaultAccountNumber: defaults.defaultAccountNumber.trim(),
-      accountNumber: defaults.defaultAccountNumber.trim(),
-      bankAccount: defaults.defaultAccountNumber.trim(),
-      recipientName: defaults.recipientName.trim(),
-      receiverName: defaults.recipientName.trim(),
-      transferName: defaults.recipientName.trim(),
-      recipientAddress: defaults.recipientAddress.trim(),
-      receiverAddress: defaults.recipientAddress.trim(),
-      transferAddress: defaults.recipientAddress.trim(),
+      defaultAccountNumber: cleanAccount,
+      accountNumber: cleanAccount,
+      bankAccount: cleanAccount,
+      recipientName: cleanName,
+      receiverName: cleanName,
+      transferName: cleanName,
+      name: cleanName,
+      recipientAddress: cleanAddress,
+      receiverAddress: cleanAddress,
+      transferAddress: cleanAddress,
+      paymentDefaults: {
+        accountNumber: cleanAccount,
+        recipientName: cleanName,
+        recipientAddress: cleanAddress,
+      },
       updatedAtMs: Date.now(),
     };
     await setDoc(doc(db, "communities", communityId), payload, { merge: true });
+    setDefaults({ defaultAccountNumber: cleanAccount, recipientName: cleanName, recipientAddress: cleanAddress });
     setMsg("Zapisano domyślne dane do przelewu.");
   };
 
@@ -134,10 +144,18 @@ export default function ChargesPage() {
 }
 
 function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = false, buildTransferTitle }: { s: Settlement; communityId: string; flat: Flat | null; setMsg: (v: string) => void; defaults: any; archived?: boolean; buildTransferTitle: (flat: any, settlement: any) => string; }) {
-  const [accountNumber, setAccountNumber] = useState(String(s.accountNumber || s.bankAccount || flat?.accountNumber || defaults.defaultAccountNumber || ""));
-  const [transferName, setTransferName] = useState(String(s.transferName || s.receiverName || flat?.recipientName || defaults.recipientName || ""));
-  const [transferAddress, setTransferAddress] = useState(String(s.transferAddress || s.receiverAddress || flat?.recipientAddress || defaults.recipientAddress || ""));
-  const [transferTitle, setTransferTitle] = useState(String(s.transferTitle || s.paymentTitle || buildTransferTitle(flat, s)));
+  const computedAccount = String(s.accountNumber || s.bankAccount || flat?.accountNumber || flat?.bankAccount || defaults.defaultAccountNumber || "");
+  const computedName = String(s.transferName || s.receiverName || flat?.recipientName || flat?.receiverName || defaults.recipientName || "");
+  const computedAddress = String(s.transferAddress || s.receiverAddress || flat?.recipientAddress || flat?.receiverAddress || defaults.recipientAddress || "");
+  const computedTitle = String(s.transferTitle || s.paymentTitle || buildTransferTitle(flat, s));
+  const [accountNumber, setAccountNumber] = useState(computedAccount);
+  const [transferName, setTransferName] = useState(computedName);
+  const [transferAddress, setTransferAddress] = useState(computedAddress);
+  const [transferTitle, setTransferTitle] = useState(computedTitle);
+  useEffect(() => { setAccountNumber(computedAccount); }, [computedAccount, s.id]);
+  useEffect(() => { setTransferName(computedName); }, [computedName, s.id]);
+  useEffect(() => { setTransferAddress(computedAddress); }, [computedAddress, s.id]);
+  useEffect(() => { setTransferTitle(computedTitle); }, [computedTitle, s.id]);
   const savePaymentData = async () => {
     const cleanTitle = transferTitle.trim() || buildTransferTitle(flat, s);
     const payload = {
@@ -166,6 +184,7 @@ function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = fal
       }, { merge: true });
     }
     setTransferTitle(cleanTitle);
+    window.alert(`Zapisano dane przelewu dla ${s.flatLabel || s.id}.`);
     setMsg(`Zapisano dane przelewu dla ${s.flatLabel || s.id}.`);
   };
   return (

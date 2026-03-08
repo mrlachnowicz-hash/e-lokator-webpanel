@@ -194,11 +194,21 @@ async function getFlat(communityId, flatId) {
   return snap.exists ? { id: snap.id, ...snap.data() } : null;
 }
 
-async function listFlats(communityId, buildingId = null) {
-  let q = db.collection(`communities/${communityId}/flats`);
-  if (buildingId) q = q.where("buildingId", "==", buildingId);
-  const snap = await q.get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+async function listFlats(communityId, buildingId = null, streetId = null) {
+  const snap = await db.collection(`communities/${communityId}/flats`).get();
+  let rows = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  if (streetId) {
+    rows = rows.filter((x) => safeString(x.streetId) === safeString(streetId));
+  }
+  if (buildingId) {
+    rows = rows.filter((x) => {
+      const a = safeString(x.buildingId);
+      const b = safeString(x.buildingNo);
+      const c = safeString(buildingId);
+      return a === c || b === c;
+    });
+  }
+  return rows;
 }
 
 async function getFlatResidents(communityId, flatId) {
@@ -1155,6 +1165,7 @@ exports.approveInvoice = onCall(async (request) => {
   const category = safeString(assignment.category || inv.ai?.suggestion?.category || "INNE");
   const scope = safeString(assignment.scope || inv.ai?.suggestion?.scope || "COMMON");
   const buildingId = assignment.buildingId || null;
+  const streetId = assignment.streetId || null;
   const flatId = assignment.flatId || null;
 
   if (!period) throw new HttpsError("invalid-argument", "Brak okresu.");
@@ -1164,7 +1175,7 @@ exports.approveInvoice = onCall(async (request) => {
     status: "ZATWIERDZONA",
     approvedAtMs: nowMs(),
     approvedByUid: request.auth.uid,
-    assigned: { scope, buildingId, flatId, category, period }
+    assigned: { scope, streetId, buildingId, flatId, category, period }
   }, { merge: true });
 
   if (scope === "FLAT" && flatId) {
@@ -1174,6 +1185,7 @@ exports.approveInvoice = onCall(async (request) => {
       invoiceId,
       flatId,
       buildingId: buildingId || null,
+      streetId: streetId || null,
       category,
       period,
       amountCents: totalCents,
@@ -1185,7 +1197,7 @@ exports.approveInvoice = onCall(async (request) => {
     return { ok: true, chargesCreated: 1, settlement };
   }
 
-  const flats = await listFlats(communityId, buildingId);
+  const flats = await listFlats(communityId, buildingId, streetId);
   if (flats.length === 0) throw new HttpsError("failed-precondition", "Brak lokali do rozbicia.");
 
   const useArea = flats.some(f => Number(f.areaM2 || 0) > 0);
@@ -1208,7 +1220,8 @@ exports.approveInvoice = onCall(async (request) => {
       source: "KSEF",
       invoiceId,
       flatId: f.id,
-      buildingId: f.buildingId || null,
+      buildingId: f.buildingId || f.buildingNo || null,
+      streetId: f.streetId || streetId || null,
       category,
       period,
       amountCents: part,

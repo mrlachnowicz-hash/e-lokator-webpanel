@@ -66,9 +66,9 @@ export default function DashboardPage() {
     { href: "/buildings", icon: <IconBuilding />, title: "Budynki", desc: "Budynki utworzone przez aplikację" },
     { href: "/flats", icon: <IconHome />, title: "Lokale", desc: "Lokal jako jednostka rozliczeniowa" },
     { href: "/invoices", icon: <IconReceipt />, title: "Faktury", desc: "Import, odczyt, sprawdzenie, rozliczenie" },
-    { href: "/charges", icon: <IconCoins />, title: "Rozliczenia", desc: "Charges, settlements, balances" },
-    { href: "/payments", icon: <IconShield />, title: "Przelewy", desc: "Import CSV/XLSX i dopasowanie po EL-xxx" },
-    { href: "/meters", icon: <IconGauge />, title: "Liczniki", desc: "Konfiguracja, odczyty, zużycie, charges" },
+    { href: "/charges", icon: <IconCoins />, title: "Rozliczenia", desc: "Naliczenia, rozliczenia, salda" },
+    { href: "/payments", icon: <IconShield />, title: "Przelewy", desc: "Import CSV/XLSX i dopasowanie po tytule przelewu" },
+    { href: "/meters", icon: <IconGauge />, title: "Liczniki", desc: "Konfiguracja, odczyty, zużycie, naliczenia" },
   ], []);
 
   return (
