@@ -45,6 +45,16 @@ function pick(raw: any, keys: string[]) {
   return "";
 }
 
+function normalizeStreetId(name: string) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9_-]/g, "");
+}
+
 function normalizeRow(r: any): Row {
   const apartmentNo = String(
     pick(r, ["apartmentNo", "flatNumber", "flatnumber", "nr", "lokal", "flat", "mieszkanie", "nr lokalu"]),
@@ -82,8 +92,24 @@ export default function ImportPage() {
   useEffect(() => {
     if (!communityId) return;
     (async () => {
-      const snap = await getDocs(collection(db, "communities", communityId, "streets"));
-      const list = snap.docs.map((d) => ({ id: d.id, name: String((d.data() as any).name || d.id) }));
+      const [streetsSnap, flatsSnap] = await Promise.all([
+        getDocs(collection(db, "communities", communityId, "streets")),
+        getDocs(collection(db, "communities", communityId, "flats")),
+      ]);
+      const byId = new Map<string, Street>();
+      streetsSnap.docs.forEach((d) => {
+        const data: any = d.data() || {};
+        byId.set(d.id, { id: d.id, name: String(data.name || d.id) });
+      });
+      flatsSnap.docs.forEach((d) => {
+        const data: any = d.data() || {};
+        const name = String(data.street || data.streetName || "").trim();
+        const id = String(data.streetId || normalizeStreetId(name) || "").trim();
+        if (!id) return;
+        const existing = byId.get(id);
+        byId.set(id, { id, name: existing?.name || name || id });
+      });
+      const list = Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name, "pl"));
       setStreets(list);
       if (!streetId && list[0]) setStreetId(list[0].id);
     })();

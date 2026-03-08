@@ -18,6 +18,8 @@ import { buildFlatLabel } from "../../lib/flatMapping";
 type Flat = {
   id: string;
   street?: string;
+  streetId?: string;
+  streetName?: string;
   buildingNo?: string;
   apartmentNo?: string;
   flatLabel?: string;
@@ -105,6 +107,7 @@ export default function FlatsPage() {
 
     let flatsCache: Flat[] = [];
     let usersByFlatId = new Map<string, any>();
+    let streetNamesById = new Map<string, string>();
 
     const sortList = (list: Flat[]) =>
       [...list].sort((a: any, b: any) => {
@@ -118,18 +121,23 @@ export default function FlatsPage() {
     const mergeAndSet = () => {
       const merged = flatsCache.map((flat) => {
         const linkedUser = usersByFlatId.get(flat.id);
-        if (!linkedUser) return flat;
-        return {
+        const resolvedStreet = String(flat.street || flat.streetName || streetNamesById.get(String(flat.streetId || "")) || linkedUser?.street || "").trim();
+        const base: Flat = {
           ...flat,
-          residentUid: flat.residentUid || linkedUser.uid || linkedUser.id || null,
-          userId: flat.userId || linkedUser.uid || linkedUser.id || null,
-          displayName: flat.displayName || linkedUser.displayName || "",
-          name: flat.name || flat.firstName || linkedUser.firstName || "",
-          surname: flat.surname || flat.lastName || linkedUser.lastName || "",
-          email: flat.email || linkedUser.email || "",
-          phone: flat.phone || linkedUser.phone || "",
+          street: resolvedStreet || flat.street || flat.streetName || "",
+        };
+        if (!linkedUser) return base;
+        return {
+          ...base,
+          residentUid: base.residentUid || linkedUser.uid || linkedUser.id || null,
+          userId: base.userId || linkedUser.uid || linkedUser.id || null,
+          displayName: base.displayName || linkedUser.displayName || "",
+          name: base.name || base.firstName || linkedUser.firstName || "",
+          surname: base.surname || base.lastName || linkedUser.lastName || "",
+          email: base.email || linkedUser.email || "",
+          phone: base.phone || linkedUser.phone || "",
           residentName:
-            flat.residentName ||
+            base.residentName ||
             [linkedUser.firstName || "", linkedUser.lastName || ""].filter(Boolean).join(" ") ||
             linkedUser.displayName ||
             "",
@@ -164,6 +172,11 @@ export default function FlatsPage() {
       mergeAndSet();
     });
 
+
+    const unsubStreets = onSnapshot(query(collection(db, "communities", communityId, "streets")), (snap) => {
+      streetNamesById = new Map(snap.docs.map((d) => [d.id, String((d.data() as any).name || d.id)]));
+      mergeAndSet();
+    });
     const unsubUsers = onSnapshot(query(collection(db, "users"), where("communityId", "==", communityId)), (snap) => {
       usersByFlatId = new Map(
         snap.docs
@@ -176,6 +189,7 @@ export default function FlatsPage() {
 
     return () => {
       unsubFlats();
+      unsubStreets();
       unsubUsers();
     };
   }, [communityId]);
