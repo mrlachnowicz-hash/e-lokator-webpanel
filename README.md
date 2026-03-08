@@ -9,7 +9,7 @@
 - nowy moduł `Liczniki`
 - PDF rozliczenia przez route Next.js
 - email rozliczenia przez SendGrid z ENV
-- SSO consume route
+- SSO consume rout
 
 ## Źródło prawdy danych
 System czyta istniejące:
