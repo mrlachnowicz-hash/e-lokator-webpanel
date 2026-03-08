@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { collection, deleteDoc, doc, getDoc, onSnapshot, orderBy, query, setDoc, updateDoc, writeBatch } from "firebase/firestore";
+import { collection, deleteDoc, doc, onSnapshot, orderBy, query, setDoc, updateDoc, writeBatch } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
@@ -19,15 +19,15 @@ function monthLabel(period: string) {
   if (!m) return period || "bez daty";
   return `${names[Number(m[2]) - 1] || m[2]} ${m[1]}`;
 }
-function transferCode(flat: any) {
-  return String(flat?.paymentCode || flat?.flatLabel || `${flat?.street || ""}-${flat?.buildingNo || ""}-${flat?.apartmentNo || ""}`)
-    .normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 18) || "LOKAL";
+function hashCode(input: string) {
+  let hash = 0;
+  for (let i = 0; i < input.length; i += 1) hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+  return Math.abs(hash).toString(36).toUpperCase().padStart(6, "0").slice(0, 6);
 }
-
 function buildTransferTitle(flat: any, settlement: any) {
-  const period = String(settlement?.period || "").replace(/[^0-9]/g, "").slice(0, 6) || new Date().toISOString().slice(0, 7).replace(/-/g, "");
-  const suffix = String(flat?.id || settlement?.flatId || "XXXX").replace(/[^A-Za-z0-9]/g, "").slice(-4).toUpperCase() || "XXXX";
-  return `EL ${transferCode(flat || settlement)} ${period} ${suffix}`.trim();
+  const period = String(settlement?.period || new Date().toISOString().slice(0, 7)).replace(/[^0-9]/g, "").slice(2, 6) || "0000";
+  const seed = [settlement?.communityId || "COMM", flat?.id || settlement?.flatId || "FLAT", settlement?.period || "0000-00"].join("|");
+  return `EL-${period}-${hashCode(seed)}`;
 }
 
 export default function ChargesPage() {
@@ -46,11 +46,15 @@ export default function ChargesPage() {
       snap.docs.forEach((d) => { map[d.id] = { id: d.id, ...(d.data() as any) }; });
       setFlats(map);
     });
-    getDoc(doc(db, "communities", communityId)).then((snap) => {
+    const unsubCommunity = onSnapshot(doc(db, "communities", communityId), (snap) => {
       const data: any = snap.data() || {};
-      setDefaults({ defaultAccountNumber: String(data.defaultAccountNumber || data.accountNumber || data.bankAccount || ""), recipientName: String(data.recipientName || data.transferName || data.receiverName || data.name || ""), recipientAddress: String(data.recipientAddress || data.transferAddress || data.receiverAddress || "") });
+      setDefaults({
+        defaultAccountNumber: String(data.defaultAccountNumber || data.accountNumber || data.bankAccount || ""),
+        recipientName: String(data.recipientName || data.receiverName || data.transferName || data.name || ""),
+        recipientAddress: String(data.recipientAddress || data.receiverAddress || data.transferAddress || ""),
+      });
     });
-    return () => { unsubSettlements(); unsubFlats(); };
+    return () => { unsubSettlements(); unsubFlats(); unsubCommunity(); };
   }, [communityId]);
 
   const drafts = useMemo(() => items.filter((s) => s.isPublished !== true), [items]);
@@ -58,7 +62,19 @@ export default function ChargesPage() {
   const archivedGroups = useMemo(() => archived.reduce((acc: Record<string, Settlement[]>, item) => { const key = String(item.archiveMonth || item.period || "bez-daty"); (acc[key] ||= []).push(item); return acc; }, {}), [archived]);
 
   const saveDefaults = async () => {
-    await setDoc(doc(db, "communities", communityId), { defaultAccountNumber: defaults.defaultAccountNumber.trim(), accountNumber: defaults.defaultAccountNumber.trim(), bankAccount: defaults.defaultAccountNumber.trim(), recipientName: defaults.recipientName.trim(), receiverName: defaults.recipientName.trim(), transferName: defaults.recipientName.trim(), recipientAddress: defaults.recipientAddress.trim(), receiverAddress: defaults.recipientAddress.trim(), transferAddress: defaults.recipientAddress.trim(), updatedAtMs: Date.now() }, { merge: true });
+    const payload = {
+      defaultAccountNumber: defaults.defaultAccountNumber.trim(),
+      accountNumber: defaults.defaultAccountNumber.trim(),
+      bankAccount: defaults.defaultAccountNumber.trim(),
+      recipientName: defaults.recipientName.trim(),
+      receiverName: defaults.recipientName.trim(),
+      transferName: defaults.recipientName.trim(),
+      recipientAddress: defaults.recipientAddress.trim(),
+      receiverAddress: defaults.recipientAddress.trim(),
+      transferAddress: defaults.recipientAddress.trim(),
+      updatedAtMs: Date.now(),
+    };
+    await setDoc(doc(db, "communities", communityId), payload, { merge: true });
     setMsg("Zapisano domyślne dane do przelewu.");
   };
 
@@ -100,7 +116,7 @@ export default function ChargesPage() {
         {msg && <div style={{ color: "#8ef0c8" }}>{msg}</div>}
 
         <div style={{ display: "grid", gap: 10 }}>
-          {drafts.map((s) => <SettlementCard key={s.id} s={s} communityId={communityId} flat={flats[s.flatId] || null} setMsg={setMsg} defaults={defaults} />)}
+          {drafts.map((s) => <SettlementCard key={s.id} s={s} communityId={communityId} flat={flats[s.flatId] || null} setMsg={setMsg} defaults={defaults} buildTransferTitle={buildTransferTitle} />)}
         </div>
 
         <div className="card" style={{ display: "grid", gap: 12 }}>
@@ -108,7 +124,7 @@ export default function ChargesPage() {
           {Object.keys(archivedGroups).length === 0 ? <div style={{ opacity: 0.7 }}>Brak archiwum.</div> : Object.entries(archivedGroups).sort((a, b) => b[0].localeCompare(a[0])).map(([period, rows]) => (
             <div key={period} style={{ display: "grid", gap: 10 }}>
               <strong>{monthLabel(period)}</strong>
-              {rows.map((s) => <SettlementCard key={s.id} s={s} communityId={communityId} flat={flats[s.flatId] || null} setMsg={setMsg} defaults={defaults} archived />)}
+              {rows.map((s) => <SettlementCard key={s.id} s={s} communityId={communityId} flat={flats[s.flatId] || null} setMsg={setMsg} defaults={defaults} buildTransferTitle={buildTransferTitle} archived />)}
             </div>
           ))}
         </div>
@@ -117,15 +133,39 @@ export default function ChargesPage() {
   );
 }
 
-function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = false }: { s: Settlement; communityId: string; flat: Flat | null; setMsg: (v: string) => void; defaults: any; archived?: boolean }) {
-  const [accountNumber, setAccountNumber] = useState(String(s.accountNumber || flat?.accountNumber || defaults.defaultAccountNumber || ""));
-  const [transferName, setTransferName] = useState(String(s.transferName || flat?.recipientName || defaults.recipientName || ""));
-  const [transferAddress, setTransferAddress] = useState(String(s.transferAddress || flat?.recipientAddress || defaults.recipientAddress || ""));
+function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = false, buildTransferTitle }: { s: Settlement; communityId: string; flat: Flat | null; setMsg: (v: string) => void; defaults: any; archived?: boolean; buildTransferTitle: (flat: any, settlement: any) => string; }) {
+  const [accountNumber, setAccountNumber] = useState(String(s.accountNumber || s.bankAccount || flat?.accountNumber || defaults.defaultAccountNumber || ""));
+  const [transferName, setTransferName] = useState(String(s.transferName || s.receiverName || flat?.recipientName || defaults.recipientName || ""));
+  const [transferAddress, setTransferAddress] = useState(String(s.transferAddress || s.receiverAddress || flat?.recipientAddress || defaults.recipientAddress || ""));
   const [transferTitle, setTransferTitle] = useState(String(s.transferTitle || s.paymentTitle || buildTransferTitle(flat, s)));
   const savePaymentData = async () => {
-    const payload = { accountNumber: accountNumber.trim(), bankAccount: accountNumber.trim(), transferName: transferName.trim(), receiverName: transferName.trim(), transferAddress: transferAddress.trim(), receiverAddress: transferAddress.trim(), transferTitle: transferTitle.trim(), paymentTitle: transferTitle.trim(), updatedAtMs: Date.now() };
+    const cleanTitle = transferTitle.trim() || buildTransferTitle(flat, s);
+    const payload = {
+      accountNumber: accountNumber.trim(),
+      bankAccount: accountNumber.trim(),
+      transferName: transferName.trim(),
+      receiverName: transferName.trim(),
+      transferAddress: transferAddress.trim(),
+      receiverAddress: transferAddress.trim(),
+      transferTitle: cleanTitle,
+      paymentTitle: cleanTitle,
+      paymentCode: cleanTitle,
+      updatedAtMs: Date.now(),
+    };
     await updateDoc(doc(db, "communities", communityId, "settlements", s.id), payload);
-    if (flat?.id) await setDoc(doc(db, "communities", communityId, "flats", flat.id), { accountNumber: accountNumber.trim(), bankAccount: accountNumber.trim(), recipientName: transferName.trim(), receiverName: transferName.trim(), recipientAddress: transferAddress.trim(), receiverAddress: transferAddress.trim(), updatedAtMs: Date.now() }, { merge: true });
+    if (flat?.id) {
+      await setDoc(doc(db, "communities", communityId, "flats", flat.id), {
+        accountNumber: accountNumber.trim(),
+        bankAccount: accountNumber.trim(),
+        recipientName: transferName.trim(),
+        receiverName: transferName.trim(),
+        recipientAddress: transferAddress.trim(),
+        receiverAddress: transferAddress.trim(),
+        paymentCode: cleanTitle,
+        updatedAtMs: Date.now(),
+      }, { merge: true });
+    }
+    setTransferTitle(cleanTitle);
     setMsg(`Zapisano dane przelewu dla ${s.flatLabel || s.id}.`);
   };
   return (

@@ -94,11 +94,19 @@ function paymentCodeForFlat(flat) {
     .slice(0, 18);
 }
 
+function shortHash(input) {
+  const src = safeString(input || "X");
+  let hash = 0;
+  for (let i = 0; i < src.length; i += 1) {
+    hash = ((hash << 5) - hash + src.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash).toString(36).toUpperCase().padStart(6, "0").slice(0, 6);
+}
+
 function buildPaymentTitle(flat, period) {
-  const code = paymentCodeForFlat(flat) || "LOKAL";
-  const compactPeriod = safeString(period).replace(/[^0-9]/g, "").slice(0, 6) || "000000";
-  const suffix = safeString(flat?.id || flat?.flatId).replace(/[^A-Za-z0-9]/g, "").slice(-4).toUpperCase() || randomCode(4);
-  return `EL ${code} ${compactPeriod} ${suffix}`;
+  const compactPeriod = safeString(period).replace(/[^0-9]/g, "").slice(2, 6) || "0000";
+  const seed = [safeString(flat?.communityId || "COMM"), safeString(flat?.id || flat?.flatId || paymentCodeForFlat(flat) || "LOKAL"), safeString(period || "0000-00")].join("|");
+  return `EL-${compactPeriod}-${shortHash(seed)}`;
 }
 
 function getOpenAIClient() {
@@ -1099,6 +1107,7 @@ async function recalcSettlement(communityId, flatId, period) {
     totalDueCents: balanceCents,
     dueDate: `${period}-15`,
     paymentTitle,
+    paymentCode: paymentTitle,
     transferTitle: paymentTitle,
     transferName: valueOr(flat.recipientName, valueOr(community?.recipientName, community?.name)),
     transferAddress: valueOr(flat.recipientAddress, community?.recipientAddress),

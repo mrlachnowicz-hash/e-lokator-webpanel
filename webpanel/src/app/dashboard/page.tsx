@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { collection, doc, getCountFromServer, getDoc, setDoc } from "firebase/firestore";
+import { collection, doc, getDoc, onSnapshot, setDoc } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
@@ -22,29 +22,31 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (!communityId) return;
-    (async () => {
-      const communitySnap = await getDoc(doc(db, "communities", communityId));
+    let mounted = true;
+    getDoc(doc(db, "communities", communityId)).then((communitySnap) => {
+      if (!mounted) return;
       setWebpanelUrl(String(communitySnap.data()?.webpanelUrl || communitySnap.data()?.paymentsUrl || ""));
-      if (!panelEnabled) {
-        setStats({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0, meters: 0 });
-        return;
-      }
-      const [flats, invoices, settlements, review, meters] = await Promise.all([
-        getCountFromServer(collection(db, "communities", communityId, "flats")),
-        getCountFromServer(collection(db, "communities", communityId, "invoices")),
-        getCountFromServer(collection(db, "communities", communityId, "settlements")),
-        getCountFromServer(collection(db, "communities", communityId, "reviewQueue")),
-        getCountFromServer(collection(db, "communities", communityId, "meters")),
-      ]);
-      setStats({
-        flats: Number(flats.data().count || 0),
-        invoices: Number(invoices.data().count || 0),
-        settlements: Number(settlements.data().count || 0),
-        review: Number(review.data().count || 0),
-        unmatchedPayments: 0,
-        meters: Number(meters.data().count || 0),
-      });
-    })();
+    });
+    if (!panelEnabled) {
+      setStats({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0, meters: 0 });
+      return () => { mounted = false; };
+    }
+
+    const unsubs = [
+      onSnapshot(collection(db, "communities", communityId, "flats"), (snap) => setStats((prev) => ({ ...prev, flats: snap.size }))),
+      onSnapshot(collection(db, "communities", communityId, "invoices"), (snap) => setStats((prev) => ({ ...prev, invoices: snap.docs.filter((d) => !(d.data() as any)?.deletedAtMs).length }))),
+      onSnapshot(collection(db, "communities", communityId, "settlements"), (snap) => setStats((prev) => ({ ...prev, settlements: snap.size }))),
+      onSnapshot(collection(db, "communities", communityId, "reviewQueue"), (snap) => setStats((prev) => ({ ...prev, review: snap.size }))),
+      onSnapshot(collection(db, "communities", communityId, "meters"), (snap) => setStats((prev) => ({ ...prev, meters: snap.size }))),
+      onSnapshot(collection(db, "communities", communityId, "payments"), (snap) => {
+        const unmatched = snap.docs.filter((d) => {
+          const x: any = d.data() || {};
+          return !(x.matched || String(x.status || "").toUpperCase() === "CODE" || String(x.status || "").toUpperCase() === "AI_HINT");
+        }).length;
+        setStats((prev) => ({ ...prev, unmatchedPayments: unmatched }));
+      }),
+    ];
+    return () => { mounted = false; unsubs.forEach((x) => x()); };
   }, [communityId, panelEnabled]);
 
   const saveWebpanelUrl = async () => {
@@ -92,6 +94,7 @@ export default function DashboardPage() {
             <div className="card"><h3>Faktury</h3><p>{stats.invoices}</p></div>
             <div className="card"><h3>Rozliczenia</h3><p>{stats.settlements}</p></div>
             <div className="card"><h3>Review queue</h3><p>{stats.review}</p></div>
+            <div className="card"><h3>Przelewy do review</h3><p>{stats.unmatchedPayments}</p></div>
             <div className="card"><h3>Liczniki</h3><p>{stats.meters}</p></div>
           </div>
         </>
