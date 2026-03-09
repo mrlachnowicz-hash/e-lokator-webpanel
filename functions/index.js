@@ -22,6 +22,8 @@ try {
 
 const db = admin.firestore();
 
+const RUNTIME_FIX_VERSION = "2026-03-09-r5";
+
 // =========================================================
 // BASIC HELPERS
 // =========================================================
@@ -32,6 +34,10 @@ function nowMs() {
 
 function safeString(v) {
   return String(v || "").trim();
+}
+
+function normKey(v) {
+  return safeString(v).toLowerCase().replace(/\s+/g, " ");
 }
 
 function normalizeStreetName(name) {
@@ -227,14 +233,14 @@ async function listFlats(communityId, buildingId = null, streetId = null) {
   const snap = await db.collection(`communities/${communityId}/flats`).get();
   let rows = snap.docs.map(d => ({ id: d.id, ...d.data() }));
   if (streetId) {
-    rows = rows.filter((x) => safeString(x.streetId) === safeString(streetId));
+    const wantedStreet = normKey(streetId);
+    rows = rows.filter((x) => wantedStreet === normKey(x.streetId) || wantedStreet === normKey(x.street));
   }
   if (buildingId) {
+    const wantedBuilding = normKey(buildingId);
     rows = rows.filter((x) => {
-      const a = safeString(x.buildingId);
-      const b = safeString(x.buildingNo);
-      const c = safeString(buildingId);
-      return a === c || b === c;
+      const values = [x.buildingId, x.buildingNo, x.building, x.blockNo].map(normKey).filter(Boolean);
+      return values.includes(wantedBuilding);
     });
   }
   return rows;
@@ -1182,25 +1188,38 @@ function normalizeInvoiceScope(scope, assignment = {}, parsed = {}, invoice = {}
 }
 
 async function resolveFlatsForScope(communityId, scope, assignment = {}, parsed = {}) {
-  const streetId = safeString(assignment.streetId || parsed.streetId);
-  const buildingId = safeString(assignment.buildingId || parsed.buildingId || parsed.suggestedBuildingId);
-  const staircaseId = safeString(assignment.staircaseId || parsed.staircaseId || assignment.entranceId || parsed.entranceId);
-  const flatId = safeString(assignment.flatId || parsed.flatId || parsed.suggestedFlatId);
+  const streetId = safeString(assignment.streetId || parsed.streetId || parsed.street);
+  const buildingId = safeString(assignment.buildingId || parsed.buildingId || parsed.suggestedBuildingId || parsed.buildingNo || parsed.building);
+  const staircaseId = safeString(assignment.staircaseId || parsed.staircaseId || assignment.entranceId || parsed.entranceId || parsed.staircase || parsed.klatka);
+  const flatId = safeString(assignment.flatId || parsed.flatId || parsed.suggestedFlatId || parsed.apartmentId);
 
   if (scope === "FLAT") {
     const flat = flatId ? await getFlat(communityId, flatId) : null;
     return flat ? [flat] : [];
   }
 
-  let flats = await listFlats(communityId, ["BUILDING", "STAIRCASE"].includes(scope) ? buildingId || null : null, streetId || null);
-  if (scope === "COMMUNITY") flats = await listFlats(communityId);
-  if (scope === "COMMON" && !buildingId && !streetId) flats = await listFlats(communityId);
+  let flats = [];
+  if (scope === "COMMUNITY") {
+    flats = await listFlats(communityId);
+  } else if (scope === "COMMON") {
+    flats = await listFlats(communityId, buildingId || null, streetId || null);
+    if (flats.length === 0 && streetId) flats = await listFlats(communityId, null, streetId);
+    if (flats.length === 0 && buildingId) flats = await listFlats(communityId, buildingId, null);
+    if (flats.length === 0) flats = await listFlats(communityId);
+  } else {
+    flats = await listFlats(communityId, ["BUILDING", "STAIRCASE"].includes(scope) ? buildingId || null : null, streetId || null);
+    if (flats.length === 0 && buildingId) flats = await listFlats(communityId, buildingId, null);
+    if (flats.length === 0 && streetId) flats = await listFlats(communityId, null, streetId);
+  }
+
   if (scope === "STAIRCASE") {
+    const wanted = normKey(staircaseId);
     flats = flats.filter((x) => {
-      const a = safeString(x.staircaseId || x.staircase || x.entranceId || x.entrance || x.klatka);
-      return staircaseId ? a === staircaseId : !!a;
+      const a = normKey(x.staircaseId || x.staircase || x.entranceId || x.entrance || x.klatka);
+      return wanted ? a === wanted : !!a;
     });
   }
+
   return flats;
 }
 
@@ -1269,7 +1288,10 @@ exports.approveInvoice = onCall(async (request) => {
 
   const targetFlats = await resolveFlatsForScope(communityId, scope, { streetId, buildingId, staircaseId, flatId }, parsed);
   if (targetFlats.length === 0) {
-    throw new HttpsError("failed-precondition", `Brak lokali do naliczenia dla typu kosztu ${scope}.`);
+    throw new HttpsError(
+      "failed-precondition",
+      `Brak lokali do naliczenia dla typu kosztu ${scope}. communityId=${communityId} street=${streetId || parsed.street || "-"} building=${buildingId || parsed.buildingNo || "-"} staircase=${staircaseId || "-"} runtime=${RUNTIME_FIX_VERSION}`
+    );
   }
 
   const useArea = targetFlats.some(f => Number(f.areaM2 || 0) > 0) && scope !== "FLAT";
