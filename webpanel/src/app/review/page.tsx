@@ -1,81 +1,12 @@
 "use client";
-
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { collection, deleteDoc, doc, onSnapshot, orderBy, query, updateDoc } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
-
-export default function ReviewPage() {
-  const { profile } = useAuth();
-  const communityId = profile?.communityId || "";
-  const [items, setItems] = useState<any[]>([]);
-  const [explains, setExplains] = useState<Record<string, any>>({});
-  const [busyId, setBusyId] = useState("");
-
-  useEffect(() => {
-    if (!communityId) return;
-    const q = query(collection(db, "communities", communityId, "reviewQueue"), orderBy("createdAtMs", "desc"));
-    return onSnapshot(q, (snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }))));
-  }, [communityId]);
-
-  async function mark(itemId: string, patch: Record<string, any>) {
-    setBusyId(itemId);
-    try {
-      await updateDoc(doc(db, "communities", communityId, "reviewQueue", itemId), { ...patch, updatedAtMs: Date.now() });
-    } finally {
-      setBusyId("");
-    }
-  }
-
-  return (
-    <RequireAuth roles={["MASTER", "ACCOUNTANT"]}>
-      <Nav />
-      <div style={{ padding: 24, display: "grid", gap: 12 }}>
-        <h2>Kolejka sprawdzenia</h2>
-        <p style={{ opacity: 0.8, marginTop: -8 }}>Tu trafiają wyjątki z reguł, heurystyk i AI. Rekord można wyjaśnić przez AI, zaakceptować, wyczyścić albo usunąć.</p>
-        {items.map((item) => (
-          <div key={item.id} className="card" style={{ display: "grid", gap: 10 }}>
-            <div><strong>{item.type || "POZYCJA"}</strong> — status: {String(item.status || "OPEN").replace("OPEN", "OTWARTE").replace("CLOSED", "ZAMKNIĘTE").replace("ACCEPTED", "ZAAKCEPTOWANE")}</div>
-            <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{JSON.stringify(item, null, 2)}</pre>
-            {explains[item.id] || item.aiExplanation ? (
-              <div style={{ background: "rgba(255,255,255,.05)", padding: 12, borderRadius: 12 }}>
-                <div><strong>AI wyjaśnienie:</strong> {(explains[item.id] || item.aiExplanation)?.explanation || (explains[item.id] || item.aiExplanation)?.summary || "—"}</div>
-                <div><strong>Co sprawdzić:</strong> {(explains[item.id] || item.aiExplanation)?.nextAction || (explains[item.id] || item.aiExplanation)?.recommendedChecks?.join(", ") || "—"}</div>
-                <div><strong>Pewność:</strong> {(explains[item.id] || item.aiExplanation)?.confidence ?? "—"}</div>
-              </div>
-            ) : null}
-            <div className="formRow" style={{ flexWrap: "wrap" }}>
-              <button className="btnGhost" disabled={busyId === item.id} onClick={async () => {
-                setBusyId(item.id);
-                try {
-                  const res = await fetch("/api/ai/review-explain", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(item),
-                  });
-                  const data = await res.json();
-                  if (res.ok) setExplains((prev) => ({ ...prev, [item.id]: data }));
-                } finally {
-                  setBusyId("");
-                }
-              }}>AI wyjaśnij</button>
-              <button className="btn" disabled={busyId === item.id} onClick={() => mark(item.id, { status: "ACCEPTED", resolution: "accepted-from-webpanel", closedAtMs: Date.now() })}>Zaakceptuj</button>
-              <button className="btnGhost" disabled={busyId === item.id} onClick={() => mark(item.id, { status: "CLOSED", resolution: "cleared-from-webpanel", closedAtMs: Date.now() })}>Wyczyść</button>
-              <button className="btnGhost" disabled={busyId === item.id} onClick={async () => {
-                if (!window.confirm(`Usunąć rekord review ${item.id}?`)) return;
-                setBusyId(item.id);
-                try {
-                  await deleteDoc(doc(db, "communities", communityId, "reviewQueue", item.id));
-                } finally {
-                  setBusyId("");
-                }
-              }}>Usuń</button>
-            </div>
-          </div>
-        ))}
-      </div>
-    </RequireAuth>
-  );
-}
+const formatType = (t:string) => String(t || "POZYCJA").replace(/_/g," ").toUpperCase().includes("INVOICE") ? "Faktura" : String(t || "POZYCJA").replace(/_/g," ").toUpperCase().includes("PAYMENT") ? "Przelew" : String(t || "POZYCJA").replace(/_/g," ").toUpperCase();
+const statusLabel = (s:string) => ({OPEN:"Otwarte",ACCEPTED:"Zaakceptowane",CLOSED:"Zamknięte"} as any)[String(s||"OPEN").toUpperCase()] || String(s||"OPEN");
+const confidenceLabel = (v:unknown) => Number(v||0) >= 0.9 ? "Wysoka" : Number(v||0) >= 0.75 ? "Średnia" : "Niska";
+export default function ReviewPage(){ const { profile } = useAuth(); const communityId = profile?.communityId || ""; const [items,setItems]=useState<any[]>([]); const [explains,setExplains]=useState<Record<string,any>>({}); const [busyId,setBusyId]=useState(""); useEffect(()=>{ if(!communityId) return; const q=query(collection(db,"communities",communityId,"reviewQueue"),orderBy("createdAtMs","desc")); return onSnapshot(q,(snap)=>setItems(snap.docs.map((d)=>({id:d.id,...(d.data() as any)})))); },[communityId]); const stats=useMemo(()=>({ open:items.filter((x)=>String(x.status||"OPEN").toUpperCase()==="OPEN").length, accepted:items.filter((x)=>String(x.status||"").toUpperCase()==="ACCEPTED").length, closed:items.filter((x)=>String(x.status||"").toUpperCase()==="CLOSED").length }),[items]); async function mark(id:string, patch:any){ setBusyId(id); try{ await updateDoc(doc(db,"communities",communityId,"reviewQueue",id),{...patch,updatedAtMs:Date.now()}); } finally { setBusyId(""); } }
+return <RequireAuth roles={["MASTER","ACCOUNTANT"]}><Nav /><div style={{padding:24,display:"grid",gap:12}}><h2>Kolejka review</h2><div className="card" style={{display:"flex",gap:18,flexWrap:"wrap"}}><div>Otwarte: <strong>{stats.open}</strong></div><div>Zaakceptowane: <strong>{stats.accepted}</strong></div><div>Zamknięte: <strong>{stats.closed}</strong></div></div>{items.map((item)=>{ const explain=explains[item.id]||item.aiExplanation||null; const proposed=item.proposed||item.suggestion||{}; return <div key={item.id} className="card" style={{display:"grid",gap:10}}><div style={{display:"flex",gap:12,flexWrap:"wrap",alignItems:"center"}}><strong>{formatType(item.type)}</strong><span>Status: {statusLabel(item.status)}</span><span>Pewność: {confidenceLabel(item.confidence || item.suggestion?.confidence)} ({Number(item.confidence || item.suggestion?.confidence || 0).toFixed(2)})</span></div><div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(240px, 1fr))",gap:12}}><div style={{background:"rgba(255,255,255,.04)",padding:12,borderRadius:12}}><div style={{fontWeight:700,marginBottom:6}}>Podstawowe dane</div><div>Tytuł: {item.title || item.paymentTitle || item.invoiceId || item.paymentId || "—"}</div><div>Kwota: {item.amountCents != null ? `${(Number(item.amountCents)/100).toFixed(2)} PLN` : "—"}</div><div>ID rekordu: {item.id}</div></div><div style={{background:"rgba(255,255,255,.04)",padding:12,borderRadius:12}}><div style={{fontWeight:700,marginBottom:6}}>Powód problemu</div><div>{item.reason || proposed.reason || item.suggestion?.reason || "Brak szczegółowego opisu."}</div></div><div style={{background:"rgba(255,255,255,.04)",padding:12,borderRadius:12}}><div style={{fontWeight:700,marginBottom:6}}>Propozycja systemu</div><div>Lokal: {proposed.flatLabel || proposed.flatId || item.suggestedFlatId || "—"}</div><div>Rozliczenie: {proposed.settlementId || item.suggestedSettlementId || "—"}</div><div>Co wykryto: {proposed.reason || item.matchReason || item.paymentTitle || item.invoiceId || "—"}</div></div></div>{explain?<div style={{background:"rgba(255,255,255,.05)",padding:12,borderRadius:12}}><div><strong>AI wyjaśnienie:</strong> {explain.explanation || explain.summary || "—"}</div><div><strong>Co sprawdzić:</strong> {explain.nextAction || explain.recommendedChecks?.join(", ") || "—"}</div></div>:null}<div style={{display:"flex",gap:10,flexWrap:"wrap"}}><button className="btnGhost" disabled={busyId===item.id} onClick={async ()=>{ setBusyId(item.id); try{ const res=await fetch("/api/ai/review-explain",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(item)}); const data=await res.json(); if(res.ok) setExplains((prev)=>({...prev,[item.id]:data})); } finally { setBusyId(""); } }}>AI wyjaśnij</button><button className="btn" disabled={busyId===item.id} onClick={()=>mark(item.id,{status:"ACCEPTED",resolution:"accepted-from-webpanel",closedAtMs:Date.now()})}>Zaakceptuj</button><button className="btnGhost" disabled={busyId===item.id} onClick={()=>mark(item.id,{status:"CLOSED",resolution:"cleared-from-webpanel",closedAtMs:Date.now()})}>Zamknij</button><button className="btnGhost" disabled={busyId===item.id} onClick={async ()=>{ if(!window.confirm(`Usunąć rekord review ${item.id}?`)) return; setBusyId(item.id); try{ await deleteDoc(doc(db,"communities",communityId,"reviewQueue",item.id)); } finally { setBusyId(""); } }}>Usuń</button></div></div>; })}</div></RequireAuth>; }

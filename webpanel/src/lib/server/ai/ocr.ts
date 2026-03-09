@@ -1,5 +1,6 @@
 import { getOpenAI, isAIEnabled } from "./openai";
 import { safeParseJson } from "./json";
+import { inferCostScope, matchInvoiceAddress, type FlatCandidate } from "@/lib/server/invoiceRecognition";
 
 export type InvoiceOCRResult = {
   supplierName: string;
@@ -14,252 +15,36 @@ export type InvoiceOCRResult = {
   allocationType: "COMMON" | "BUILDING" | "FLAT" | "UNKNOWN";
   suggestedBuildingId?: string;
   suggestedFlatId?: string;
+  suggestedStreetId?: string;
+  suggestedStreetName?: string;
+  suggestedApartmentNo?: string;
   confidence: number;
   needsReview: boolean;
   reason: string;
   extractedText: string;
 };
 
-const FALLBACK: InvoiceOCRResult = {
-  supplierName: "",
-  invoiceNumber: "",
-  issueDate: "",
-  dueDate: "",
-  currency: "PLN",
-  grossAmount: 0,
-  netAmount: 0,
-  vatAmount: 0,
-  category: "INNE",
-  allocationType: "UNKNOWN",
-  confidence: 0.2,
-  needsReview: true,
-  reason: "Nie udało się wiarygodnie odczytać faktury.",
-  extractedText: "",
-};
-
-function aiPromptPayload(payload: { extractedText: string; knownBuildings?: string[]; knownFlats?: Array<{ id: string; flatLabel?: string }>; }) {
-  return JSON.stringify({
-    knownBuildings: payload.knownBuildings || [],
-    knownFlats: payload.knownFlats || [],
-    extractedText: String(payload.extractedText || "").slice(0, 120000),
-  });
-}
-
-function normalizeAmount(value: string) {
-  const cleaned = String(value || "")
-    .replace(/PLN|zł|zl|EUR/gi, "")
-    .replace(/\s/g, "")
-    .replace(/\.(?=\d{3}(\D|$))/g, "")
-    .replace(/,(?=\d{2}(\D|$))/g, ".");
-  const num = Number(cleaned.replace(/[^0-9.-]/g, ""));
-  return Number.isFinite(num) ? num : 0;
-}
-
-function normalizeLine(value: string) {
-  return String(value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
-}
-
-function heuristicCategory(text: string) {
-  const t = normalizeLine(text);
-  if (t.includes("energia") || t.includes("tauron") || t.includes("prad") || t.includes("elektry")) return "PRĄD";
-  if (t.includes("woda") || t.includes("sciek") || t.includes("wodociag")) return "WODA";
-  if (t.includes("gaz")) return "GAZ";
-  if (t.includes("sprzatan")) return "SPRZĄTANIE";
-  if (t.includes("remont") || t.includes("malowan") || t.includes("napraw") || t.includes("hydraul") || t.includes("elektryk") || t.includes("szklar")) return "REMONT";
-  return "INNE";
-}
-
-function parseBasicInvoiceText(text: string, knownBuildings?: string[], knownFlats?: Array<{ id: string; flatLabel?: string }>): Partial<InvoiceOCRResult> {
-  const raw = String(text || "").replace(/\u0000/g, " ").trim();
-  const lines = raw.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
-  const compact = lines.join("\n");
-  const compactNorm = normalizeLine(compact);
-
+const FALLBACK: InvoiceOCRResult = { supplierName: "", invoiceNumber: "", issueDate: "", dueDate: "", currency: "PLN", grossAmount: 0, netAmount: 0, vatAmount: 0, category: "INNE", allocationType: "UNKNOWN", confidence: 0.2, needsReview: true, reason: "Nie udało się wiarygodnie odczytać faktury.", extractedText: "" };
+function aiPromptPayload(payload: { extractedText: string; knownBuildings?: string[]; knownFlats?: Array<{ id: string; flatLabel?: string; street?: string; streetId?: string; buildingNo?: string; apartmentNo?: string }>; }) { return JSON.stringify({ knownBuildings: payload.knownBuildings || [], knownFlats: payload.knownFlats || [], extractedText: String(payload.extractedText || "").slice(0, 120000) }); }
+function normalizeAmount(value: string) { const cleaned = String(value || "").replace(/PLN|zł|zl|EUR/gi, "").replace(/\s/g, "").replace(/\.(?=\d{3}(\D|$))/g, "").replace(/,(?=\d{2}(\D|$))/g, "."); const num = Number(cleaned.replace(/[^0-9.-]/g, "")); return Number.isFinite(num) ? num : 0; }
+function normalizeLine(value: string) { return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase(); }
+function heuristicCategory(text: string) { const t = normalizeLine(text); if (t.includes("energia") || t.includes("tauron") || t.includes("prad") || t.includes("elektry")) return "PRĄD"; if (t.includes("woda") || t.includes("sciek") || t.includes("wodociag")) return "WODA"; if (t.includes("gaz")) return "GAZ"; if (t.includes("sprzatan")) return "SPRZĄTANIE"; if (t.includes("remont") || t.includes("malowan") || t.includes("napraw") || t.includes("hydraul") || t.includes("elektryk") || t.includes("szklar")) return "REMONT"; return "INNE"; }
+function parseBasicInvoiceText(text: string, knownBuildings?: string[], knownFlats?: FlatCandidate[]): Partial<InvoiceOCRResult> {
+  const raw = String(text || "").replace(/\u0000/g, " ").trim(); const lines = raw.split(/\r?\n/).map((x) => x.trim()).filter(Boolean); const compact = lines.join("\n"); const compactNorm = normalizeLine(compact);
   const invoiceNumber = (compact.match(/(?:numer faktury|nr faktury|faktura\s+nr|fv\/?[a-z]*)\s*[:#-]?\s*([A-Z0-9\/-]+)/i)?.[1] || "").trim();
   const issueDate = (compact.match(/(?:data wystawienia|issue date)\s*[:#-]?\s*(20\d{2}[-./]\d{2}[-./]\d{2})/i)?.[1] || "").replace(/\./g, "-").replace(/\//g, "-");
   const dueDate = (compact.match(/(?:termin płatności|termin platnosci|due date)\s*[:#-]?\s*(20\d{2}[-./]\d{2}[-./]\d{2})/i)?.[1] || "").replace(/\./g, "-").replace(/\//g, "-");
-
-  let supplierName = "";
-  const sellerIdx = lines.findIndex((x) => /sprzedawca|seller/i.test(x));
-  if (sellerIdx >= 0 && lines[sellerIdx + 1]) supplierName = lines[sellerIdx + 1];
-  if (!supplierName) {
-    supplierName = (compact.match(/(?:sprzedawca|seller)\s*[:#-]?\s*([^\n]+)/i)?.[1] || "").trim();
-  }
-  if (!supplierName) {
-    supplierName = lines.find((x) => /sp\.? z o\.o\.|s\.a\.|tauron|wodociągi|wodociagi|gaz|serwis|usługi|uslugi|hydro|volt|glass|kolor/i.test(x)) || "";
-  }
-
-  const amountMatch = compact.match(/(?:do zapłaty|do zaplaty|razem brutto|kwota brutto|wartość brutto|wartosc brutto|total)\s*[:#-]?\s*([0-9\s.,]+)\s*(PLN|zł|zl|EUR)?/i);
-  const grossAmount = amountMatch ? normalizeAmount(`${amountMatch[1]} ${amountMatch[2] || ""}`) : 0;
-
-  const category = heuristicCategory(compact);
-
-  let allocationType: InvoiceOCRResult["allocationType"] = "UNKNOWN";
-  if (/lokal|mieszkani|apartment|nr\s*lokalu|\d+\/\d+/.test(compactNorm)) allocationType = "FLAT";
-  else if (/czesci wspolne|nieruchomosc wspolna|koszt wspolny|budynek/.test(compactNorm)) allocationType = "COMMON";
-
-  let suggestedBuildingId = "";
-  for (const building of knownBuildings || []) {
-    if (!building) continue;
-    const b = normalizeLine(building);
-    if (b && compactNorm.includes(` ${b}`) || compactNorm.includes(`/${b}`) || compactNorm.includes(`${b}/`)) {
-      suggestedBuildingId = building;
-      break;
-    }
-  }
-
-  let suggestedFlatId = "";
-  let bestScore = 0;
-  for (const flat of knownFlats || []) {
-    const label = String(flat.flatLabel || "");
-    if (!label) continue;
-    const labelNorm = normalizeLine(label);
-    let score = 0;
-    if (compactNorm.includes(labelNorm)) score += 5;
-    const tokens = labelNorm.split(/\s+/).filter(Boolean);
-    for (const token of tokens) {
-      if (token.length < 2) continue;
-      if (compactNorm.includes(token)) score += 1;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      suggestedFlatId = flat.id;
-    }
-  }
-  if (suggestedFlatId) allocationType = "FLAT";
-
-  const confidence = Math.max(
-    0.35,
-    Math.min(
-      0.94,
-      (invoiceNumber ? 0.2 : 0) +
-      (supplierName ? 0.15 : 0) +
-      (grossAmount > 0 ? 0.2 : 0) +
-      (issueDate ? 0.1 : 0) +
-      (allocationType !== "UNKNOWN" ? 0.15 : 0) +
-      (suggestedBuildingId ? 0.07 : 0) +
-      (suggestedFlatId ? 0.13 : 0)
-    )
-  );
-
-  return {
-    supplierName,
-    invoiceNumber,
-    issueDate,
-    dueDate,
-    grossAmount,
-    netAmount: 0,
-    vatAmount: 0,
-    category,
-    allocationType,
-    suggestedBuildingId,
-    suggestedFlatId,
-    confidence,
-    needsReview: confidence < 0.85 || allocationType === "UNKNOWN" || grossAmount <= 0,
-    reason: confidence >= 0.85 ? "Dane odczytane automatycznie z dokumentu." : "Dane odczytane częściowo automatycznie. Wymagają sprawdzenia.",
-    extractedText: raw,
-  };
+  let supplierName = ""; const sellerIdx = lines.findIndex((x) => /sprzedawca|seller/i.test(x)); if (sellerIdx >= 0 && lines[sellerIdx + 1]) supplierName = lines[sellerIdx + 1]; if (!supplierName) supplierName = (compact.match(/(?:sprzedawca|seller)\s*[:#-]?\s*([^\n]+)/i)?.[1] || "").trim(); if (!supplierName) supplierName = lines.find((x) => /sp\.? z o\.o\.|s\.a\.|tauron|wodociągi|wodociagi|gaz|serwis|usługi|uslugi|hydro|volt|glass|kolor/i.test(x)) || "";
+  const amountMatch = compact.match(/(?:do zapłaty|do zaplaty|razem brutto|kwota brutto|wartość brutto|wartosc brutto|total)\s*[:#-]?\s*([0-9\s.,]+)\s*(PLN|zł|zl|EUR)?/i); const grossAmount = amountMatch ? normalizeAmount(`${amountMatch[1]} ${amountMatch[2] || ""}`) : 0;
+  const category = heuristicCategory(compact); const scopeHint = inferCostScope(compact); let allocationType: InvoiceOCRResult["allocationType"] = scopeHint.scope;
+  let suggestedBuildingId = ""; for (const building of knownBuildings || []) { if (!building) continue; const b = normalizeLine(building); if ((b && compactNorm.includes(` ${b}`)) || compactNorm.includes(`/${b}`) || compactNorm.includes(`${b}/`)) { suggestedBuildingId = building; break; } }
+  const addressMatch = matchInvoiceAddress(compact, knownFlats || []); if (addressMatch?.flatId) allocationType = "FLAT"; else if (allocationType === "UNKNOWN" && suggestedBuildingId) allocationType = "BUILDING";
+  const confidence = Math.max(0.35, Math.min(0.97, (invoiceNumber ? 0.18 : 0) + (supplierName ? 0.12 : 0) + (grossAmount > 0 ? 0.2 : 0) + (issueDate ? 0.08 : 0) + (allocationType !== "UNKNOWN" ? 0.12 : 0) + (suggestedBuildingId ? 0.08 : 0) + (addressMatch?.confidence || 0) * 0.35 + (scopeHint.confidence || 0) * 0.12 ));
+  const reasons = [scopeHint.reason, addressMatch?.reason].filter(Boolean).join("; ");
+  return { supplierName, invoiceNumber, issueDate, dueDate, grossAmount, netAmount: 0, vatAmount: 0, category, allocationType, suggestedBuildingId: addressMatch?.buildingNo || suggestedBuildingId, suggestedFlatId: addressMatch?.flatId || "", suggestedStreetId: addressMatch?.streetId || "", suggestedStreetName: addressMatch?.streetName || "", suggestedApartmentNo: addressMatch?.apartmentNo || "", confidence, needsReview: confidence < 0.88 || allocationType === "UNKNOWN" || grossAmount <= 0, reason: reasons || (confidence >= 0.88 ? "Dane odczytane automatycznie z dokumentu." : "Dane odczytane częściowo automatycznie. Wymagają sprawdzenia."), extractedText: raw };
 }
-
-function mergeWithHeuristic(parsed: Partial<InvoiceOCRResult>, heuristic: Partial<InvoiceOCRResult>, extractedText: string, fallbackReason?: string): InvoiceOCRResult {
-  const merged = {
-    ...FALLBACK,
-    ...heuristic,
-    ...parsed,
-    supplierName: String(parsed?.supplierName || heuristic?.supplierName || ""),
-    invoiceNumber: String(parsed?.invoiceNumber || heuristic?.invoiceNumber || ""),
-    issueDate: String(parsed?.issueDate || heuristic?.issueDate || ""),
-    dueDate: String(parsed?.dueDate || heuristic?.dueDate || ""),
-    currency: String(parsed?.currency || heuristic?.currency || "PLN"),
-    category: String(parsed?.category || heuristic?.category || FALLBACK.category),
-    allocationType: (parsed?.allocationType || heuristic?.allocationType || FALLBACK.allocationType),
-    suggestedBuildingId: String(parsed?.suggestedBuildingId || heuristic?.suggestedBuildingId || ""),
-    suggestedFlatId: String(parsed?.suggestedFlatId || heuristic?.suggestedFlatId || ""),
-    grossAmount: Number(parsed?.grossAmount || heuristic?.grossAmount || 0),
-    netAmount: Number(parsed?.netAmount || heuristic?.netAmount || 0),
-    vatAmount: Number(parsed?.vatAmount || heuristic?.vatAmount || 0),
-    confidence: Number(parsed?.confidence || heuristic?.confidence || 0),
-    needsReview: Boolean(parsed?.needsReview ?? heuristic?.needsReview ?? true),
-    reason: String(parsed?.reason || heuristic?.reason || fallbackReason || FALLBACK.reason),
-    extractedText,
-  } as InvoiceOCRResult;
-  return merged;
-}
-
-async function askAi(input: any[]) {
-  const client = getOpenAI();
-  if (!client) return null;
-  return client.responses.create({
-    model: process.env.OPENAI_MODEL_SMART || process.env.OPENAI_MODEL_FAST || "gpt-5.4",
-    input,
-  });
-}
-
-export async function extractPdfText(buffer: Buffer): Promise<string> {
-  try {
-    const pdfParse = (await import("pdf-parse")).default as any;
-    const parsed = await pdfParse(buffer);
-    return String(parsed?.text || "").replace(/\u0000/g, " ").trim();
-  } catch {
-    return "";
-  }
-}
-
-export async function analyzeInvoiceText(payload: { extractedText: string; knownBuildings?: string[]; knownFlats?: Array<{ id: string; flatLabel?: string }>; }) {
-  const text = String(payload.extractedText || "").trim();
-  if (!text) return FALLBACK;
-  const heuristic = parseBasicInvoiceText(text, payload.knownBuildings, payload.knownFlats);
-  if (!isAIEnabled()) return mergeWithHeuristic({}, heuristic, text, "Odczytano dokument regułami lokalnymi bez AI.");
-  const response = await askAi([
-    {
-      role: "system",
-      content: [{
-        type: "input_text",
-        text:
-          "Jesteś systemem OCR/analizy faktur dla wspólnot mieszkaniowych. " +
-          "Zwróć wyłącznie JSON bez markdown. " +
-          "Schema: {supplierName:string, invoiceNumber:string, issueDate:string, dueDate:string, currency:string, grossAmount:number, netAmount:number, vatAmount:number, category:string, allocationType:'COMMON'|'BUILDING'|'FLAT'|'UNKNOWN', suggestedBuildingId?:string, suggestedFlatId?:string, confidence:number, needsReview:boolean, reason:string}. " +
-          "Jeżeli brak pewności, ustaw needsReview=true i allocationType='UNKNOWN'. " +
-          "Nie wymyślaj identyfikatorów nieobecnych w danych wejściowych."
-      }]
-    },
-    {
-      role: "user",
-      content: [{ type: "input_text", text: aiPromptPayload(payload) }]
-    }
-  ]);
-  const parsed = safeParseJson<Partial<InvoiceOCRResult>>(response?.output_text || "", {});
-  return mergeWithHeuristic(parsed, heuristic, text, "AI nie zwróciło poprawnego JSON.");
-}
-
-export async function analyzeInvoiceImage(payload: { mimeType: string; buffer: Buffer; knownBuildings?: string[]; knownFlats?: Array<{ id: string; flatLabel?: string }>; }) {
-  if (!isAIEnabled()) return { ...FALLBACK, reason: "AI wyłączone. OCR obrazu nie jest dostępny." };
-  const base64 = payload.buffer.toString("base64");
-  const dataUrl = `data:${payload.mimeType};base64,${base64}`;
-  const response = await askAi([
-    {
-      role: "system",
-      content: [{
-        type: "input_text",
-        text:
-          "Jesteś systemem OCR/analizy faktur dla wspólnot mieszkaniowych. Odczytaj obraz faktury i zwróć wyłącznie JSON bez markdown. " +
-          "Schema: {supplierName:string, invoiceNumber:string, issueDate:string, dueDate:string, currency:string, grossAmount:number, netAmount:number, vatAmount:number, category:string, allocationType:'COMMON'|'BUILDING'|'FLAT'|'UNKNOWN', suggestedBuildingId?:string, suggestedFlatId?:string, confidence:number, needsReview:boolean, reason:string, extractedText?:string}. " +
-          "Jeżeli brak pewności, ustaw needsReview=true i allocationType='UNKNOWN'."
-      }]
-    },
-    {
-      role: "user",
-      content: [
-        { type: "input_text", text: aiPromptPayload({ extractedText: "OCR z obrazu", knownBuildings: payload.knownBuildings, knownFlats: payload.knownFlats }) },
-        { type: "input_image", image_url: dataUrl },
-      ]
-    }
-  ]);
-  const parsed = safeParseJson<Partial<InvoiceOCRResult>>(response?.output_text || "", FALLBACK);
-  const extracted = String((parsed as any)?.extractedText || "OCR z obrazu");
-  const heuristic = parseBasicInvoiceText(extracted, payload.knownBuildings, payload.knownFlats);
-  return mergeWithHeuristic(parsed, heuristic, extracted, "AI nie zwróciło poprawnego OCR obrazu.");
-}
+function mergeWithHeuristic(parsed: Partial<InvoiceOCRResult>, heuristic: Partial<InvoiceOCRResult>, extractedText: string, fallbackReason?: string): InvoiceOCRResult { const confidence = Number(parsed?.confidence ?? heuristic?.confidence ?? 0); const allocationType = (parsed?.allocationType || heuristic?.allocationType || FALLBACK.allocationType); const grossAmount = Number(parsed?.grossAmount ?? heuristic?.grossAmount ?? 0); return { ...FALLBACK, ...heuristic, ...parsed, supplierName: String(parsed?.supplierName || heuristic?.supplierName || ""), invoiceNumber: String(parsed?.invoiceNumber || heuristic?.invoiceNumber || ""), issueDate: String(parsed?.issueDate || heuristic?.issueDate || ""), dueDate: String(parsed?.dueDate || heuristic?.dueDate || ""), currency: String(parsed?.currency || heuristic?.currency || "PLN"), category: String(parsed?.category || heuristic?.category || FALLBACK.category), allocationType, suggestedBuildingId: String(parsed?.suggestedBuildingId || heuristic?.suggestedBuildingId || ""), suggestedFlatId: String(parsed?.suggestedFlatId || heuristic?.suggestedFlatId || ""), suggestedStreetId: String((parsed as any)?.suggestedStreetId || (heuristic as any)?.suggestedStreetId || ""), suggestedStreetName: String((parsed as any)?.suggestedStreetName || (heuristic as any)?.suggestedStreetName || ""), suggestedApartmentNo: String((parsed as any)?.suggestedApartmentNo || (heuristic as any)?.suggestedApartmentNo || ""), grossAmount, netAmount: Number(parsed?.netAmount || heuristic?.netAmount || 0), vatAmount: Number(parsed?.vatAmount || heuristic?.vatAmount || 0), confidence, needsReview: Boolean(parsed?.needsReview ?? heuristic?.needsReview ?? (confidence < 0.88 || allocationType === "UNKNOWN" || grossAmount <= 0)), reason: String(parsed?.reason || heuristic?.reason || fallbackReason || FALLBACK.reason), extractedText } as InvoiceOCRResult; }
+async function askAi(input: any[]) { const client = getOpenAI(); if (!client) return null; return client.responses.create({ model: process.env.OPENAI_MODEL_SMART || process.env.OPENAI_MODEL_FAST || "gpt-5.4", input }); }
+export async function extractPdfText(buffer: Buffer): Promise<string> { try { const pdfParse = (await import("pdf-parse")).default as any; const parsed = await pdfParse(buffer); return String(parsed?.text || "").replace(/\u0000/g, " ").trim(); } catch { return ""; } }
+export async function analyzeInvoiceText(payload: { extractedText: string; knownBuildings?: string[]; knownFlats?: Array<{ id: string; flatLabel?: string; street?: string; streetId?: string; buildingNo?: string; apartmentNo?: string }>; }) { const text = String(payload.extractedText || "").trim(); if (!text) return FALLBACK; const heuristic = parseBasicInvoiceText(text, payload.knownBuildings, payload.knownFlats as FlatCandidate[]); if (!isAIEnabled()) return mergeWithHeuristic({}, heuristic, text, "Odczytano dokument regułami lokalnymi bez AI."); const response = await askAi([{ role: "system", content: [{ type: "input_text", text: "Jesteś systemem OCR/analizy faktur dla wspólnot mieszkaniowych. Zwróć wyłącznie JSON bez markdown. Schema: {supplierName:string, invoiceNumber:string, issueDate:string, dueDate:string, currency:string, grossAmount:number, netAmount:number, vatAmount:number, category:string, allocationType:'COMMON'|'BUILDING'|'FLAT'|'UNKNOWN', suggestedBuildingId?:string, suggestedFlatId?:string, suggestedStreetId?:string, suggestedStreetName?:string, suggestedApartmentNo?:string, confidence:number, needsReview:boolean, reason:string}. Jeżeli brak pewności, ustaw needsReview=true i allocationType='UNKNOWN'. Nie przypisuj lokalu na siłę." }] }, { role: "user", content: [{ type: "input_text", text: aiPromptPayload(payload) }] }]); const parsed = safeParseJson<Partial<InvoiceOCRResult>>(response?.output_text || "", {}); return mergeWithHeuristic(parsed, heuristic, text, "AI nie zwróciło poprawnego JSON."); }
+export async function analyzeInvoiceImage(payload: { mimeType: string; buffer: Buffer; knownBuildings?: string[]; knownFlats?: Array<{ id: string; flatLabel?: string; street?: string; streetId?: string; buildingNo?: string; apartmentNo?: string }>; }) { if (!isAIEnabled()) return { ...FALLBACK, reason: "AI wyłączone. OCR obrazu nie jest dostępny." }; const base64 = payload.buffer.toString("base64"); const dataUrl = `data:${payload.mimeType};base64,${base64}`; const response = await askAi([{ role: "system", content: [{ type: "input_text", text: "Jesteś systemem OCR/analizy faktur dla wspólnot mieszkaniowych. Odczytaj obraz faktury i zwróć wyłącznie JSON bez markdown. Schema: {supplierName:string, invoiceNumber:string, issueDate:string, dueDate:string, currency:string, grossAmount:number, netAmount:number, vatAmount:number, category:string, allocationType:'COMMON'|'BUILDING'|'FLAT'|'UNKNOWN', suggestedBuildingId?:string, suggestedFlatId?:string, suggestedStreetId?:string, suggestedStreetName?:string, suggestedApartmentNo?:string, confidence:number, needsReview:boolean, reason:string, extractedText?:string}. Jeżeli brak pewności, ustaw needsReview=true i allocationType='UNKNOWN'." }] }, { role: "user", content: [{ type: "input_text", text: aiPromptPayload({ extractedText: "OCR z obrazu", knownBuildings: payload.knownBuildings, knownFlats: payload.knownFlats }) }, { type: "input_image", image_url: dataUrl }] }]); const parsed = safeParseJson<Partial<InvoiceOCRResult>>(response?.output_text || "", FALLBACK); const extracted = String((parsed as any)?.extractedText || "OCR z obrazu"); const heuristic = parseBasicInvoiceText(extracted, payload.knownBuildings, payload.knownFlats as FlatCandidate[]); return mergeWithHeuristic(parsed, heuristic, extracted, "AI nie zwróciło poprawnego OCR obrazu."); }

@@ -1,0 +1,44 @@
+import { NextRequest, NextResponse } from "next/server";
+import { getAdminApp, getAdminDb } from "@/lib/server/firebaseAdmin";
+import { buildStablePaymentTitle } from "@/lib/server/paymentRefs";
+export const runtime = "nodejs";
+type ImportRow = { date?: string; title?: string; amount?: string | number; source?: string; code?: string; payerName?: string; payerAddress?: string; };
+const normalize = (v: unknown) => String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+const toCents = (v: unknown) => { const n = Number(String(v ?? 0).replace(/\s/g, "").replace(",", ".")); return Number.isFinite(n) ? Math.round(n * 100) : 0; };
+const monthFromDate = (v: unknown) => { const s = String(v ?? "").trim(); const m = s.match(/(20\d{2})[-./](\d{2})/); return m ? `${m[1]}-${m[2]}` : new Date().toISOString().slice(0,7); };
+const codeCandidates = (r: ImportRow) => Array.from(new Set((`${r.title || ""} ${r.code || ""} ${r.source || ""}`.toUpperCase().match(/EL[0-9A-Z]{6,18}/g) || []).map((x) => x.trim())));
+export async function POST(req: NextRequest) {
+  try {
+    const authHeader = req.headers.get("authorization") || ""; const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : ""; if (!token) return NextResponse.json({ error: "Brak tokenu autoryzacji." }, { status: 401 });
+    const adminApp = getAdminApp(); const decoded = await adminApp.auth().verifyIdToken(token); const uid = decoded.uid; const db = getAdminDb();
+    const body = await req.json(); const communityId = String(body?.communityId || "").trim(); const rows = Array.isArray(body?.rows) ? body.rows as ImportRow[] : []; if (!communityId || !rows.length) return NextResponse.json({ error: "Brak communityId albo pusty plik." }, { status: 400 });
+    const userSnap = await db.collection("users").doc(uid).get(); const me = userSnap.data() || {}; const role = String((me as any).role || "").toUpperCase(); const userCommunityId = String((me as any).communityId || (me as any).customerId || "").trim(); if (!["MASTER","ACCOUNTANT","ADMIN"].includes(role)) return NextResponse.json({ error: "Brak uprawnień." }, { status: 403 }); if (userCommunityId && userCommunityId !== communityId) return NextResponse.json({ error: "Inna wspólnota." }, { status: 403 });
+    const [flatsSnap, settlementsSnap, communitySnap] = await Promise.all([db.collection(`communities/${communityId}/flats`).get(), db.collection(`communities/${communityId}/settlements`).get(), db.doc(`communities/${communityId}`).get()]);
+    const flats = flatsSnap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })); const settlements = settlementsSnap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })); const community = communitySnap.data() || {};
+    const settlementByCode = new Map<string, any>(); settlements.forEach((s:any) => { const code = String(s.paymentTitle || s.transferTitle || buildStablePaymentTitle({ communityId, flatId: s.flatId, flatLabel: s.flatLabel, street: s.street, buildingNo: s.buildingNo, apartmentNo: s.apartmentNo, period: s.period })).toUpperCase(); if (code) settlementByCode.set(code, s); });
+    let matched = 0; let unmatched = 0; const details:string[]=[];
+    for (const row of rows) {
+      const amountCents = toCents(row.amount); const period = monthFromDate(row.date); const text = `${row.title || ""} ${row.source || ""} ${row.payerName || ""} ${row.payerAddress || ""}`; const normalized = normalize(text); const codes = codeCandidates(row); let settlement:any=null; let flat:any=null; let confidence=0; let matchReason="Brak pewnego dopasowania.";
+      for (const code of codes) { if (settlementByCode.has(code)) { settlement = settlementByCode.get(code); flat = flats.find((f:any) => f.id === settlement.flatId) || null; confidence = 0.99; matchReason = `Dopasowanie po kodzie ${code}.`; break; } }
+      if (!settlement) {
+        let bestScore = 0;
+        for (const candidate of settlements) {
+          const candidateFlat = flats.find((f:any) => f.id === candidate.flatId) || null; const candidateCode = String(candidate.paymentTitle || candidate.transferTitle || "").toUpperCase(); const flatLabel = normalize(candidate.flatLabel || `${candidate.street || candidateFlat?.street || ""} ${candidate.buildingNo || candidateFlat?.buildingNo || ""}/${candidate.apartmentNo || candidateFlat?.apartmentNo || ""}`); const resident = normalize(candidate.residentName || candidateFlat?.residentName || candidateFlat?.displayName || `${candidateFlat?.name || ""} ${candidateFlat?.surname || ""}`);
+          let score = 0; if (candidateCode && String(text).toUpperCase().includes(candidateCode)) score += 8; if (flatLabel && normalized.includes(flatLabel)) score += 6; if (resident && normalized.includes(resident)) score += 3; if (String(candidate.period || "") === period) score += 2; const due = Number(candidate.totalDueCents || candidate.balanceCents || 0); if (due > 0 && Math.abs(due - amountCents) <= 5) score += 4; if (due > 0 && Math.abs(due - amountCents) <= 100) score += 2; if (score > bestScore) { bestScore = score; settlement = candidate; flat = candidateFlat; } }
+        if (settlement && bestScore >= 8) { confidence = Math.min(0.96, 0.45 + bestScore / 20); matchReason = "Dopasowanie po tytule / lokalu / nazwisku / kwocie."; } else if (settlement && bestScore >= 5) { confidence = 0.68; matchReason = "Dopasowanie częściowe — wymaga sprawdzenia."; } else { settlement = null; flat = null; }
+      }
+      const paymentRef = db.collection(`communities/${communityId}/payments`).doc(); const base:any = { communityId, date: String(row.date || ""), title: String(row.title || "").trim(), source: String(row.source || "").trim(), code: codes[0] || String(row.code || "").trim(), payerName: String(row.payerName || "").trim(), payerAddress: String(row.payerAddress || "").trim(), amountCents, amount: amountCents / 100, period, createdAtMs: Date.now(), updatedAtMs: Date.now() };
+      if (settlement && flat && confidence >= 0.84) {
+        matched += 1; await paymentRef.set({ ...base, matched: true, status: "MATCHED", matchedBy: confidence >= 0.98 ? "CODE" : "HEURISTIC", matchedAtMs: Date.now(), confidence, matchReason, flatId: flat.id, settlementId: settlement.id, residentName: settlement.residentName || flat.residentName || flat.displayName || `${flat.name || ""} ${flat.surname || ""}`.trim(), flatLabel: settlement.flatLabel || flat.flatLabel || `${flat.street || ""} ${flat.buildingNo || ""}/${flat.apartmentNo || ""}`.trim() }, { merge: true });
+        const prevPayments = Number(settlement.totalPaymentsCents || settlement.paymentsCents || 0); const totalCharges = Number(settlement.totalChargesCents || settlement.chargesCents || 0); const nextPayments = prevPayments + amountCents;
+        await db.doc(`communities/${communityId}/settlements/${settlement.id}`).set({ accountNumber: settlement.accountNumber || community.defaultAccountNumber || community.accountNumber || "", transferName: settlement.transferName || community.recipientName || community.name || "", transferAddress: settlement.transferAddress || community.recipientAddress || "", paymentTitle: settlement.paymentTitle || buildStablePaymentTitle({ communityId, flatId: flat.id, flatLabel: flat.flatLabel, street: flat.street, buildingNo: flat.buildingNo, apartmentNo: flat.apartmentNo, period }), transferTitle: settlement.transferTitle || settlement.paymentTitle || buildStablePaymentTitle({ communityId, flatId: flat.id, flatLabel: flat.flatLabel, street: flat.street, buildingNo: flat.buildingNo, apartmentNo: flat.apartmentNo, period }), totalPaymentsCents: nextPayments, paymentsCents: nextPayments, balanceCents: totalCharges - nextPayments, updatedAtMs: Date.now() }, { merge: true });
+        details.push(`Dopasowano: ${base.title || "wpłata"} → ${settlement.flatLabel || flat.flatLabel || flat.id}.`);
+      } else {
+        unmatched += 1; await paymentRef.set({ ...base, matched: false, status: "REVIEW", matchedBy: "REVIEW", confidence, aiSuggestion: settlement ? { flatId: flat?.id || null, settlementId: settlement.id, confidence, reason: matchReason, needsReview: true } : null, matchReason }, { merge: true });
+        await db.collection(`communities/${communityId}/reviewQueue`).add({ type: "PAYMENT_IMPORT_REVIEW", status: "OPEN", createdAtMs: Date.now(), paymentId: paymentRef.id, paymentTitle: base.title, amountCents, confidence, reason: matchReason, proposed: settlement ? { flatId: flat?.id || "", settlementId: settlement.id, flatLabel: settlement.flatLabel || flat?.flatLabel || "" } : null });
+        details.push(`Review: ${base.title || "wpłata"}.`);
+      }
+    }
+    return NextResponse.json({ ok: true, matched, unmatched, details });
+  } catch (error:any) { return NextResponse.json({ error: error?.message || "Błąd importu przelewów." }, { status: 500 }); }
+}
