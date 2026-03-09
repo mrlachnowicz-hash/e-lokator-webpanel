@@ -21,6 +21,7 @@ try {
 }
 
 const db = admin.firestore();
+const RUNTIME_FIX_VERSION = "2026-03-09-r4";
 
 // =========================================================
 // BASIC HELPERS
@@ -1148,6 +1149,7 @@ async function recalcSettlement(communityId, flatId, period) {
     paymentTitle: paymentRef,
     paymentCode: paymentRef,
     transferTitle: paymentRef,
+    runtimeFixVersion: RUNTIME_FIX_VERSION,
     totalChargesCents,
     chargesCents: totalChargesCents,
     totalPaymentsCents,
@@ -1264,7 +1266,8 @@ exports.approveInvoice = onCall(async (request) => {
     status: "ZATWIERDZONA",
     approvedAtMs: nowMs(),
     approvedByUid: request.auth.uid,
-    assigned: { scope, streetId: streetId || null, buildingId: buildingId || null, staircaseId: staircaseId || null, flatId: flatId || null, category, period }
+    assigned: { scope, streetId: streetId || null, buildingId: buildingId || null, staircaseId: staircaseId || null, flatId: flatId || null, category, period },
+    approvalRuntimeVersion: RUNTIME_FIX_VERSION
   }, { merge: true });
 
   const targetFlats = await resolveFlatsForScope(communityId, scope, { streetId, buildingId, staircaseId, flatId }, parsed);
@@ -1310,7 +1313,7 @@ exports.approveInvoice = onCall(async (request) => {
     await recalcSettlement(communityId, affectedFlatId, period);
   }
 
-  return { ok: true, chargesCreated: createdCharges.length, affectedFlatIds, scope };
+  return { ok: true, chargesCreated: createdCharges.length, affectedFlatIds, scope, runtimeFixVersion: RUNTIME_FIX_VERSION };
 });
 
 exports.rebuildSettlementsForPeriod = onCall(async (request) => {
