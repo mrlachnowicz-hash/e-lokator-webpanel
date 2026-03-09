@@ -71,27 +71,35 @@ function parseXmlToRows(xmlText: string): any[] {
   const errorNode = xml.querySelector("parsererror");
   if (errorNode) throw new Error("Nie udało się odczytać XML.");
 
-  const rowNodes = Array.from(xml.querySelectorAll("row, item, flat, lokal, mieszkanie, resident, lokator, entry, rekord"));
-  const rows = rowNodes.map((node) => {
+  const tag = (name: string) => name.toLowerCase();
+  const nodeChildrenToObject = (node: Element) => {
     const obj: Record<string, string> = {};
     Array.from(node.children).forEach((child) => {
-      obj[child.tagName] = child.textContent?.trim() || "";
+      obj[tag(child.tagName)] = child.textContent?.trim() || "";
     });
     return obj;
-  }).filter((row) => Object.keys(row).length > 0);
-
+  };
+  const candidateNames = new Set(["row", "item", "flat", "local", "lokal", "mieszkanie", "resident", "lokator", "entry", "rekord"]);
+  const rowNodes = Array.from(xml.getElementsByTagName("*")).filter((node) => candidateNames.has(tag(node.tagName)));
+  const rows = rowNodes.map((node) => nodeChildrenToObject(node)).filter((row) => Object.keys(row).length > 0);
   if (rows.length) return rows;
 
-  const flatNodes = Array.from(xml.querySelectorAll("Flat, Lokal, Mieszkanie"));
+  const textOf = (node: Element, names: string[]) => {
+    for (const child of Array.from(node.children)) {
+      if (names.includes(tag(child.tagName))) return child.textContent?.trim() || "";
+    }
+    return "";
+  };
+  const flatNodes = Array.from(xml.getElementsByTagName("*")).filter((node) => ["flat", "local", "lokal", "mieszkanie"].includes(tag(node.tagName)));
   return flatNodes.map((node) => ({
-    street: node.querySelector("Street, Ulica")?.textContent || "",
-    buildingNo: node.querySelector("BuildingNo, Budynek, NumerBudynku")?.textContent || "",
-    apartmentNo: node.querySelector("ApartmentNo, LokalNo, NumerLokalu")?.textContent || "",
-    firstName: node.querySelector("FirstName, Imie")?.textContent || "",
-    lastName: node.querySelector("LastName, Nazwisko")?.textContent || "",
-    email: node.querySelector("Email")?.textContent || "",
-    phone: node.querySelector("Phone, Telefon")?.textContent || "",
-    areaM2: node.querySelector("AreaM2, Metraz")?.textContent || "",
+    street: textOf(node, ["street", "ulica"]),
+    buildingNo: textOf(node, ["buildingno", "building", "budynek", "numerbudynku"]),
+    apartmentNo: textOf(node, ["apartmentno", "lokalno", "numerlokalu", "flatnumber"]),
+    firstName: textOf(node, ["firstname", "imie", "imię"]),
+    lastName: textOf(node, ["lastname", "nazwisko"]),
+    email: textOf(node, ["email", "mail"]),
+    phone: textOf(node, ["phone", "telefon", "tel"]),
+    areaM2: textOf(node, ["aream2", "metraz", "metraż", "m2"]),
   }));
 }
 

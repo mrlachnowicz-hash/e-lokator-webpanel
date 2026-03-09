@@ -6,7 +6,11 @@ type ImportRow = { date?: string; title?: string; amount?: string | number; sour
 const normalize = (v: unknown) => String(v ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
 const toCents = (v: unknown) => { const n = Number(String(v ?? 0).replace(/\s/g, "").replace(",", ".")); return Number.isFinite(n) ? Math.round(n * 100) : 0; };
 const monthFromDate = (v: unknown) => { const s = String(v ?? "").trim(); const m = s.match(/(20\d{2})[-./](\d{2})/); return m ? `${m[1]}-${m[2]}` : new Date().toISOString().slice(0,7); };
-const codeCandidates = (r: ImportRow) => Array.from(new Set((`${r.title || ""} ${r.code || ""} ${r.source || ""}`.toUpperCase().match(/EL[0-9A-Z]{6,18}/g) || []).map((x) => x.trim())));
+const codeCandidates = (r: ImportRow) => {
+  const text = `${r.title || ""} ${r.code || ""} ${r.source || ""}`.toUpperCase();
+  const matches = text.match(/[A-Z]{2}-\d{3}-\d{3}-\d{3}-\d{4}-\d{2}/g) || [];
+  return Array.from(new Set(matches.map((x) => x.trim())));
+};
 export async function POST(req: NextRequest) {
   try {
     const authHeader = req.headers.get("authorization") || ""; const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : ""; if (!token) return NextResponse.json({ error: "Brak tokenu autoryzacji." }, { status: 401 });

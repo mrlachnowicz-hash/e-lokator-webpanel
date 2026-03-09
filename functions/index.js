@@ -105,11 +105,11 @@ function shortHash(input) {
 
 function buildPaymentTitle(flat, period) {
   const periodLabel = safeString(period || "0000-00").match(/^(\d{4}-\d{2})/)?.[1] || "0000-00";
-  const apt = safeString(flat?.apartmentNo || flat?.flatNumber || flat?.flatLabel || flat?.id || "0").replace(/[^0-9A-Z]/gi, "").slice(-3).padStart(3, "0");
-  const seed = [safeString(flat?.communityId || "COMM"), safeString(flat?.id || flat?.flatId || paymentCodeForFlat(flat) || "LOKAL"), safeString(flat?.street || ""), safeString(flat?.buildingNo || ""), safeString(flat?.apartmentNo || flat?.flatNumber || ""), periodLabel].join("|");
-  const a = shortHash(`A|${seed}`).slice(0, 3);
-  const b = shortHash(`B|${seed}`).slice(0, 3);
-  return `EL-${apt}-${a}-${b}-${periodLabel}`;
+  const seed = [safeString(flat?.communityId || "COMM"), safeString(flat?.id || flat?.flatId || paymentCodeForFlat(flat) || "LOKAL"), safeString(flat?.street || ""), safeString(flat?.buildingNo || ""), safeString(flat?.apartmentNo || flat?.flatNumber || ""), safeString(flat?.flatLabel || ""), periodLabel].join("|");
+  const a = shortHash(`A|${seed}`).slice(0, 3).padStart(3, "0");
+  const b = shortHash(`B|${seed}`).slice(0, 3).padStart(3, "0");
+  const c = shortHash(`C|${seed}`).slice(0, 3).padStart(3, "0");
+  return `EL-${a}-${b}-${c}-${periodLabel}`;
 }
 
 function getOpenAIClient() {
@@ -1200,8 +1200,11 @@ exports.approveInvoice = onCall(async (request) => {
     return { ok: true, chargesCreated: 1, settlement };
   }
 
-  const flats = await listFlats(communityId, buildingId, streetId);
-  if (flats.length === 0) throw new HttpsError("failed-precondition", "Brak lokali do rozbicia.");
+  let flats = await listFlats(communityId, buildingId, streetId);
+  if (flats.length === 0 && buildingId) flats = await listFlats(communityId, buildingId, null);
+  if (flats.length === 0 && streetId) flats = await listFlats(communityId, null, streetId);
+  if (flats.length === 0 && ["COMMUNITY", "WSPOLNOTA", "COMMON"].includes(scope)) flats = await listFlats(communityId, null, null);
+  if (flats.length === 0) throw new HttpsError("failed-precondition", "Brak lokali do naliczenia.");
 
   const useArea = flats.some(f => Number(f.areaM2 || 0) > 0);
   const totalWeight = useArea
