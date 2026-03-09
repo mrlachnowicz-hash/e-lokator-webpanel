@@ -47,26 +47,59 @@ function pick(raw: any, keys: string[]) {
 }
 
 function normalizeRow(r: any): Row {
-  const apartmentNo = String(pick(r, ["apartmentNo", "flatNumber", "flatnumber", "nr", "lokal", "flat", "mieszkanie", "nr lokalu"])).trim();
+  const apartmentNo = String(pick(r, ["apartmentNo", "flatNumber", "flatnumber", "nr", "lokal", "flat", "mieszkanie", "nr lokalu", "numerLokalu"])).trim();
   const firstName = String(pick(r, ["firstName", "name", "imie", "imię"])).trim();
   const lastName = String(pick(r, ["lastName", "surname", "nazwisko"])).trim();
   const displayName = String(pick(r, ["displayName", "residentName", "mieszkaniec"])).trim();
   const areaRaw = pick(r, ["areaM2", "metraz", "metraż", "m2", "area"]);
   return {
     street: String(pick(r, ["street", "ulica"])).trim(),
-    buildingNo: String(pick(r, ["buildingNo", "nr budynku", "building", "budynek"])).trim(),
+    buildingNo: String(pick(r, ["buildingNo", "nr budynku", "building", "budynek", "numerBudynku"])).trim(),
     apartmentNo,
     firstName,
     lastName,
     displayName,
     email: String(pick(r, ["email", "mail"])).trim(),
     phone: String(pick(r, ["phone", "telefon", "tel"])).trim(),
-    areaM2: areaRaw !== "" ? Number(areaRaw) : undefined,
+    areaM2: areaRaw !== "" ? Number(String(areaRaw).replace(",", ".")) : undefined,
   };
+}
+
+function parseXmlToRows(xmlText: string): any[] {
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(xmlText, "application/xml");
+  const errorNode = xml.querySelector("parsererror");
+  if (errorNode) throw new Error("Nie udało się odczytać XML.");
+
+  const rowNodes = Array.from(xml.querySelectorAll("row, item, flat, lokal, mieszkanie, resident, lokator, entry, rekord"));
+  const rows = rowNodes.map((node) => {
+    const obj: Record<string, string> = {};
+    Array.from(node.children).forEach((child) => {
+      obj[child.tagName] = child.textContent?.trim() || "";
+    });
+    return obj;
+  }).filter((row) => Object.keys(row).length > 0);
+
+  if (rows.length) return rows;
+
+  const flatNodes = Array.from(xml.querySelectorAll("Flat, Lokal, Mieszkanie"));
+  return flatNodes.map((node) => ({
+    street: node.querySelector("Street, Ulica")?.textContent || "",
+    buildingNo: node.querySelector("BuildingNo, Budynek, NumerBudynku")?.textContent || "",
+    apartmentNo: node.querySelector("ApartmentNo, LokalNo, NumerLokalu")?.textContent || "",
+    firstName: node.querySelector("FirstName, Imie")?.textContent || "",
+    lastName: node.querySelector("LastName, Nazwisko")?.textContent || "",
+    email: node.querySelector("Email")?.textContent || "",
+    phone: node.querySelector("Phone, Telefon")?.textContent || "",
+    areaM2: node.querySelector("AreaM2, Metraz")?.textContent || "",
+  }));
 }
 
 async function readSheetFile(file: File) {
   const lower = file.name.toLowerCase();
+  if (lower.endsWith(".xml")) {
+    return parseXmlToRows(await file.text());
+  }
   if (lower.endsWith(".csv")) {
     const bytes = new Uint8Array(await file.arrayBuffer());
     const utf8 = new TextDecoder("utf-8").decode(bytes);
@@ -118,9 +151,8 @@ export default function ImportPage() {
       });
       const list = Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name, "pl"));
       setStreets(list);
-      if (!streetId && list[0]) setStreetId(list[0].id);
     })();
-  }, [communityId, streetId]);
+  }, [communityId]);
 
   const selectedStreet = streets.find((s) => s.id === streetId)?.name || "";
   const csvHasStreet = rows.some((r) => !!r.street);
@@ -134,12 +166,12 @@ export default function ImportPage() {
       <div style={{ padding: 24, display: "grid", gap: 16, maxWidth: 1100 }}>
         <h2>Import lokali</h2>
         <p style={{ opacity: 0.75 }}>
-          CSV/XLSX może zawierać pełne dane: street, buildingNo, apartmentNo, firstName, lastName, displayName, email, phone, areaM2.
+          Obsługiwane formaty: CSV, XLSX, XLS, XML. Plik może zawierać pełne dane: street, buildingNo, apartmentNo, firstName, lastName, displayName, email, phone, areaM2.
           Jeśli w pliku nie ma ulicy albo numeru budynku, panel użyje wartości wybranych ręcznie poniżej.
         </p>
         <div className="formRow" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
           <select className="select" value={streetId} onChange={(e) => setStreetId(e.target.value)}>
-            <option value="">Wybierz ulicę</option>
+            <option value="">Wybierz ulicę ręcznie tylko gdy plik jej nie zawiera</option>
             {streets.map((s) => (
               <option key={s.id} value={s.id}>{s.name}</option>
             ))}
@@ -147,7 +179,7 @@ export default function ImportPage() {
           <input className="input" placeholder="Nr budynku" value={buildingNo} onChange={(e) => setBuildingNo(e.target.value)} />
           <input
             type="file"
-            accept=".csv,.xlsx,.xls"
+            accept=".csv,.xlsx,.xls,.xml"
             onChange={async (e) => {
               const file = e.target.files?.[0];
               if (!file) return;
@@ -155,13 +187,18 @@ export default function ImportPage() {
               setErr(null);
               setDetails([]);
               setFileName(file.name);
-              const json = await readSheetFile(file);
-              setRows((json as any[]).map(normalizeRow).filter((r) => !!r.apartmentNo));
+              try {
+                const json = await readSheetFile(file);
+                setRows((json as any[]).map(normalizeRow).filter((r) => !!r.apartmentNo));
+              } catch (error: any) {
+                setRows([]);
+                setErr(error?.message || "Nie udało się odczytać pliku importu.");
+              }
             }}
           />
         </div>
 
-        {fileName ? <div style={{ opacity: 0.8, fontSize: 14 }}>Plik: <strong>{fileName}</strong>. CSV ma własną ulicę: <strong>{csvHasStreet ? "tak" : "nie"}</strong>, własny numer budynku: <strong>{csvHasBuilding ? "tak" : "nie"}</strong>.</div> : null}
+        {fileName ? <div style={{ opacity: 0.8, fontSize: 14 }}>Plik: <strong>{fileName}</strong>. Zawiera własną ulicę: <strong>{csvHasStreet ? "tak" : "nie"}</strong>, własny numer budynku: <strong>{csvHasBuilding ? "tak" : "nie"}</strong>.</div> : null}
 
         {preview.length > 0 && (
           <div className="card">

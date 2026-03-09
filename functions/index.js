@@ -104,9 +104,12 @@ function shortHash(input) {
 }
 
 function buildPaymentTitle(flat, period) {
-  const compactPeriod = safeString(period).replace(/[^0-9]/g, "").slice(2, 6) || "0000";
-  const seed = [safeString(flat?.communityId || "COMM"), safeString(flat?.id || flat?.flatId || paymentCodeForFlat(flat) || "LOKAL"), safeString(period || "0000-00")].join("|");
-  return `EL-${compactPeriod}-${shortHash(seed)}`;
+  const periodLabel = safeString(period || "0000-00").match(/^(\d{4}-\d{2})/)?.[1] || "0000-00";
+  const apt = safeString(flat?.apartmentNo || flat?.flatNumber || flat?.flatLabel || flat?.id || "0").replace(/[^0-9A-Z]/gi, "").slice(-3).padStart(3, "0");
+  const seed = [safeString(flat?.communityId || "COMM"), safeString(flat?.id || flat?.flatId || paymentCodeForFlat(flat) || "LOKAL"), safeString(flat?.street || ""), safeString(flat?.buildingNo || ""), safeString(flat?.apartmentNo || flat?.flatNumber || ""), periodLabel].join("|");
+  const a = shortHash(`A|${seed}`).slice(0, 3);
+  const b = shortHash(`B|${seed}`).slice(0, 3);
+  return `EL-${apt}-${a}-${b}-${periodLabel}`;
 }
 
 function getOpenAIClient() {

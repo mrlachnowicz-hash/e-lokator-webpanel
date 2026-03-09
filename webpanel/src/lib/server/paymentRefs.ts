@@ -1,3 +1,5 @@
+import crypto from "crypto";
+
 export function normalizePlain(value: unknown) {
   return String(value ?? "")
     .normalize("NFD")
@@ -7,17 +9,22 @@ export function normalizePlain(value: unknown) {
 }
 
 export function shortHash(input: string) {
-  let hash = 0;
-  const src = String(input || "X");
-  for (let i = 0; i < src.length; i += 1) hash = ((hash << 5) - hash + src.charCodeAt(i)) | 0;
-  return Math.abs(hash).toString(36).toUpperCase().padStart(6, "0").slice(0, 6);
+  return crypto.createHash("sha256").update(String(input || "X")).digest("hex").toUpperCase().slice(0, 6);
+}
+
+function randomTripletFromSeed(seed: string, salt: string) {
+  const hex = crypto.createHash("sha256").update(`${salt}|${seed}`).digest("hex");
+  const num = parseInt(hex.slice(0, 8), 16) % 1000;
+  return String(num).padStart(3, "0");
 }
 
 export function buildStablePaymentTitle(input: { communityId?: string; flatId?: string; street?: string; buildingNo?: string; apartmentNo?: string; flatLabel?: string; period?: string; }) {
-  const period = String(input.period || "").replace(/[^0-9]/g, "").slice(2, 6) || "0000";
-  const localPart = normalizePlain(input.apartmentNo || input.flatLabel || input.flatId || "L").slice(-4) || "L";
-  const seed = [input.communityId || "", input.flatId || "", input.street || "", input.buildingNo || "", input.apartmentNo || "", input.period || ""].join("|");
-  return `EL${period}${localPart}${shortHash(seed)}`.slice(0, 18);
+  const apartmentPart = normalizePlain(input.apartmentNo || input.flatLabel || input.flatId || "0").slice(-3).padStart(3, "0");
+  const period = String(input.period || "0000-00").match(/^(\d{4}-\d{2})/)?.[1] || "0000-00";
+  const seed = [input.communityId || "COMM", input.flatId || "", input.street || "", input.buildingNo || "", input.apartmentNo || "", period].join("|");
+  const randA = randomTripletFromSeed(seed, "A");
+  const randB = randomTripletFromSeed(seed, "B");
+  return `EL-${apartmentPart}-${randA}-${randB}-${period}`;
 }
 
 export function normalizeAccountNumber(value: unknown) {

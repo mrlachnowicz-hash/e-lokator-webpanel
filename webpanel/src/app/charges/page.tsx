@@ -7,6 +7,7 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
+import { buildStablePaymentTitle, normalizeAccountNumber } from "../../lib/server/paymentRefs";
 
 type Settlement = any;
 type Flat = any;
@@ -19,15 +20,16 @@ function monthLabel(period: string) {
   if (!m) return period || "bez daty";
   return `${names[Number(m[2]) - 1] || m[2]} ${m[1]}`;
 }
-function hashCode(input: string) {
-  let hash = 0;
-  for (let i = 0; i < input.length; i += 1) hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
-  return Math.abs(hash).toString(36).toUpperCase().padStart(6, "0").slice(0, 6);
-}
 function buildTransferTitle(flat: any, settlement: any) {
-  const period = String(settlement?.period || new Date().toISOString().slice(0, 7)).replace(/[^0-9]/g, "").slice(2, 6) || "0000";
-  const seed = [settlement?.communityId || "COMM", flat?.id || settlement?.flatId || "FLAT", settlement?.period || "0000-00"].join("|");
-  return `EL-${period}-${hashCode(seed)}`;
+  return buildStablePaymentTitle({
+    communityId: settlement?.communityId || flat?.communityId || "",
+    flatId: flat?.id || settlement?.flatId || "",
+    street: flat?.street || settlement?.street || "",
+    buildingNo: flat?.buildingNo || settlement?.buildingNo || "",
+    apartmentNo: flat?.apartmentNo || settlement?.apartmentNo || "",
+    flatLabel: flat?.flatLabel || settlement?.flatLabel || "",
+    period: settlement?.period || new Date().toISOString().slice(0, 7),
+  });
 }
 
 export default function ChargesPage() {
@@ -62,7 +64,7 @@ export default function ChargesPage() {
   const archivedGroups = useMemo(() => archived.reduce((acc: Record<string, Settlement[]>, item) => { const key = String(item.archiveMonth || item.period || "bez-daty"); (acc[key] ||= []).push(item); return acc; }, {}), [archived]);
 
   const saveDefaults = async () => {
-    const cleanAccount = defaults.defaultAccountNumber.trim();
+    const cleanAccount = normalizeAccountNumber(defaults.defaultAccountNumber);
     const cleanName = defaults.recipientName.trim();
     const cleanAddress = defaults.recipientAddress.trim();
     const payload = {
@@ -76,6 +78,11 @@ export default function ChargesPage() {
       recipientAddress: cleanAddress,
       receiverAddress: cleanAddress,
       transferAddress: cleanAddress,
+      paymentSettings: {
+        accountNumber: cleanAccount,
+        recipientName: cleanName,
+        recipientAddress: cleanAddress,
+      },
       paymentDefaults: {
         accountNumber: cleanAccount,
         recipientName: cleanName,
@@ -159,8 +166,8 @@ function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = fal
   const savePaymentData = async () => {
     const cleanTitle = transferTitle.trim() || buildTransferTitle(flat, s);
     const payload = {
-      accountNumber: accountNumber.trim(),
-      bankAccount: accountNumber.trim(),
+      accountNumber: normalizeAccountNumber(accountNumber),
+      bankAccount: normalizeAccountNumber(accountNumber),
       transferName: transferName.trim(),
       receiverName: transferName.trim(),
       transferAddress: transferAddress.trim(),
@@ -173,8 +180,8 @@ function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = fal
     await updateDoc(doc(db, "communities", communityId, "settlements", s.id), payload);
     if (flat?.id) {
       await setDoc(doc(db, "communities", communityId, "flats", flat.id), {
-        accountNumber: accountNumber.trim(),
-        bankAccount: accountNumber.trim(),
+        accountNumber: normalizeAccountNumber(accountNumber),
+        bankAccount: normalizeAccountNumber(accountNumber),
         recipientName: transferName.trim(),
         receiverName: transferName.trim(),
         recipientAddress: transferAddress.trim(),
