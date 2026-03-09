@@ -7,7 +7,7 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
-import { buildStablePaymentTitle, normalizeAccountNumber } from "../../lib/server/paymentRefs";
+import { buildStablePaymentTitle, normalizeAccountNumber, normalizePaymentRef } from "../../lib/server/paymentRefs";
 
 type Settlement = any;
 type Flat = any;
@@ -30,6 +30,15 @@ function buildTransferTitle(flat: any, settlement: any) {
     flatLabel: flat?.flatLabel || settlement?.flatLabel || "",
     period: settlement?.period || new Date().toISOString().slice(0, 7),
   });
+}
+
+function validAccountNumber(value: any) {
+  const digits = normalizeAccountNumber(value);
+  return digits.length >= 10 && !/^0+$/.test(digits);
+}
+function pickSettlementTitle(settlement: any, flat: any) {
+  const current = normalizePaymentRef(settlement?.paymentRef || settlement?.transferTitle || settlement?.paymentTitle || settlement?.paymentCode || "");
+  return current || buildTransferTitle(flat, settlement);
 }
 
 export default function ChargesPage() {
@@ -91,6 +100,24 @@ export default function ChargesPage() {
       updatedAtMs: Date.now(),
     };
     await setDoc(doc(db, "communities", communityId), payload, { merge: true });
+    const batch = writeBatch(db);
+    drafts.forEach((draft) => {
+      const flat = flats[draft.flatId] || null;
+      batch.set(doc(db, "communities", communityId, "settlements", draft.id), {
+        accountNumber: cleanAccount,
+        bankAccount: cleanAccount,
+        transferName: cleanName,
+        receiverName: cleanName,
+        transferAddress: cleanAddress,
+        receiverAddress: cleanAddress,
+        transferTitle: pickSettlementTitle(draft, flat),
+        paymentTitle: pickSettlementTitle(draft, flat),
+        paymentRef: pickSettlementTitle(draft, flat),
+        paymentCode: pickSettlementTitle(draft, flat),
+        updatedAtMs: Date.now(),
+      }, { merge: true });
+    });
+    await batch.commit();
     setDefaults({ defaultAccountNumber: cleanAccount, recipientName: cleanName, recipientAddress: cleanAddress });
     setMsg("Zapisano domyślne dane do przelewu.");
   };
@@ -151,10 +178,10 @@ export default function ChargesPage() {
 }
 
 function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = false, buildTransferTitle }: { s: Settlement; communityId: string; flat: Flat | null; setMsg: (v: string) => void; defaults: any; archived?: boolean; buildTransferTitle: (flat: any, settlement: any) => string; }) {
-  const computedAccount = String(s.accountNumber || s.bankAccount || flat?.accountNumber || flat?.bankAccount || defaults.defaultAccountNumber || "");
+  const computedAccount = String(validAccountNumber(s.accountNumber || s.bankAccount) ? (s.accountNumber || s.bankAccount) : (validAccountNumber(flat?.accountNumber || flat?.bankAccount) ? (flat?.accountNumber || flat?.bankAccount) : (defaults.defaultAccountNumber || "")));
   const computedName = String(s.transferName || s.receiverName || flat?.recipientName || flat?.receiverName || defaults.recipientName || "");
   const computedAddress = String(s.transferAddress || s.receiverAddress || flat?.recipientAddress || flat?.receiverAddress || defaults.recipientAddress || "");
-  const computedTitle = String(s.transferTitle || s.paymentTitle || buildTransferTitle(flat, s));
+  const computedTitle = String(pickSettlementTitle(s, flat));
   const [accountNumber, setAccountNumber] = useState(computedAccount);
   const [transferName, setTransferName] = useState(computedName);
   const [transferAddress, setTransferAddress] = useState(computedAddress);
@@ -164,7 +191,7 @@ function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = fal
   useEffect(() => { setTransferAddress(computedAddress); }, [computedAddress, s.id]);
   useEffect(() => { setTransferTitle(computedTitle); }, [computedTitle, s.id]);
   const savePaymentData = async () => {
-    const cleanTitle = transferTitle.trim() || buildTransferTitle(flat, s);
+    const cleanTitle = normalizePaymentRef(transferTitle) || buildTransferTitle(flat, s);
     const payload = {
       accountNumber: normalizeAccountNumber(accountNumber),
       bankAccount: normalizeAccountNumber(accountNumber),
@@ -174,6 +201,7 @@ function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = fal
       receiverAddress: transferAddress.trim(),
       transferTitle: cleanTitle,
       paymentTitle: cleanTitle,
+      paymentRef: cleanTitle,
       paymentCode: cleanTitle,
       updatedAtMs: Date.now(),
     };

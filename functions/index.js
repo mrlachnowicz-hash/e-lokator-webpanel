@@ -21,8 +21,7 @@ try {
 }
 
 const db = admin.firestore();
-
-const RUNTIME_FIX_VERSION = "2026-03-09-r5";
+const RUNTIME_FIX_VERSION = "2026-03-09-r6";
 
 // =========================================================
 // BASIC HELPERS
@@ -34,10 +33,6 @@ function nowMs() {
 
 function safeString(v) {
   return String(v || "").trim();
-}
-
-function normKey(v) {
-  return safeString(v).toLowerCase().replace(/\s+/g, " ");
 }
 
 function normalizeStreetName(name) {
@@ -233,14 +228,14 @@ async function listFlats(communityId, buildingId = null, streetId = null) {
   const snap = await db.collection(`communities/${communityId}/flats`).get();
   let rows = snap.docs.map(d => ({ id: d.id, ...d.data() }));
   if (streetId) {
-    const wantedStreet = normKey(streetId);
-    rows = rows.filter((x) => wantedStreet === normKey(x.streetId) || wantedStreet === normKey(x.street));
+    rows = rows.filter((x) => safeString(x.streetId) === safeString(streetId));
   }
   if (buildingId) {
-    const wantedBuilding = normKey(buildingId);
     rows = rows.filter((x) => {
-      const values = [x.buildingId, x.buildingNo, x.building, x.blockNo].map(normKey).filter(Boolean);
-      return values.includes(wantedBuilding);
+      const a = safeString(x.buildingId);
+      const b = safeString(x.buildingNo);
+      const c = safeString(buildingId);
+      return a === c || b === c;
     });
   }
   return rows;
@@ -1172,7 +1167,8 @@ async function recalcSettlement(communityId, flatId, period) {
     status: existing?.isPublished ? "PUBLISHED" : "DRAFT",
     isPublished: existing?.isPublished === true,
     updatedAtMs: nowMs(),
-    createdAtMs: Number(existing?.createdAtMs || nowMs())
+    createdAtMs: Number(existing?.createdAtMs || nowMs()),
+    runtimeFixVersion: RUNTIME_FIX_VERSION
   }, { merge: true });
 
   return { settlementId, paymentRef, totalChargesCents, totalPaymentsCents, balanceCents };
@@ -1188,39 +1184,96 @@ function normalizeInvoiceScope(scope, assignment = {}, parsed = {}, invoice = {}
 }
 
 async function resolveFlatsForScope(communityId, scope, assignment = {}, parsed = {}) {
-  const streetId = safeString(assignment.streetId || parsed.streetId || parsed.street);
-  const buildingId = safeString(assignment.buildingId || parsed.buildingId || parsed.suggestedBuildingId || parsed.buildingNo || parsed.building);
-  const staircaseId = safeString(assignment.staircaseId || parsed.staircaseId || assignment.entranceId || parsed.entranceId || parsed.staircase || parsed.klatka);
-  const flatId = safeString(assignment.flatId || parsed.flatId || parsed.suggestedFlatId || parsed.apartmentId);
+  const allFlats = await listFlats(communityId);
+  const directStreetId = safeString(assignment.streetId || parsed.streetId || parsed.suggestedStreetId);
+  const directBuildingId = safeString(assignment.buildingId || parsed.buildingId || parsed.suggestedBuildingId || parsed.buildingNo);
+  const directStaircaseId = safeString(assignment.staircaseId || parsed.staircaseId || assignment.entranceId || parsed.entranceId);
+  const directFlatId = safeString(assignment.flatId || parsed.flatId || parsed.suggestedFlatId);
+  const hintText = [
+    assignment.reason,
+    parsed.reason,
+    parsed.ocrText,
+    parsed.extractedText,
+    parsed.streetName,
+    parsed.street,
+    parsed.buildingNo,
+    parsed.apartmentNo,
+    parsed.address,
+    parsed.description,
+  ].map(safeString).filter(Boolean).join("\n");
+  const hints = parseAddressHints(hintText);
+  const normalizedStreetId = normalizeStreetName(directStreetId);
+  const normalizedStreetName = normalizeLookup(assignment.streetName || parsed.streetName || parsed.street || hints.streetName);
+  const normalizedBuilding = normalizeBuildingNo(directBuildingId || hints.buildingNo);
+  const normalizedApartment = normalizeBuildingNo(directFlatId ? "" : (assignment.apartmentNo || parsed.apartmentNo || hints.apartmentNo));
+
+  const directFlat = directFlatId ? allFlats.find((f) => safeString(f.id) === directFlatId) : null;
+
+  const filterByAddress = (rows) => rows.filter((flat) => {
+    const flatStreetId = normalizeStreetName(flat.streetId || "");
+    const flatStreetName = normalizeLookup(flat.street || flat.streetName || "");
+    const flatBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId || "");
+    const flatApartment = normalizeBuildingNo(flat.apartmentNo || flat.flatNumber || "");
+    const streetOk = !normalizedStreetId && !normalizedStreetName
+      ? true
+      : (normalizedStreetId && flatStreetId === normalizedStreetId) || (normalizedStreetName && flatStreetName.includes(normalizedStreetName));
+    const buildingOk = !normalizedBuilding ? true : flatBuilding === normalizedBuilding;
+    const apartmentOk = !normalizedApartment ? true : flatApartment === normalizedApartment;
+    return streetOk && buildingOk && apartmentOk;
+  });
 
   if (scope === "FLAT") {
-    const flat = flatId ? await getFlat(communityId, flatId) : null;
-    return flat ? [flat] : [];
+    if (directFlat) return [directFlat];
+    const byAddress = filterByAddress(allFlats);
+    return byAddress.slice(0, 1);
   }
 
   let flats = [];
-  if (scope === "COMMUNITY") {
-    flats = await listFlats(communityId);
-  } else if (scope === "COMMON") {
-    flats = await listFlats(communityId, buildingId || null, streetId || null);
-    if (flats.length === 0 && streetId) flats = await listFlats(communityId, null, streetId);
-    if (flats.length === 0 && buildingId) flats = await listFlats(communityId, buildingId, null);
-    if (flats.length === 0) flats = await listFlats(communityId);
+
+  if (scope === "BUILDING" || scope === "STAIRCASE") {
+    if (directFlat) {
+      flats = allFlats.filter((flat) => {
+        const sameStreet = !safeString(directFlat.streetId) || safeString(flat.streetId) === safeString(directFlat.streetId) || normalizeLookup(flat.street || flat.streetName).includes(normalizeLookup(directFlat.street || directFlat.streetName));
+        const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId) === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId);
+        return sameStreet && sameBuilding;
+      });
+    }
+    if (!flats.length) flats = filterByAddress(allFlats).filter((flat) => !normalizedApartment || true);
+    if (!flats.length && directBuildingId) {
+      flats = allFlats.filter((flat) => normalizeBuildingNo(flat.buildingNo || flat.buildingId) === normalizeBuildingNo(directBuildingId));
+    }
+    if (scope === "STAIRCASE") {
+      const normalizedStair = normalizeLookup(directStaircaseId);
+      if (normalizedStair) {
+        flats = flats.filter((x) => normalizeLookup(x.staircaseId || x.staircase || x.entranceId || x.entrance || x.klatka) === normalizedStair);
+      }
+    }
+  } else if (scope === "COMMUNITY") {
+    flats = allFlats;
   } else {
-    flats = await listFlats(communityId, ["BUILDING", "STAIRCASE"].includes(scope) ? buildingId || null : null, streetId || null);
-    if (flats.length === 0 && buildingId) flats = await listFlats(communityId, buildingId, null);
-    if (flats.length === 0 && streetId) flats = await listFlats(communityId, null, streetId);
+    const lowerHint = normalizeLookup(hintText);
+    const mentionsCommunity = /wspolnot|osiedl|teren wspolny|nieruchomosc wspolna/.test(lowerHint);
+    if (mentionsCommunity) {
+      flats = allFlats;
+    } else if (directFlat) {
+      flats = allFlats.filter((flat) => {
+        const sameStreet = !safeString(directFlat.streetId) || safeString(flat.streetId) === safeString(directFlat.streetId) || normalizeLookup(flat.street || flat.streetName).includes(normalizeLookup(directFlat.street || directFlat.streetName));
+        const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId) === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId);
+        return sameStreet && sameBuilding;
+      });
+    }
+    if (!flats.length) flats = filterByAddress(allFlats).filter((flat) => !normalizedApartment || normalizeBuildingNo(flat.apartmentNo || flat.flatNumber) !== normalizedApartment);
+    if (!flats.length && (normalizedStreetId || normalizedStreetName)) {
+      flats = allFlats.filter((flat) => {
+        const flatStreetId = normalizeStreetName(flat.streetId || "");
+        const flatStreetName = normalizeLookup(flat.street || flat.streetName || "");
+        return (normalizedStreetId && flatStreetId === normalizedStreetId) || (normalizedStreetName && flatStreetName.includes(normalizedStreetName));
+      });
+    }
+    if (!flats.length) flats = allFlats;
   }
 
-  if (scope === "STAIRCASE") {
-    const wanted = normKey(staircaseId);
-    flats = flats.filter((x) => {
-      const a = normKey(x.staircaseId || x.staircase || x.entranceId || x.entrance || x.klatka);
-      return wanted ? a === wanted : !!a;
-    });
-  }
-
-  return flats;
+  return Array.from(new Map(flats.map((x) => [x.id, x])).values());
 }
 
 async function replaceInvoiceCharges(communityId, invoiceId, nextCharges) {
@@ -1288,10 +1341,7 @@ exports.approveInvoice = onCall(async (request) => {
 
   const targetFlats = await resolveFlatsForScope(communityId, scope, { streetId, buildingId, staircaseId, flatId }, parsed);
   if (targetFlats.length === 0) {
-    throw new HttpsError(
-      "failed-precondition",
-      `Brak lokali do naliczenia dla typu kosztu ${scope}. communityId=${communityId} street=${streetId || parsed.street || "-"} building=${buildingId || parsed.buildingNo || "-"} staircase=${staircaseId || "-"} runtime=${RUNTIME_FIX_VERSION}`
-    );
+    throw new HttpsError("failed-precondition", `Brak lokali do naliczenia dla typu kosztu ${scope}. streetId=${streetId || "-"} buildingId=${buildingId || "-"} flatId=${flatId || "-"}`);
   }
 
   const useArea = targetFlats.some(f => Number(f.areaM2 || 0) > 0) && scope !== "FLAT";
@@ -1332,7 +1382,7 @@ exports.approveInvoice = onCall(async (request) => {
     await recalcSettlement(communityId, affectedFlatId, period);
   }
 
-  return { ok: true, chargesCreated: createdCharges.length, affectedFlatIds, scope };
+  return { ok: true, chargesCreated: createdCharges.length, affectedFlatIds, scope, runtimeFixVersion: RUNTIME_FIX_VERSION };
 });
 
 exports.rebuildSettlementsForPeriod = onCall(async (request) => {
