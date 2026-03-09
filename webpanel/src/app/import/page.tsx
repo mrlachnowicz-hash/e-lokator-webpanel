@@ -30,6 +30,7 @@ type ImportResult = {
   skipped?: number;
   invalid?: number;
   duplicateInFile?: number;
+  conflicts?: number;
   details?: string[];
 };
 
@@ -71,36 +72,23 @@ function parseXmlToRows(xmlText: string): any[] {
   const errorNode = xml.querySelector("parsererror");
   if (errorNode) throw new Error("Nie udało się odczytać XML.");
 
-  const tag = (name: string) => name.toLowerCase();
-  const nodeChildrenToObject = (node: Element) => {
+  const toObjects = (nodes: Element[]) => nodes.map((node) => {
     const obj: Record<string, string> = {};
     Array.from(node.children).forEach((child) => {
-      obj[tag(child.tagName)] = child.textContent?.trim() || "";
+      obj[child.tagName] = child.textContent?.trim() || "";
     });
     return obj;
-  };
-  const candidateNames = new Set(["row", "item", "flat", "local", "lokal", "mieszkanie", "resident", "lokator", "entry", "rekord"]);
-  const rowNodes = Array.from(xml.getElementsByTagName("*")).filter((node) => candidateNames.has(tag(node.tagName)));
-  const rows = rowNodes.map((node) => nodeChildrenToObject(node)).filter((row) => Object.keys(row).length > 0);
-  if (rows.length) return rows;
+  }).filter((row) => Object.keys(row).length > 0);
 
-  const textOf = (node: Element, names: string[]) => {
-    for (const child of Array.from(node.children)) {
-      if (names.includes(tag(child.tagName))) return child.textContent?.trim() || "";
-    }
-    return "";
-  };
-  const flatNodes = Array.from(xml.getElementsByTagName("*")).filter((node) => ["flat", "local", "lokal", "mieszkanie"].includes(tag(node.tagName)));
-  return flatNodes.map((node) => ({
-    street: textOf(node, ["street", "ulica"]),
-    buildingNo: textOf(node, ["buildingno", "building", "budynek", "numerbudynku"]),
-    apartmentNo: textOf(node, ["apartmentno", "lokalno", "numerlokalu", "flatnumber"]),
-    firstName: textOf(node, ["firstname", "imie", "imię"]),
-    lastName: textOf(node, ["lastname", "nazwisko"]),
-    email: textOf(node, ["email", "mail"]),
-    phone: textOf(node, ["phone", "telefon", "tel"]),
-    areaM2: textOf(node, ["aream2", "metraz", "metraż", "m2"]),
-  }));
+  const genericNodes = Array.from(xml.querySelectorAll("locals > local, row, item, flat, lokal, mieszkanie, resident, lokator, entry, rekord"));
+  const genericRows = toObjects(genericNodes);
+  if (genericRows.length) return genericRows;
+
+  const allChildren = Array.from(xml.documentElement?.children || []).filter((node) => node.children.length > 0);
+  const fallbackRows = toObjects(allChildren as Element[]);
+  if (fallbackRows.length) return fallbackRows;
+
+  throw new Error("XML nie zawiera rozpoznawalnych rekordów lokali.");
 }
 
 async function readSheetFile(file: File) {
@@ -239,7 +227,7 @@ export default function ImportPage() {
                   });
                   const data: ImportResult = await response.json().catch(() => ({}));
                   if (!response.ok) throw new Error((data as any)?.error || "Błąd importu");
-                  setMsg(`Import zakończony. Utworzono: ${data.created ?? 0}, zaktualizowano: ${data.updated ?? 0}, pominięto: ${data.skipped ?? 0}, nieprawidłowe: ${data.invalid ?? 0}, duplikaty w pliku: ${data.duplicateInFile ?? 0}.`);
+                  setMsg(`Import zakończony. Utworzono: ${data.created ?? 0}, zaktualizowano: ${data.updated ?? 0}, pominięto: ${data.skipped ?? 0}, nieprawidłowe: ${data.invalid ?? 0}, duplikaty w pliku: ${data.duplicateInFile ?? 0}, konflikty: ${data.conflicts ?? 0}.`);
                   setDetails(data.details || []);
                 } catch (e: any) {
                   setErr(e?.message || "Błąd importu");

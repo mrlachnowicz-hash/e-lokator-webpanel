@@ -5,6 +5,7 @@ const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/
 const { XMLParser } = require("fast-xml-parser");
 const PDFDocument = require("pdfkit");
 const nodemailer = require("nodemailer");
+const crypto = require("crypto");
 
 let OpenAI = null;
 let pdfParse = null;
@@ -95,21 +96,46 @@ function paymentCodeForFlat(flat) {
 }
 
 function shortHash(input) {
-  const src = safeString(input || "X");
-  let hash = 0;
-  for (let i = 0; i < src.length; i += 1) {
-    hash = ((hash << 5) - hash + src.charCodeAt(i)) | 0;
-  }
-  return Math.abs(hash).toString(36).toUpperCase().padStart(6, "0").slice(0, 6);
+  return crypto.createHash("sha256").update(safeString(input || "X"), "utf8").digest("hex").toUpperCase().slice(0, 6);
 }
 
-function buildPaymentTitle(flat, period) {
-  const periodLabel = safeString(period || "0000-00").match(/^(\d{4}-\d{2})/)?.[1] || "0000-00";
-  const seed = [safeString(flat?.communityId || "COMM"), safeString(flat?.id || flat?.flatId || paymentCodeForFlat(flat) || "LOKAL"), safeString(flat?.street || ""), safeString(flat?.buildingNo || ""), safeString(flat?.apartmentNo || flat?.flatNumber || ""), safeString(flat?.flatLabel || ""), periodLabel].join("|");
-  const a = shortHash(`A|${seed}`).slice(0, 3).padStart(3, "0");
-  const b = shortHash(`B|${seed}`).slice(0, 3).padStart(3, "0");
-  const c = shortHash(`C|${seed}`).slice(0, 3).padStart(3, "0");
-  return `EL-${a}-${b}-${c}-${periodLabel}`;
+const PAYMENT_REF_REGEX = /\b([A-Z]{2}-\d{3}-\d{3}-\d{3}-20\d{2}-\d{2})\b/i;
+
+function normalizePaymentRef(value) {
+  const input = safeString(value).toUpperCase().replace(/[–—]/g, "-");
+  const direct = input.match(PAYMENT_REF_REGEX);
+  if (direct?.[1]) return direct[1];
+  const relaxed = input.replace(/[^A-Z0-9]/g, " ").replace(/\s+/g, " ").trim().match(/\b([A-Z]{2})\s*(\d{3})\s*(\d{3})\s*(\d{3})\s*(20\d{2})\s*(\d{2})\b/);
+  return relaxed ? `${relaxed[1]}-${relaxed[2]}-${relaxed[3]}-${relaxed[4]}-${relaxed[5]}-${relaxed[6]}` : "";
+}
+
+function extractPaymentRef(value) {
+  return normalizePaymentRef(value);
+}
+
+async function generateUniquePaymentRef(period, prefix = "EL") {
+  const periodMatch = safeString(period || nowMs()).match(/^(20\d{2})-(\d{2})/);
+  const year = periodMatch?.[1] || new Date().toISOString().slice(0, 4);
+  const month = periodMatch?.[2] || new Date().toISOString().slice(5, 7);
+  const head = safeString(prefix || "EL").replace(/[^A-Z0-9]/gi, "").toUpperCase().slice(0, 2).padEnd(2, "X");
+  for (let i = 0; i < 12; i += 1) {
+    const candidate = `${head}-${String(Math.floor(Math.random() * 1000)).padStart(3, "0")}-${String(Math.floor(Math.random() * 1000)).padStart(3, "0")}-${String(Math.floor(Math.random() * 1000)).padStart(3, "0")}-${year}-${month}`;
+    const existing = await db.collectionGroup("settlements").where("paymentRef", "==", candidate).limit(1).get();
+    if (existing.empty) return candidate;
+  }
+  throw new HttpsError("already-exists", "Nie udało się wygenerować unikalnego paymentRef.");
+}
+
+function readCommunityPaymentDefaults(community) {
+  return {
+    accountNumber: safeString(community?.defaultAccountNumber || community?.accountNumber || community?.bankAccount || community?.paymentSettings?.accountNumber || community?.paymentDefaults?.accountNumber),
+    recipientName: safeString(community?.recipientName || community?.receiverName || community?.transferName || community?.paymentSettings?.recipientName || community?.paymentDefaults?.recipientName || community?.name),
+    recipientAddress: safeString(community?.recipientAddress || community?.receiverAddress || community?.transferAddress || community?.paymentSettings?.recipientAddress || community?.paymentDefaults?.recipientAddress),
+  };
+}
+
+async function buildPaymentTitle(flat, period, existingValue = "") {
+  return normalizePaymentRef(existingValue) || await generateUniquePaymentRef(period, "EL");
 }
 
 function getOpenAIClient() {
@@ -1102,10 +1128,14 @@ async function recalcSettlement(communityId, flatId, period) {
   const balanceCents = totalChargesCents - totalPaymentsCents;
 
   const community = await getCommunity(communityId);
+  const defaults = readCommunityPaymentDefaults(community);
   const settlementId = `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
-  const paymentTitle = buildPaymentTitle({ ...flat, id: flatId }, period);
+  const settlementRef = db.doc(`communities/${communityId}/settlements/${settlementId}`);
+  const existingSnap = await settlementRef.get();
+  const existing = existingSnap.exists ? existingSnap.data() : {};
+  const paymentRef = await buildPaymentTitle({ ...flat, id: flatId }, period, existing?.paymentRef || existing?.paymentTitle || existing?.transferTitle || flat?.paymentCode || "");
 
-  await db.doc(`communities/${communityId}/settlements/${settlementId}`).set({
+  await settlementRef.set({
     id: settlementId,
     communityId,
     flatId,
@@ -1114,26 +1144,81 @@ async function recalcSettlement(communityId, flatId, period) {
     buildingNo: flat.buildingNo || "",
     apartmentNo: flat.apartmentNo || "",
     period,
+    paymentRef,
+    paymentTitle: paymentRef,
+    paymentCode: paymentRef,
+    transferTitle: paymentRef,
     totalChargesCents,
+    chargesCents: totalChargesCents,
     totalPaymentsCents,
+    paymentsCents: totalPaymentsCents,
     balanceCents,
     totalDueCents: balanceCents,
     dueDate: `${period}-15`,
-    paymentTitle,
-    paymentCode: paymentTitle,
-    transferTitle: paymentTitle,
-    transferName: valueOr(flat.recipientName, valueOr(community?.recipientName, community?.name)),
-    transferAddress: valueOr(flat.recipientAddress, community?.recipientAddress),
-    accountNumber: valueOr(flat.accountNumber, valueOr(community?.defaultAccountNumber, community?.accountNumber)),
-    residentName: valueOr(flat.name, flat.payerName),
-    residentEmail: valueOr(flat.email, flat.payerEmail),
-    status: "DRAFT",
-    isPublished: false,
+    transferName: valueOr(existing?.transferName, valueOr(flat.recipientName, defaults.recipientName)),
+    receiverName: valueOr(existing?.receiverName, valueOr(flat.receiverName, valueOr(flat.recipientName, defaults.recipientName))),
+    transferAddress: valueOr(existing?.transferAddress, valueOr(flat.recipientAddress, defaults.recipientAddress)),
+    receiverAddress: valueOr(existing?.receiverAddress, valueOr(flat.receiverAddress, valueOr(flat.recipientAddress, defaults.recipientAddress))),
+    accountNumber: valueOr(existing?.accountNumber, valueOr(flat.accountNumber, defaults.accountNumber)),
+    bankAccount: valueOr(existing?.bankAccount, valueOr(existing?.accountNumber, valueOr(flat.bankAccount, valueOr(flat.accountNumber, defaults.accountNumber)))),
+    residentName: valueOr(existing?.residentName, valueOr(flat.displayName, valueOr(flat.name, flat.payerName))),
+    residentEmail: valueOr(existing?.residentEmail, valueOr(flat.email, flat.payerEmail)),
+    status: existing?.isPublished ? "PUBLISHED" : "DRAFT",
+    isPublished: existing?.isPublished === true,
     updatedAtMs: nowMs(),
-    createdAtMs: nowMs()
+    createdAtMs: Number(existing?.createdAtMs || nowMs())
   }, { merge: true });
 
-  return { settlementId, totalChargesCents, totalPaymentsCents, balanceCents };
+  return { settlementId, paymentRef, totalChargesCents, totalPaymentsCents, balanceCents };
+}
+
+function normalizeInvoiceScope(scope, assignment = {}, parsed = {}, invoice = {}) {
+  const raw = safeString(scope || assignment.scope || parsed.scope || invoice.ai?.suggestion?.scope || invoice.ai?.suggestion?.allocationType || "COMMON").toUpperCase();
+  if (["FLAT", "LOCAL", "LOKAL"].includes(raw)) return "FLAT";
+  if (["BUILDING", "BUDYNEK"].includes(raw)) return "BUILDING";
+  if (["STAIRCASE", "KLATKA", "ENTRANCE"].includes(raw)) return "STAIRCASE";
+  if (["COMMUNITY", "WSPOLNOTA"].includes(raw)) return "COMMUNITY";
+  return "COMMON";
+}
+
+async function resolveFlatsForScope(communityId, scope, assignment = {}, parsed = {}) {
+  const streetId = safeString(assignment.streetId || parsed.streetId);
+  const buildingId = safeString(assignment.buildingId || parsed.buildingId || parsed.suggestedBuildingId);
+  const staircaseId = safeString(assignment.staircaseId || parsed.staircaseId || assignment.entranceId || parsed.entranceId);
+  const flatId = safeString(assignment.flatId || parsed.flatId || parsed.suggestedFlatId);
+
+  if (scope === "FLAT") {
+    const flat = flatId ? await getFlat(communityId, flatId) : null;
+    return flat ? [flat] : [];
+  }
+
+  let flats = await listFlats(communityId, ["BUILDING", "STAIRCASE"].includes(scope) ? buildingId || null : null, streetId || null);
+  if (scope === "COMMUNITY") flats = await listFlats(communityId);
+  if (scope === "COMMON" && !buildingId && !streetId) flats = await listFlats(communityId);
+  if (scope === "STAIRCASE") {
+    flats = flats.filter((x) => {
+      const a = safeString(x.staircaseId || x.staircase || x.entranceId || x.entrance || x.klatka);
+      return staircaseId ? a === staircaseId : !!a;
+    });
+  }
+  return flats;
+}
+
+async function replaceInvoiceCharges(communityId, invoiceId, nextCharges) {
+  const previous = await db.collection(`communities/${communityId}/charges`).where("invoiceId", "==", invoiceId).get();
+  const affected = new Set();
+  const batch = db.batch();
+  previous.docs.forEach((doc) => {
+    affected.add(safeString(doc.data().flatId));
+    batch.delete(doc.ref);
+  });
+  nextCharges.forEach((charge) => {
+    const ref = db.collection(`communities/${communityId}/charges`).doc();
+    batch.set(ref, charge);
+    affected.add(safeString(charge.flatId));
+  });
+  await batch.commit();
+  return Array.from(affected).filter(Boolean);
 }
 
 async function recalcAllSettlementsForPeriod(communityId, period) {
@@ -1164,12 +1249,13 @@ exports.approveInvoice = onCall(async (request) => {
   const inv = snap.data();
   const parsed = inv.parsed || {};
   const totalCents = Number(parsed.totalGrossCents || parsed.amountCents || inv.totalGrossCents || inv.amountCents || 0);
-  const period = safeString(assignment.period || parsed.period || inv.ai?.suggestion?.period);
-  const category = safeString(assignment.category || inv.ai?.suggestion?.category || "INNE");
-  const scope = safeString(assignment.scope || inv.ai?.suggestion?.scope || "COMMON");
-  const buildingId = assignment.buildingId || null;
-  const streetId = assignment.streetId || null;
-  const flatId = assignment.flatId || null;
+  const period = safeString(assignment.period || parsed.period || inv.period || inv.ai?.suggestion?.period);
+  const category = safeString(assignment.category || parsed.category || inv.category || inv.ai?.suggestion?.category || "INNE");
+  const scope = normalizeInvoiceScope(assignment.scope, assignment, parsed, inv);
+  const buildingId = safeString(assignment.buildingId || parsed.buildingId || inv.ai?.suggestion?.buildingId);
+  const streetId = safeString(assignment.streetId || parsed.streetId || inv.ai?.suggestion?.streetId);
+  const staircaseId = safeString(assignment.staircaseId || parsed.staircaseId || inv.ai?.suggestion?.staircaseId);
+  const flatId = safeString(assignment.flatId || parsed.flatId || inv.ai?.suggestion?.flatId);
 
   if (!period) throw new HttpsError("invalid-argument", "Brak okresu.");
   if (totalCents <= 0) throw new HttpsError("failed-precondition", "Brak kwoty na fakturze.");
@@ -1178,68 +1264,53 @@ exports.approveInvoice = onCall(async (request) => {
     status: "ZATWIERDZONA",
     approvedAtMs: nowMs(),
     approvedByUid: request.auth.uid,
-    assigned: { scope, streetId, buildingId, flatId, category, period }
+    assigned: { scope, streetId: streetId || null, buildingId: buildingId || null, staircaseId: staircaseId || null, flatId: flatId || null, category, period }
   }, { merge: true });
 
-  if (scope === "FLAT" && flatId) {
-    await db.collection(`communities/${communityId}/charges`).add({
-      createdAtMs: nowMs(),
-      source: "KSEF",
-      invoiceId,
-      flatId,
-      buildingId: buildingId || null,
-      streetId: streetId || null,
-      category,
-      period,
-      amountCents: totalCents,
-      currency: "PLN",
-      status: "OPEN"
-    });
-
-    const settlement = await recalcSettlement(communityId, flatId, period);
-    return { ok: true, chargesCreated: 1, settlement };
+  const targetFlats = await resolveFlatsForScope(communityId, scope, { streetId, buildingId, staircaseId, flatId }, parsed);
+  if (targetFlats.length === 0) {
+    throw new HttpsError("failed-precondition", `Brak lokali do naliczenia dla typu kosztu ${scope}.`);
   }
 
-  let flats = await listFlats(communityId, buildingId, streetId);
-  if (flats.length === 0 && buildingId) flats = await listFlats(communityId, buildingId, null);
-  if (flats.length === 0 && streetId) flats = await listFlats(communityId, null, streetId);
-  if (flats.length === 0 && ["COMMUNITY", "WSPOLNOTA", "COMMON"].includes(scope)) flats = await listFlats(communityId, null, null);
-  if (flats.length === 0) throw new HttpsError("failed-precondition", "Brak lokali do naliczenia.");
-
-  const useArea = flats.some(f => Number(f.areaM2 || 0) > 0);
+  const useArea = targetFlats.some(f => Number(f.areaM2 || 0) > 0) && scope !== "FLAT";
   const totalWeight = useArea
-    ? flats.reduce((s, f) => s + Math.max(0, Number(f.areaM2 || 0)), 0)
-    : flats.length;
+    ? targetFlats.reduce((s, f) => s + Math.max(0, Number(f.areaM2 || 0)), 0)
+    : targetFlats.length;
 
-  const chargeIds = [];
+  const createdCharges = [];
   let allocated = 0;
-
-  for (let i = 0; i < flats.length; i++) {
-    const f = flats[i];
-    const w = useArea ? Math.max(0, Number(f.areaM2 || 0)) : 1;
-    let part = Math.floor((totalCents * w) / totalWeight);
-    if (i === flats.length - 1) part = totalCents - allocated;
+  for (let i = 0; i < targetFlats.length; i += 1) {
+    const f = targetFlats[i];
+    const weight = scope === "FLAT" ? 1 : (useArea ? Math.max(0, Number(f.areaM2 || 0)) : 1);
+    let part = scope === "FLAT" ? totalCents : Math.floor((totalCents * weight) / Math.max(1, totalWeight));
+    if (i === targetFlats.length - 1) part = totalCents - allocated;
     allocated += part;
-
-    const cRef = await db.collection(`communities/${communityId}/charges`).add({
+    createdCharges.push({
       createdAtMs: nowMs(),
-      source: "KSEF",
+      updatedAtMs: nowMs(),
+      source: inv.source || "OCR",
       invoiceId,
       flatId: f.id,
-      buildingId: f.buildingId || f.buildingNo || null,
+      buildingId: f.buildingId || f.buildingNo || buildingId || null,
       streetId: f.streetId || streetId || null,
+      staircaseId: f.staircaseId || f.staircase || f.entranceId || staircaseId || null,
       category,
       period,
       amountCents: part,
       currency: "PLN",
-      status: "OPEN"
+      status: "OPEN",
+      scope,
+      costTarget: scope === "FLAT" ? "flat" : scope === "BUILDING" ? "building" : scope === "STAIRCASE" ? "buildingCharges" : scope === "COMMUNITY" ? "community" : "buildingCharges",
+      allocationMethod: scope === "FLAT" ? "DIRECT" : (useArea ? "AREA" : "EQUAL"),
     });
-
-    chargeIds.push(cRef.id);
-    await recalcSettlement(communityId, f.id, period);
   }
 
-  return { ok: true, chargesCreated: chargeIds.length, chargeIds };
+  const affectedFlatIds = await replaceInvoiceCharges(communityId, invoiceId, createdCharges);
+  for (const affectedFlatId of affectedFlatIds) {
+    await recalcSettlement(communityId, affectedFlatId, period);
+  }
+
+  return { ok: true, chargesCreated: createdCharges.length, affectedFlatIds, scope };
 });
 
 exports.rebuildSettlementsForPeriod = onCall(async (request) => {

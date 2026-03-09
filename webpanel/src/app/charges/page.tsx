@@ -67,7 +67,6 @@ export default function ChargesPage() {
     const cleanAccount = normalizeAccountNumber(defaults.defaultAccountNumber);
     const cleanName = defaults.recipientName.trim();
     const cleanAddress = defaults.recipientAddress.trim();
-    const now = Date.now();
     const payload = {
       defaultAccountNumber: cleanAccount,
       accountNumber: cleanAccount,
@@ -89,24 +88,11 @@ export default function ChargesPage() {
         recipientName: cleanName,
         recipientAddress: cleanAddress,
       },
-      updatedAtMs: now,
+      updatedAtMs: Date.now(),
     };
     await setDoc(doc(db, "communities", communityId), payload, { merge: true });
-    const batch = writeBatch(db);
-    drafts.forEach((item) => {
-      batch.set(doc(db, "communities", communityId, "settlements", item.id), {
-        accountNumber: cleanAccount,
-        bankAccount: cleanAccount,
-        transferName: cleanName,
-        receiverName: cleanName,
-        transferAddress: cleanAddress,
-        receiverAddress: cleanAddress,
-        updatedAtMs: now,
-      }, { merge: true });
-    });
-    await batch.commit();
     setDefaults({ defaultAccountNumber: cleanAccount, recipientName: cleanName, recipientAddress: cleanAddress });
-    setMsg(`Zapisano domyślne dane do przelewu i zaktualizowano szkice: ${drafts.length}.`);
+    setMsg("Zapisano domyślne dane do przelewu.");
   };
 
   const clearAllDrafts = async () => {
