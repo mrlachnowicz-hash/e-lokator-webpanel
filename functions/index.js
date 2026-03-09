@@ -21,7 +21,7 @@ try {
 }
 
 const db = admin.firestore();
-const RUNTIME_FIX_VERSION = "2026-03-09-r6";
+const RUNTIME_FIX_VERSION = "2026-03-09-r7";
 
 // =========================================================
 // BASIC HELPERS
@@ -1252,18 +1252,50 @@ async function resolveFlatsForScope(communityId, scope, assignment = {}, parsed 
     flats = allFlats;
   } else {
     const lowerHint = normalizeLookup(hintText);
-    const mentionsCommunity = /wspolnot|osiedl|teren wspolny|nieruchomosc wspolna/.test(lowerHint);
-    if (mentionsCommunity) {
-      flats = allFlats;
-    } else if (directFlat) {
+    const mentionsWholeCommunity = /(?:cal[ae]? wspolnot|cala wspolnot|wszystkie budynki|cale osiedle|cała wspólnota|całe osiedle)/.test(lowerHint);
+    const mentionsCommonOnly = /wspoln|czesc wspoln|nieruchomosc wspoln|teren wspoln|osiedl/.test(lowerHint);
+    if (directFlat) {
       flats = allFlats.filter((flat) => {
         const sameStreet = !safeString(directFlat.streetId) || safeString(flat.streetId) === safeString(directFlat.streetId) || normalizeLookup(flat.street || flat.streetName).includes(normalizeLookup(directFlat.street || directFlat.streetName));
         const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId) === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId);
         return sameStreet && sameBuilding;
       });
     }
+    if (!flats.length && normalizedBuilding) {
+      flats = allFlats.filter((flat) => {
+        const flatStreetId = normalizeStreetName(flat.streetId || "");
+        const flatStreetName = normalizeLookup(flat.street || flat.streetName || "");
+        const sameStreet = !normalizedStreetId && !normalizedStreetName
+          ? true
+          : (normalizedStreetId && flatStreetId === normalizedStreetId) || (normalizedStreetName && flatStreetName.includes(normalizedStreetName));
+        const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizedBuilding;
+        return sameStreet && sameBuilding;
+      });
+    }
+    if (!flats.length && directStaircaseId) {
+      const normalizedStair = normalizeLookup(directStaircaseId);
+      flats = allFlats.filter((flat) => {
+        const sameStreet = !normalizedStreetId && !normalizedStreetName
+          ? true
+          : (normalizedStreetId && normalizeStreetName(flat.streetId || "") === normalizedStreetId) || (normalizedStreetName && normalizeLookup(flat.street || flat.streetName || "").includes(normalizedStreetName));
+        const sameBuilding = !normalizedBuilding ? true : normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizedBuilding;
+        const sameStair = normalizeLookup(flat.staircaseId || flat.staircase || flat.entranceId || flat.entrance || flat.klatka) === normalizedStair;
+        return sameStreet && sameBuilding && sameStair;
+      });
+    }
     if (!flats.length) flats = filterByAddress(allFlats).filter((flat) => !normalizedApartment || normalizeBuildingNo(flat.apartmentNo || flat.flatNumber) !== normalizedApartment);
     if (!flats.length && (normalizedStreetId || normalizedStreetName)) {
+      flats = allFlats.filter((flat) => {
+        const flatStreetId = normalizeStreetName(flat.streetId || "");
+        const flatStreetName = normalizeLookup(flat.street || flat.streetName || "");
+        return (normalizedStreetId && flatStreetId === normalizedStreetId) || (normalizedStreetName && flatStreetName.includes(normalizedStreetName));
+      });
+    }
+    if (!flats.length && mentionsWholeCommunity) flats = allFlats;
+    if (!flats.length && mentionsCommonOnly && normalizedBuilding) {
+      flats = allFlats.filter((flat) => normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizedBuilding);
+    }
+    if (!flats.length && mentionsCommonOnly && (normalizedStreetId || normalizedStreetName)) {
       flats = allFlats.filter((flat) => {
         const flatStreetId = normalizeStreetName(flat.streetId || "");
         const flatStreetName = normalizeLookup(flat.street || flat.streetName || "");
