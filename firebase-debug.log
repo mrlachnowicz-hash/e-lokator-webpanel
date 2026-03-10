@@ -1,0 +1,124 @@
+[debug] [2026-03-10T19:50:46.565Z] ----------------------------------------------------------------------
+[debug] [2026-03-10T19:50:46.570Z] Command:       /opt/homebrew/Cellar/node/25.6.1/bin/node /opt/homebrew/bin/firebase deploy --only functions
+[debug] [2026-03-10T19:50:46.570Z] CLI Version:   15.7.0
+[debug] [2026-03-10T19:50:46.570Z] Platform:      darwin
+[debug] [2026-03-10T19:50:46.570Z] Node Version:  v25.6.1
+[debug] [2026-03-10T19:50:46.570Z] Time:          Tue Mar 10 2026 20:50:46 GMT+0100 (czas środkowoeuropejski standardowy)
+[debug] [2026-03-10T19:50:46.570Z] ----------------------------------------------------------------------
+[debug] 
+[debug] [2026-03-10T19:50:47.218Z] > command requires scopes: ["email","openid","https://www.googleapis.com/auth/cloudplatformprojects.readonly","https://www.googleapis.com/auth/firebase","https://www.googleapis.com/auth/cloud-platform"]
+[debug] [2026-03-10T19:50:47.218Z] > authorizing via signed-in user (mrlachnowicz@gmail.com)
+[debug] [2026-03-10T19:50:47.218Z] [iam] checking project obslugaspoldzielni for permissions ["cloudfunctions.functions.create","cloudfunctions.functions.delete","cloudfunctions.functions.get","cloudfunctions.functions.list","cloudfunctions.functions.update","cloudfunctions.operations.get","firebase.projects.get"]
+[debug] [2026-03-10T19:50:47.218Z] Checked if tokens are valid: true, expires at: 1773173518630
+[debug] [2026-03-10T19:50:47.219Z] Checked if tokens are valid: true, expires at: 1773173518630
+[debug] [2026-03-10T19:50:47.219Z] >>> [apiv2][query] POST https://cloudresourcemanager.googleapis.com/v1/projects/obslugaspoldzielni:testIamPermissions [none]
+[debug] [2026-03-10T19:50:47.219Z] >>> [apiv2][(partial)header] POST https://cloudresourcemanager.googleapis.com/v1/projects/obslugaspoldzielni:testIamPermissions  x-goog-user-project=obslugaspoldzielni
+[debug] [2026-03-10T19:50:47.219Z] >>> [apiv2][body] POST https://cloudresourcemanager.googleapis.com/v1/projects/obslugaspoldzielni:testIamPermissions {"permissions":["cloudfunctions.functions.create","cloudfunctions.functions.delete","cloudfunctions.functions.get","cloudfunctions.functions.list","cloudfunctions.functions.update","cloudfunctions.operations.get","firebase.projects.get"]}
+[debug] [2026-03-10T19:50:48.128Z] <<< [apiv2][status] POST https://cloudresourcemanager.googleapis.com/v1/projects/obslugaspoldzielni:testIamPermissions 200
+[debug] [2026-03-10T19:50:48.128Z] <<< [apiv2][body] POST https://cloudresourcemanager.googleapis.com/v1/projects/obslugaspoldzielni:testIamPermissions {"permissions":["cloudfunctions.functions.create","cloudfunctions.functions.delete","cloudfunctions.functions.get","cloudfunctions.functions.list","cloudfunctions.functions.update","cloudfunctions.operations.get","firebase.projects.get"]}
+[debug] [2026-03-10T19:50:48.129Z] Checked if tokens are valid: true, expires at: 1773173518630
+[debug] [2026-03-10T19:50:48.129Z] Checked if tokens are valid: true, expires at: 1773173518630
+[debug] [2026-03-10T19:50:48.129Z] >>> [apiv2][query] POST https://iam.googleapis.com/v1/projects/obslugaspoldzielni/serviceAccounts/obslugaspoldzielni@appspot.gserviceaccount.com:testIamPermissions [none]
+[debug] [2026-03-10T19:50:48.129Z] >>> [apiv2][body] POST https://iam.googleapis.com/v1/projects/obslugaspoldzielni/serviceAccounts/obslugaspoldzielni@appspot.gserviceaccount.com:testIamPermissions {"permissions":["iam.serviceAccounts.actAs"]}
+[debug] [2026-03-10T19:50:49.032Z] <<< [apiv2][status] POST https://iam.googleapis.com/v1/projects/obslugaspoldzielni/serviceAccounts/obslugaspoldzielni@appspot.gserviceaccount.com:testIamPermissions 200
+[debug] [2026-03-10T19:50:49.032Z] <<< [apiv2][body] POST https://iam.googleapis.com/v1/projects/obslugaspoldzielni/serviceAccounts/obslugaspoldzielni@appspot.gserviceaccount.com:testIamPermissions {"permissions":["iam.serviceAccounts.actAs"]}
+[info] 
+[info] === Deploying to 'obslugaspoldzielni'...
+[info] 
+[info] i  deploying functions 
+[debug] [2026-03-10T19:50:49.036Z] Checked if tokens are valid: true, expires at: 1773173518630
+[debug] [2026-03-10T19:50:49.036Z] Checked if tokens are valid: true, expires at: 1773173518630
+[debug] [2026-03-10T19:50:49.037Z] >>> [apiv2][query] GET https://cloudresourcemanager.googleapis.com/v1/projects/obslugaspoldzielni [none]
+[debug] [2026-03-10T19:50:49.262Z] <<< [apiv2][status] GET https://cloudresourcemanager.googleapis.com/v1/projects/obslugaspoldzielni 200
+[debug] [2026-03-10T19:50:49.262Z] <<< [apiv2][body] GET https://cloudresourcemanager.googleapis.com/v1/projects/obslugaspoldzielni {"projectNumber":"490539426176","projectId":"obslugaspoldzielni","lifecycleState":"ACTIVE","name":"ObslugaSpoldzielni","labels":{"firebase":"enabled","firebase-core":"disabled"},"createTime":"2026-01-31T16:02:55.129687Z"}
+[info] i  functions: preparing codebase default for deployment 
+[info] i  functions: ensuring required API cloudfunctions.googleapis.com is enabled... 
+[info] i  functions: ensuring required API cloudbuild.googleapis.com is enabled... 
+[info] i  artifactregistry: ensuring required API artifactregistry.googleapis.com is enabled... 
+[debug] [2026-03-10T19:50:49.265Z] Checked if tokens are valid: true, expires at: 1773173518630
+[debug] [2026-03-10T19:50:49.265Z] Checked if tokens are valid: true, expires at: 1773173518630
+[debug] [2026-03-10T19:50:49.265Z] >>> [apiv2][query] GET https://firebase.googleapis.com/v1beta1/projects/obslugaspoldzielni/adminSdkConfig [none]
+[debug] [2026-03-10T19:50:50.111Z] <<< [apiv2][status] GET https://firebase.googleapis.com/v1beta1/projects/obslugaspoldzielni/adminSdkConfig 200
+[debug] [2026-03-10T19:50:50.112Z] <<< [apiv2][body] GET https://firebase.googleapis.com/v1beta1/projects/obslugaspoldzielni/adminSdkConfig {"projectId":"obslugaspoldzielni","storageBucket":"obslugaspoldzielni.firebasestorage.app"}
+[debug] [2026-03-10T19:50:50.112Z] Checked if tokens are valid: true, expires at: 1773173518630
+[debug] [2026-03-10T19:50:50.113Z] Checked if tokens are valid: true, expires at: 1773173518630
+[debug] [2026-03-10T19:50:50.113Z] >>> [apiv2][query] GET https://runtimeconfig.googleapis.com/v1beta1/projects/obslugaspoldzielni/configs [none]
+[debug] [2026-03-10T19:50:51.380Z] <<< [apiv2][status] GET https://runtimeconfig.googleapis.com/v1beta1/projects/obslugaspoldzielni/configs 200
+[debug] [2026-03-10T19:50:51.380Z] <<< [apiv2][body] GET https://runtimeconfig.googleapis.com/v1beta1/projects/obslugaspoldzielni/configs {}
+[debug] [2026-03-10T19:50:51.382Z] Validating nodejs source
+[warn] ⚠  functions: Couldn't find firebase-functions package in your source code. Have you run 'npm install'? 
+[debug] [2026-03-10T19:50:51.383Z] getFunctionsSDKVersion encountered error: Cannot find module 'firebase-functions'
+Require stack:
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/node/versioning.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/node/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/prepare.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/emulator/functionsEmulatorShared.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/frameworks/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/hosting/prepare.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/hosting/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/commands/deploy.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/commands/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/bin/cli.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/bin/firebase.js {"code":"MODULE_NOT_FOUND","requireStack":["/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/node/versioning.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/node/index.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/index.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/prepare.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/emulator/functionsEmulatorShared.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/frameworks/index.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/hosting/prepare.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/hosting/index.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/index.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/commands/deploy.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/commands/index.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/index.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/bin/cli.js","/opt/homebrew/lib/node_modules/firebase-tools/lib/bin/firebase.js"]}
+[debug] [2026-03-10T19:50:51.384Z] checkFunctionsSDKVersion encountered error: Invalid Version:  {}
+[debug] [2026-03-10T19:50:51.385Z] > [functions] package.json contents: {
+  "name": "functions",
+  "description": "Cloud Functions for Firebase",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "serve": "firebase emulators:start --only functions",
+    "shell": "firebase functions:shell",
+    "deploy": "firebase deploy --only functions",
+    "logs": "firebase functions:log"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.5.0",
+    "firebase-admin": "^13.6.0",
+    "pdf-parse": "^1.1.1",
+    "firebase-functions": "^7.0.0",
+    "nodemailer": "^6.10.0",
+    "openai": "^4.0.0",
+    "pdfkit": "^0.16.0"
+  },
+  "devDependencies": {
+    "firebase-functions-test": "^3.4.1"
+  }
+}
+[debug] [2026-03-10T19:50:51.385Z] Building nodejs source
+[info] i  functions: Loading and analyzing source code for codebase default to determine what to deploy 
+[debug] [2026-03-10T19:50:51.385Z] Could not parse firebase-functions version '' into semver.
+[debug] [2026-03-10T19:50:51.386Z] Could not find functions.yaml. Must use http discovery
+[debug] [2026-03-10T19:50:51.396Z] Error: Cannot find module 'firebase-functions'
+Require stack:
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/node/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/prepare.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/emulator/functionsEmulatorShared.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/frameworks/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/hosting/prepare.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/hosting/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/commands/deploy.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/commands/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/index.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/bin/cli.js
+- /opt/homebrew/lib/node_modules/firebase-tools/lib/bin/firebase.js
+    at Module._resolveFilename (node:internal/modules/cjs/loader:1455:15)
+    at require.resolve (node:internal/modules/helpers:163:19)
+    at Delegate.findFunctionsBinary (/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/node/index.js:101:33)
+    at Delegate.spawnFunctionsProcess (/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/node/index.js:131:30)
+    at Delegate.serveAdmin (/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/node/index.js:152:35)
+    at Delegate.discoverBuild (/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/runtimes/node/index.js:192:41)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async loadCodebases (/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/prepare.js:334:33)
+    at async prepare (/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/functions/prepare.js:69:24)
+    at async chain (/opt/homebrew/lib/node_modules/firebase-tools/lib/deploy/index.js:45:9)
+[error] 
+[error] Error: An unexpected error has occurred.

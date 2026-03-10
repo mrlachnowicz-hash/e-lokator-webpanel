@@ -7,12 +7,14 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
+import { callable } from "../../lib/functions";
 import { buildStablePaymentTitle, normalizeAccountNumber, normalizePaymentRef } from "../../lib/paymentRefs";
 import { mergeSettlementsForView, SETTLEMENTS_COLLECTION, SETTLEMENT_DRAFTS_COLLECTION } from "../../lib/settlementCollections";
 
 type Settlement = any;
 type Flat = any;
 type PaymentDefaults = { defaultAccountNumber: string; recipientName: string; recipientAddress: string };
+const clearDraftsCallable = callable<any, any>("clearSettlementDrafts");
 
 function money(v: any) { return `${Number(v || 0).toFixed(2)} PLN`; }
 function centsOrAmount(cents: any, amount: any) { return cents != null ? Number(cents) / 100 : Number(amount || 0); }
@@ -145,28 +147,11 @@ export default function ChargesPage() {
   const clearAllDrafts = async () => {
     if (!communityId || !window.confirm("Usunąć wszystkie szkice rozliczeń?")) return;
     try {
-      const snap = await getDocs(collection(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION));
-      if (snap.empty) {
-        setMsg("Brak szkiców do usunięcia.");
-        return;
-      }
-      let deleted = 0;
-      let batch = writeBatch(db);
-      let ops = 0;
-      for (const d of snap.docs) {
-        batch.delete(d.ref);
-        deleted += 1;
-        ops += 1;
-        if (ops >= 450) {
-          await batch.commit();
-          batch = writeBatch(db);
-          ops = 0;
-        }
-      }
-      if (ops > 0) await batch.commit();
-      setMsg(`Usunięto szkice: ${deleted}.`);
+      const res: any = await clearDraftsCallable({ communityId });
+      const deleted = Number(res?.data?.deleted || 0);
+      setMsg(deleted > 0 ? `Usunięto szkice: ${deleted}.` : "Brak szkiców do usunięcia.");
     } catch (error: any) {
-      setMsg(`Błąd czyszczenia szkiców: ${error?.message || "nieznany"}`);
+      setMsg(`Błąd czyszczenia szkiców: ${error?.message || error?.details || "nieznany"}`);
     }
   };
 

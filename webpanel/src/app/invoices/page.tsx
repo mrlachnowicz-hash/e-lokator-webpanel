@@ -106,6 +106,7 @@ export default function InvoicesPage() {
   const [uploading, setUploading] = useState(false);
   const [busyId, setBusyId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
+  const [ksefDebug, setKsefDebug] = useState<{ created: number; duplicates: number; totalVisible: number }>({ created: 0, duplicates: 0, totalVisible: 0 });
 
   useEffect(() => {
     if (!communityId) return;
@@ -135,9 +136,13 @@ export default function InvoicesPage() {
 
   const activeInvoices = useMemo(() => {
     return invoices
-      .filter((item) => item.isArchived !== true && !item.archivedAtMs && String(item.status || "").toUpperCase() !== "PRZENIESIONA_DO_SZKICU")
+      .filter((item) => item.isArchived !== true && !item.archivedAtMs && !["PRZENIESIONA_DO_SZKICU", "ARCHIVED"].includes(String(item.status || "").toUpperCase()))
       .sort((a, b) => Number(b.updatedAtMs || b.createdAtMs || 0) - Number(a.updatedAtMs || a.createdAtMs || 0));
   }, [invoices]);
+
+  const visibleKsefInvoices = useMemo(() => {
+    return activeInvoices.filter((item) => item.sourceCollection === "ksefInvoices");
+  }, [activeInvoices]);
 
   useEffect(() => {
     setAssignments((prev) => {
@@ -333,10 +338,25 @@ export default function InvoicesPage() {
     setMessage(null);
     try {
       const res: any = await fetchKsefCallable({ communityId, count: 5 });
-      const count = Number(res?.data?.created?.length || 0);
-      setMessage(`Pobrano z KSeF: ${count} faktur.`);
+      const created = Number(res?.data?.created?.length || 0);
+      const duplicates = Number(res?.data?.duplicates?.length || 0);
+      const [invoiceSnap, ksefSnap] = await Promise.all([
+        getDocs(collection(db, "communities", communityId, "invoices")),
+        getDocs(collection(db, "communities", communityId, "ksefInvoices")),
+      ]);
+      setInvoices([
+        ...invoiceSnap.docs.map((d) => normalizeInvoice(d.id, "invoices", d.data())),
+        ...ksefSnap.docs.map((d) => normalizeInvoice(d.id, "ksefInvoices", d.data())),
+      ]);
+      const totalVisible = ksefSnap.docs.filter((d) => {
+        const data: any = d.data() || {};
+        const status = String(data.status || "").toUpperCase();
+        return data.isArchived !== true && !data.archivedAtMs && !["PRZENIESIONA_DO_SZKICU", "ARCHIVED"].includes(status);
+      }).length;
+      setKsefDebug({ created, duplicates, totalVisible });
+      setMessage(`Pobrano z KSeF: ${created} faktur, duplikaty: ${duplicates}. Widoczne teraz na liście: ${totalVisible}.`);
     } catch (error: any) {
-      setMessage(error?.message || "Błąd pobierania z KSeF.");
+      setMessage(error?.message || error?.details || "Błąd pobierania z KSeF.");
     } finally {
       setUploading(false);
     }
@@ -372,9 +392,18 @@ export default function InvoicesPage() {
 
         <div className="card" style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
           <div>Aktywne faktury: <strong>{activeInvoices.length}</strong></div>
+          <div>Aktywne z KSeF: <strong>{visibleKsefInvoices.length}</strong></div>
           <div>Lokale w bazie: <strong>{flats.length}</strong></div>
           <div>Upload OCR: <strong>{uploading ? "w toku" : "gotowy"}</strong></div>
         </div>
+
+        {ksefDebug.created > 0 || ksefDebug.duplicates > 0 ? (
+          <div className="card" style={{ display: "grid", gap: 6 }}>
+            <strong>Ostatni import KSeF</strong>
+            <div>Dodane: {ksefDebug.created} · Duplikaty: {ksefDebug.duplicates} · Widoczne na liście: {ksefDebug.totalVisible}</div>
+            <div style={{ opacity: 0.78 }}>Jeśli liczba „Widoczne na liście” jest większa od zera, faktury są już niżej na tej stronie jako źródło KSeF.</div>
+          </div>
+        ) : null}
 
         <div style={{ display: "grid", gap: 12 }}>
           {activeInvoices.length === 0 ? <div className="card">Brak aktywnych faktur roboczych.</div> : activeInvoices.map((item) => {

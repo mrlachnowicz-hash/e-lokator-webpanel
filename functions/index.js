@@ -1302,6 +1302,37 @@ exports.ksefRunAutoSync = onSchedule({ schedule: "every 15 minutes", timeZone: "
   return { processed, success, failed };
 });
 
+
+exports.clearSettlementDrafts = onCall(async (request) => {
+  const communityId = safeString(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+
+  const caller = await getCallerProfile(request.auth?.uid);
+  assertPanelRole(caller);
+  if (!sameCommunity(caller, communityId) && !isOwnerEmail(caller?.email)) {
+    throw new HttpsError("permission-denied", "Brak dostępu do tej wspólnoty.");
+  }
+
+  const snap = await db.collection(`communities/${communityId}/settlementDrafts`).get();
+  if (snap.empty) return { ok: true, deleted: 0 };
+
+  let deleted = 0;
+  let batch = db.batch();
+  let ops = 0;
+  for (const d of snap.docs) {
+    batch.delete(d.ref);
+    deleted += 1;
+    ops += 1;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+  if (ops > 0) await batch.commit();
+  return { ok: true, deleted };
+});
+
 exports.ksefRetryNow = onCall(async (request) => {
   const me = await assertStaff(request);
   const communityId = safeString(request.data?.communityId || me.communityId);
