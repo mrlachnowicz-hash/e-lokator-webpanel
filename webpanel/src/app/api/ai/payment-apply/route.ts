@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getAdminDb } from "@/lib/server/firebaseAdmin";
 import { suggestPaymentMatch } from "@/lib/server/ai/payment";
-import { extractPaymentRef, generatePaymentRef, normalizePaymentRef } from "@/lib/server/paymentRefs";
+import { ensurePaymentRef, extractPaymentRef, normalizePaymentRef } from "@/lib/server/paymentRefs";
 
 export const runtime = "nodejs";
 
@@ -47,6 +47,9 @@ export async function POST(req: Request) {
       flatLabel: d.get("flatLabel") || `${d.get("street") || ""} ${d.get("buildingNo") || ""}/${d.get("apartmentNo") || ""}`.trim(),
       residentName: d.get("residentName") || d.get("displayName") || `${d.get("name") || ""} ${d.get("surname") || ""}`.trim(),
       email: d.get("email") || "",
+      street: d.get("street") || d.get("streetName") || "",
+      buildingNo: d.get("buildingNo") || d.get("buildingId") || "",
+      apartmentNo: d.get("apartmentNo") || d.get("flatNumber") || "",
     }));
     const settlementCandidates = settlementsSnap.docs.slice(0, 200).map((d) => ({
       id: d.id,
@@ -105,7 +108,18 @@ export async function POST(req: Request) {
     const paymentsCents = Number(settlement.paymentsCents || settlement.totalPaymentsCents || 0) + amountCents;
     const flatData = flatCandidates.find((f) => f.id === suggestedFlatId);
     const period = String(payment.period || settlement.period || new Date().toISOString().slice(0, 7));
-    const paymentRefValue = normalizePaymentRef(settlement.paymentRef || settlement.paymentTitle || settlement.transferTitle || explicitPaymentRef) || generatePaymentRef(period);
+    const paymentRefValue = ensurePaymentRef(
+      settlement.paymentRef || settlement.paymentTitle || settlement.transferTitle || explicitPaymentRef,
+      {
+        communityId,
+        flatId: suggestedFlatId,
+        flatLabel: settlement.flatLabel || flatData?.flatLabel || suggestedFlatId,
+        street: settlement.street || flatData?.street || "",
+        buildingNo: settlement.buildingNo || flatData?.buildingNo || "",
+        apartmentNo: settlement.apartmentNo || flatData?.apartmentNo || "",
+        period,
+      },
+    );
 
     await settlementRef.set({
       flatId: suggestedFlatId,

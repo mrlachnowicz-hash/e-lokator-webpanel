@@ -1,64 +1,99 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import Nav from "@/components/Nav";
-import RequireAuth from "@/components/RequireAuth";
+import Link from "next/link";
+import { useEffect, useMemo, useState } from "react";
+import { collection, onSnapshot } from "firebase/firestore";
 import { db } from "@/lib/firebase";
-import { collection, getDocs } from "firebase/firestore";
+import { useAuth } from "@/lib/authContext";
+import { Nav } from "@/components/Nav";
+import { RequireAuth } from "@/components/RequireAuth";
 
-type Invoice = {
-  id: string;
-  supplier: string;
-  amount: number;
-  archiveMonth?: string;
-  period?: string;
-};
+type InvoiceItem = any & { id: string; sourceCollection: "invoices" | "ksefInvoices" };
+
+function monthLabel(period: string) {
+  const names = ["styczeń", "luty", "marzec", "kwiecień", "maj", "czerwiec", "lipiec", "sierpień", "wrzesień", "październik", "listopad", "grudzień"];
+  const m = String(period || "").match(/^(\d{4})-(\d{2})/);
+  if (!m) return period || "bez daty";
+  return `${names[Number(m[2]) - 1] || m[2]} ${m[1]}`;
+}
+
+function normalizeInvoice(docId: string, sourceCollection: "invoices" | "ksefInvoices", data: any): InvoiceItem {
+  return { id: docId, sourceCollection, ...(data || {}) };
+}
+
+function amountLabel(item: InvoiceItem) {
+  const cents = Number(item?.parsed?.totalGrossCents || item?.parsed?.amountCents || item?.totalGrossCents || item?.amountCents || 0);
+  return `${(cents / 100).toFixed(2)} PLN`;
+}
+
+function archiveKey(item: InvoiceItem) {
+  return String(item.archiveMonth || item.period || item?.parsed?.period || item.issueDate?.slice?.(0, 7) || "inne").trim() || "inne";
+}
 
 export default function InvoiceArchivePage() {
-  const [invoices, setInvoices] = useState<Record<string, Invoice[]>>({});
+  const { profile } = useAuth();
+  const communityId = profile?.communityId || "";
+  const [invoices, setInvoices] = useState<InvoiceItem[]>([]);
 
   useEffect(() => {
-    const load = async () => {
-      const snap = await getDocs(collection(db, "invoices"));
-      const grouped: Record<string, Invoice[]> = {};
-
-      snap.docs.forEach((doc) => {
-        const data = doc.data() as Invoice;
-        const month = data.archiveMonth || data.period || "inne";
-
-        if (!grouped[month]) grouped[month] = [];
-
-        grouped[month].push({
-          id: doc.id,
-          ...data,
-        });
+    if (!communityId) return;
+    const unsubInvoices = onSnapshot(collection(db, "communities", communityId, "invoices"), (snap) => {
+      setInvoices((prev) => {
+        const other = prev.filter((item) => item.sourceCollection !== "invoices");
+        return [...other, ...snap.docs.map((d) => normalizeInvoice(d.id, "invoices", d.data()))];
       });
-
-      setInvoices(grouped);
+    });
+    const unsubKsef = onSnapshot(collection(db, "communities", communityId, "ksefInvoices"), (snap) => {
+      setInvoices((prev) => {
+        const other = prev.filter((item) => item.sourceCollection !== "ksefInvoices");
+        return [...other, ...snap.docs.map((d) => normalizeInvoice(d.id, "ksefInvoices", d.data()))];
+      });
+    });
+    return () => {
+      unsubInvoices();
+      unsubKsef();
     };
+  }, [communityId]);
 
-    load();
-  }, []);
+  const archived = useMemo(() => {
+    return invoices
+      .filter((item) => item.isArchived === true || !!item.archivedAtMs || String(item.status || "").toUpperCase() === "PRZENIESIONA_DO_SZKICU")
+      .sort((a, b) => Number(b.archivedAtMs || b.updatedAtMs || b.createdAtMs || 0) - Number(a.archivedAtMs || a.updatedAtMs || a.createdAtMs || 0));
+  }, [invoices]);
+
+  const groups = useMemo(() => {
+    return archived.reduce((acc: Record<string, InvoiceItem[]>, item) => {
+      const key = archiveKey(item);
+      (acc[key] ||= []).push(item);
+      return acc;
+    }, {});
+  }, [archived]);
 
   return (
-    <RequireAuth>
+    <RequireAuth roles={["MASTER", "ACCOUNTANT"]}>
       <Nav />
+      <div style={{ padding: 24, display: "grid", gap: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div>
+            <h1 style={{ margin: 0 }}>Archiwum faktur</h1>
+            <div style={{ opacity: 0.75 }}>Faktury przeniesione do szkiców rozliczeń.</div>
+          </div>
+          <Link href="/invoices" className="btnGhost" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}>Wróć do faktur</Link>
+        </div>
 
-      <div className="max-w-6xl mx-auto px-6 py-8 text-white">
-        <h1 className="text-2xl font-semibold mb-6">Archiwum faktur</h1>
-
-        {Object.entries(invoices).map(([month, items]) => (
-          <div key={month} className="mb-8">
-            <h2 className="text-lg font-semibold mb-3">{month}</h2>
-
-            <div className="space-y-2">
-              {items.map((inv) => (
-                <div
-                  key={inv.id}
-                  className="rounded-xl border border-white/10 p-4 flex justify-between"
-                >
-                  <span>{inv.supplier}</span>
-                  <span>{inv.amount} PLN</span>
+        {Object.keys(groups).length === 0 ? <div className="card">Brak archiwum faktur.</div> : Object.entries(groups).sort((a, b) => b[0].localeCompare(a[0])).map(([month, items]) => (
+          <div key={month} className="card" style={{ display: "grid", gap: 12 }}>
+            <strong>{monthLabel(month)}</strong>
+            <div style={{ display: "grid", gap: 10 }}>
+              {items.map((item) => (
+                <div key={`${item.sourceCollection}_${item.id}`} style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", borderTop: "1px solid rgba(255,255,255,.08)", paddingTop: 10 }}>
+                  <div style={{ display: "grid", gap: 4 }}>
+                    <strong>{String(item.supplierName || item.vendorName || item.parsed?.sellerName || item.filename || item.id)}</strong>
+                    <div style={{ opacity: 0.78 }}>Kategoria: {String(item.category || item.parsed?.category || "INNE")} · Zakres: {String(item.assigned?.scope || item.scope || item.parsed?.scope || item.parsed?.allocationType || "—")}</div>
+                    <div style={{ opacity: 0.78 }}>Okres: {String(item.lastDraftPeriod || item.period || item.parsed?.period || "—")} · Szkice: {Number(item.settlementDraftCount || 0)}</div>
+                    <div style={{ opacity: 0.7 }}>Źródło: {item.sourceCollection === "ksefInvoices" ? "KSeF" : "Faktury"} · ID: {item.id}</div>
+                  </div>
+                  <div style={{ fontWeight: 700 }}>{amountLabel(item)}</div>
                 </div>
               ))}
             </div>

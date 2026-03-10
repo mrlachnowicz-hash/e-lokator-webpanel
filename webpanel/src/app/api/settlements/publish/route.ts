@@ -27,9 +27,17 @@ export async function POST(req: Request) {
     const snap = await ref.get();
     if (!snap.exists) return NextResponse.json({ error: "Settlement not found" }, { status: 404 });
     const data: any = snap.data() || {};
-    const period = String(data.period || "").trim();
+    const period = String(data.period || data.archiveMonth || "").trim();
+    const now = Date.now();
 
-    await ref.set({ isPublished: true, status: "PUBLISHED", publishedAtMs: Date.now(), updatedAtMs: Date.now(), archiveMonth: period }, { merge: true });
+    await ref.set({
+      isPublished: true,
+      status: "PUBLISHED",
+      publishedAtMs: now,
+      updatedAtMs: now,
+      archiveMonth: period,
+      sentAtMs: now,
+    }, { merge: true });
 
     let emailFallback = false;
     if (data.flatId) {
@@ -44,7 +52,7 @@ export async function POST(req: Request) {
       }
     }
 
-    return NextResponse.json({ ok: true, settlementId, emailFallback });
+    return NextResponse.json({ ok: true, settlementId, published: true, emailFallback });
   } catch (error: any) {
     return NextResponse.json({ error: error?.message || "Publish error" }, { status: 500 });
   }

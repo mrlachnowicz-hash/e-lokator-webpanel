@@ -72,3 +72,6 @@ export function RequireAuth({ children, roles, requirePanelAccess = true }: { ch
 
   return <>{children}</>;
 }
+
+
+export default RequireAuth;

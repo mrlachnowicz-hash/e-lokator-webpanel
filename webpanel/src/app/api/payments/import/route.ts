@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { getAdminApp, getAdminDb } from "@/lib/server/firebaseAdmin";
-import { buildStablePaymentTitle, extractPaymentRef, generatePaymentRef, normalizePaymentRef } from "@/lib/server/paymentRefs";
+import { buildStablePaymentTitle, ensurePaymentRef, extractPaymentRef, normalizePaymentRef } from "@/lib/server/paymentRefs";
 
 export const runtime = "nodejs";
 
@@ -184,7 +184,18 @@ export async function POST(req: NextRequest) {
       };
 
       if (settlement && flat && confidence >= 0.84) {
-        const settlementPaymentRef = normalizePaymentRef(settlement.paymentRef || settlement.paymentTitle || settlement.transferTitle || settlement.paymentCode || "") || generatePaymentRef(period);
+        const settlementPaymentRef = ensurePaymentRef(
+          settlement.paymentRef || settlement.paymentTitle || settlement.transferTitle || settlement.paymentCode || "",
+          {
+            communityId,
+            flatId: settlement.flatId || flat.id,
+            flatLabel: settlement.flatLabel || flat.flatLabel || `${flat.street || ""} ${flat.buildingNo || ""}/${flat.apartmentNo || ""}`.trim(),
+            street: settlement.street || flat.street || "",
+            buildingNo: settlement.buildingNo || flat.buildingNo || "",
+            apartmentNo: settlement.apartmentNo || flat.apartmentNo || "",
+            period: settlement.period || period,
+          },
+        );
         const bankMatchKey = `${settlement.id}|${importFingerprint}`;
         if (matchedPaymentKeys.has(bankMatchKey)) {
           duplicates += 1;

@@ -103,6 +103,8 @@ export async function POST(req: Request, context: { params: { settlementId: stri
       ],
     });
 
+    await settlement.ref.set({ sentAtMs: Date.now(), updatedAtMs: Date.now() }, { merge: true });
+
     return NextResponse.json({ ok: true, email, pdfUrl });
   } catch (error: any) {
     return NextResponse.json({ error: error?.message || "Email error" }, { status: 500 });

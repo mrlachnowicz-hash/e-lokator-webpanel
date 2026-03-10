@@ -100,6 +100,28 @@ function shortHash(input) {
   return crypto.createHash("sha256").update(safeString(input || "X"), "utf8").digest("hex").toUpperCase().slice(0, 6);
 }
 
+function simpleHash(input) {
+  let hash = 2166136261;
+  const text = safeString(input || "");
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function tripletFromSeed(seed, salt) {
+  return String(simpleHash(`${salt}|${seed}`) % 1000).padStart(3, "0");
+}
+
+function normalizePlain(value) {
+  return safeString(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
 const PAYMENT_REF_REGEX = /\b([A-Z]{2}-\d{3}-\d{3}-\d{3}-20\d{2}-\d{2})\b/i;
 
 function normalizePaymentRef(value) {
@@ -114,17 +136,64 @@ function extractPaymentRef(value) {
   return normalizePaymentRef(value);
 }
 
-async function generateUniquePaymentRef(period, prefix = "EL") {
+function buildStablePaymentRef(flat = {}, period = "") {
   const periodMatch = safeString(period || nowMs()).match(/^(20\d{2})-(\d{2})/);
   const year = periodMatch?.[1] || new Date().toISOString().slice(0, 4);
   const month = periodMatch?.[2] || new Date().toISOString().slice(5, 7);
-  const head = safeString(prefix || "EL").replace(/[^A-Z0-9]/gi, "").toUpperCase().slice(0, 2).padEnd(2, "X");
-  for (let i = 0; i < 12; i += 1) {
-    const candidate = `${head}-${String(Math.floor(Math.random() * 1000)).padStart(3, "0")}-${String(Math.floor(Math.random() * 1000)).padStart(3, "0")}-${String(Math.floor(Math.random() * 1000)).padStart(3, "0")}-${year}-${month}`;
-    const existing = await db.collectionGroup("settlements").where("paymentRef", "==", candidate).limit(1).get();
-    if (existing.empty) return candidate;
-  }
-  throw new HttpsError("already-exists", "Nie udało się wygenerować unikalnego paymentRef.");
+  const seed = [
+    flat.communityId || "",
+    flat.id || flat.flatId || "",
+    flat.street || flat.streetName || "",
+    flat.buildingNo || flat.buildingId || "",
+    flat.apartmentNo || flat.flatNumber || "",
+    flat.flatLabel || "",
+    `${year}-${month}`,
+  ].join("|");
+  const aptDigits = normalizePlain(flat.apartmentNo || flat.flatNumber || flat.flatId || flat.id || flat.flatLabel || "").replace(/[^0-9]/g, "");
+  const part1 = aptDigits ? aptDigits.slice(-3).padStart(3, "0") : tripletFromSeed(seed, "APT");
+  const part2 = tripletFromSeed(seed, "B");
+  const part3 = tripletFromSeed(seed, "C");
+  return `EL-${part1}-${part2}-${part3}-${year}-${month}`;
+}
+
+function ensurePaymentRef(existingValue, flat = {}, period = "") {
+  return normalizePaymentRef(existingValue) || buildStablePaymentRef(flat, period);
+}
+
+function normalizeLookup(value) {
+  return safeString(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\bul\.?\b/g, " ")
+    .replace(/\bal\.?\b/g, " ")
+    .replace(/\bos\.?\b/g, " ")
+    .replace(/[^a-z0-9/ -]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeBuildingNo(value) {
+  return normalizeLookup(value).replace(/\s+/g, "");
+}
+
+function parseAddressHints(text) {
+  const raw = safeString(text);
+  const normalized = normalizeLookup(raw);
+  const out = { streetName: "", buildingNo: "", apartmentNo: "", staircaseId: "" };
+  const streetMatch = raw.match(/(?:ul(?:ica)?|al(?:eja)?|os(?:iedle)?)\.?\s+([A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż .-]{3,})/i);
+  if (streetMatch?.[1]) out.streetName = safeString(streetMatch[1]).split(/\s+(?:nr|bud|budynku|lok|lokalu|kl|klatka)\b/i)[0];
+  const addressMatch = normalized.match(/([a-ząćęłńóśźż .-]{3,})\s+(\d+[a-z]?)(?:\/(\d+[a-z]?))?/i);
+  if (!out.streetName && addressMatch?.[1]) out.streetName = safeString(addressMatch[1]);
+  if (addressMatch?.[2]) out.buildingNo = safeString(addressMatch[2]);
+  if (addressMatch?.[3]) out.apartmentNo = safeString(addressMatch[3]);
+  const buildingMatch = raw.match(/(?:bud(?:ynek|ynku)?|nr\s+budynku|adres\s+obiektu|adres\s+dostawy|punkt\s+poboru)\s*[:#-]?\s*(\d+[A-Za-z]?)/i);
+  if (buildingMatch?.[1] && !out.buildingNo) out.buildingNo = safeString(buildingMatch[1]);
+  const apartmentMatch = raw.match(/(?:lokal(?:u)?|mieszkanie|nr\s+lokalu|lok\.)\s*[:#-]?\s*(\d+[A-Za-z]?)/i);
+  if (apartmentMatch?.[1]) out.apartmentNo = safeString(apartmentMatch[1]);
+  const stairMatch = raw.match(/(?:klatka|kl\.|staircase|entrance|pion)\s*[:#-]?\s*([A-Za-z0-9-]+)/i);
+  if (stairMatch?.[1]) out.staircaseId = safeString(stairMatch[1]);
+  return out;
 }
 
 function readCommunityPaymentDefaults(community) {
@@ -136,7 +205,7 @@ function readCommunityPaymentDefaults(community) {
 }
 
 async function buildPaymentTitle(flat, period, existingValue = "") {
-  return normalizePaymentRef(existingValue) || await generateUniquePaymentRef(period, "EL");
+  return ensurePaymentRef(existingValue, flat, period);
 }
 
 function getOpenAIClient() {
@@ -788,13 +857,41 @@ async function extractPdfText(base64Pdf) {
 // =========================================================
 
 function heuristicCategory(text) {
-  const t = String(text || "").toLowerCase();
-  if (t.includes("woda") || t.includes("ściek") || t.includes("kanal")) return "WODA";
-  if (t.includes("gaz")) return "GAZ";
-  if (t.includes("energia") || t.includes("prąd") || t.includes("tauron") || t.includes("enea")) return "PRAD";
-  if (t.includes("sprząt") || t.includes("czysto")) return "SPRZATANIE";
-  if (t.includes("remont") || t.includes("napraw") || t.includes("modern")) return "REMONT";
+  const t = normalizeLookup(text);
+  if (/woda|sciek|kanal|wodociag/.test(t)) return "WODA";
+  if (/gaz/.test(t)) return "GAZ";
+  if (/energia|prad|tauron|enea|energa|pge/.test(t)) return "PRAD";
+  if (/sprzatan|czystosc|utrzymanie porzadku/.test(t)) return "SPRZATANIE";
+  if (/remont|napraw|modern|serwis|hydraul|elektryk/.test(t)) return "REMONT";
   return "INNE";
+}
+
+function detectInvoiceScope(invoiceText, hintedScope = "") {
+  const direct = safeString(hintedScope).toUpperCase();
+  if (["FLAT", "BUILDING", "STAIRCASE", "COMMON", "COMMUNITY"].includes(direct)) {
+    return { scope: direct, confidence: 0.99, reason: "Zakres wynika z jawnego przypisania." };
+  }
+
+  const text = safeString(invoiceText);
+  const normalized = normalizeLookup(text);
+  const hints = parseAddressHints(text);
+  const explicitFlatNo = !!hints.apartmentNo || /(?:nr\s+lokalu|lokal(?:u)?|mieszkanie|adres\s+lokalu|\/\d+[a-z]?)/i.test(text);
+  const communityScore = /(?:cala?\s+wspolnot|wszystkie\s+budynki|cale\s+osiedle|osiedl|wspolnota\s+mieszkaniow|zarzad\s+wspolnoty)/.test(normalized) ? 1 : 0;
+  const commonScore = /(?:czesc\s+wspoln|czesci\s+wspoln|nieruchomosc\s+wspoln|fundusz\s+remontowy|sprzatanie\s+klatek|oswietlenie\s+klatki|pion\s+wentylacyjny|pion\s+kanal|winda|teren\s+wspoln|garaz\s+wspoln)/.test(normalized) ? 1 : 0;
+  const staircaseScore = /(?:klatka|kl\.|staircase|entrance|pion)/.test(normalized) ? 1 : 0;
+  const buildingScore = /(?:budynek|adres\s+obiektu|adres\s+dostawy|punkt\s+poboru|obiekt)/.test(normalized) ? 1 : 0;
+  const flatScore = /(?:lokal(?:u)?|mieszkanie|nr\s+lokalu|adres\s+lokalu|odbiorca\s+uslugi)/.test(normalized) ? 1 : 0;
+
+  if (communityScore) return { scope: "COMMUNITY", confidence: 0.94, reason: "Tekst wskazuje na koszt całej wspólnoty / osiedla." };
+  if (commonScore && staircaseScore && hints.staircaseId) return { scope: "COMMON", confidence: 0.92, reason: "Tekst wskazuje na część wspólną przypisaną do klatki / pionu." };
+  if (commonScore && (buildingScore || hints.buildingNo)) return { scope: "COMMON", confidence: 0.9, reason: "Tekst wskazuje na część wspólną budynku." };
+  if (commonScore) return { scope: "COMMON", confidence: 0.88, reason: "Tekst wskazuje na koszt części wspólnej." };
+  if (staircaseScore && hints.staircaseId && !explicitFlatNo) return { scope: "STAIRCASE", confidence: 0.86, reason: "Tekst wskazuje na konkretną klatkę / pion." };
+  if (buildingScore && !explicitFlatNo) return { scope: "BUILDING", confidence: 0.82, reason: "Tekst wskazuje na konkretny budynek." };
+  if (flatScore && explicitFlatNo) return { scope: "FLAT", confidence: 0.84, reason: "Tekst zawiera jednoznaczny numer lokalu." };
+  if (explicitFlatNo && !commonScore && !communityScore) return { scope: "FLAT", confidence: 0.8, reason: "Rozpoznano numer lokalu w adresie." };
+  if (hints.buildingNo) return { scope: "BUILDING", confidence: 0.66, reason: "Rozpoznano adres budynku." };
+  return { scope: "COMMON", confidence: 0.5, reason: "Brak jednoznacznych danych — przyjęto koszt wspólny do weryfikacji." };
 }
 
 async function askAiForJson(prompt, model = null, fallback = null) {
@@ -818,23 +915,32 @@ async function askAiForJson(prompt, model = null, fallback = null) {
 }
 
 async function aiSuggestInvoice(invoiceText) {
+  const scopeHint = detectInvoiceScope(invoiceText);
   const prompt = [
     "Jesteś asystentem księgowej wspólnoty mieszkaniowej.",
     "Zwróć wyłącznie JSON:",
     "{",
     '  "category":"PRAD|WODA|GAZ|SPRZATANIE|REMONT|INNE",',
-    '  "scope":"COMMON|FLAT",',
+    '  "scope":"FLAT|BUILDING|STAIRCASE|COMMON|COMMUNITY",',
     '  "period":"YYYY-MM",',
     '  "confidence":0.0,',
     '  "needsReview":true,',
     '  "reason":"..."',
     "}",
     "",
+    `Wstępna heurystyka zakresu: ${scopeHint.scope} (${scopeHint.reason})`,
     "FAKTURA:",
     invoiceText
   ].join("\n");
 
-  return await askAiForJson(prompt, process.env.OPENAI_MODEL_FAST || "gpt-4o-mini", null);
+  return await askAiForJson(prompt, process.env.OPENAI_MODEL_FAST || "gpt-4o-mini", {
+    category: heuristicCategory(invoiceText),
+    scope: scopeHint.scope,
+    period: monthFromDateStr((String(invoiceText || "").match(/20\d{2}-\d{2}-\d{2}/) || [])[0] || ""),
+    confidence: scopeHint.confidence,
+    needsReview: true,
+    reason: scopeHint.reason,
+  });
 }
 
 async function aiExplainReview(input) {
@@ -994,13 +1100,14 @@ exports.aiParseInvoicePdf = onCall(async (request) => {
   if (!fileBase64) throw new HttpsError("invalid-argument", "Brak pliku PDF.");
 
   const text = await extractPdfText(fileBase64);
+  const scopeHint = detectInvoiceScope(text);
   const heuristic = {
     category: heuristicCategory(text),
-    scope: "COMMON",
+    scope: scopeHint.scope,
     period: monthFromDateStr((text.match(/20\d{2}-\d{2}-\d{2}/) || [])[0] || ""),
-    confidence: 0.55,
+    confidence: Math.max(0.55, Number(scopeHint.confidence || 0)),
     needsReview: true,
-    reason: "Heurystyka OCR/PDF"
+    reason: scopeHint.reason || "Heurystyka OCR/PDF"
   };
 
   const ai = await aiSuggestInvoice(text);
@@ -1134,7 +1241,7 @@ async function recalcSettlement(communityId, flatId, period) {
   const settlementRef = db.doc(`communities/${communityId}/settlements/${settlementId}`);
   const existingSnap = await settlementRef.get();
   const existing = existingSnap.exists ? existingSnap.data() : {};
-  const paymentRef = await buildPaymentTitle({ ...flat, id: flatId }, period, existing?.paymentRef || existing?.paymentTitle || existing?.transferTitle || flat?.paymentCode || "");
+  const paymentRef = await buildPaymentTitle({ ...flat, communityId, id: flatId }, period, existing?.paymentRef || existing?.paymentTitle || existing?.transferTitle || "");
 
   await settlementRef.set({
     id: settlementId,
@@ -1175,19 +1282,37 @@ async function recalcSettlement(communityId, flatId, period) {
 }
 
 function normalizeInvoiceScope(scope, assignment = {}, parsed = {}, invoice = {}) {
-  const raw = safeString(scope || assignment.scope || parsed.scope || invoice.ai?.suggestion?.scope || invoice.ai?.suggestion?.allocationType || "COMMON").toUpperCase();
+  const raw = safeString(scope || assignment.scope || parsed.scope || parsed.allocationType || invoice.ai?.suggestion?.scope || invoice.ai?.suggestion?.allocationType).toUpperCase();
   if (["FLAT", "LOCAL", "LOKAL"].includes(raw)) return "FLAT";
   if (["BUILDING", "BUDYNEK"].includes(raw)) return "BUILDING";
   if (["STAIRCASE", "KLATKA", "ENTRANCE"].includes(raw)) return "STAIRCASE";
   if (["COMMUNITY", "WSPOLNOTA"].includes(raw)) return "COMMUNITY";
-  return "COMMON";
+  if (["COMMON", "WSPOLNE", "CZESCI_WSPOLNE", "CZESCI_WSPOLNE"].includes(raw)) return "COMMON";
+
+  const hintText = [
+    assignment.reason,
+    parsed.reason,
+    parsed.ocrText,
+    parsed.extractedText,
+    parsed.description,
+    parsed.streetName,
+    parsed.street,
+    parsed.buildingNo,
+    parsed.apartmentNo,
+    parsed.address,
+    invoice.filename,
+    invoice.extractedText,
+    JSON.stringify(invoice.parsed?.items || []),
+  ].map(safeString).filter(Boolean).join("\n");
+
+  return detectInvoiceScope(hintText).scope;
 }
 
 async function resolveFlatsForScope(communityId, scope, assignment = {}, parsed = {}) {
   const allFlats = await listFlats(communityId);
   const directStreetId = safeString(assignment.streetId || parsed.streetId || parsed.suggestedStreetId);
   const directBuildingId = safeString(assignment.buildingId || parsed.buildingId || parsed.suggestedBuildingId || parsed.buildingNo);
-  const directStaircaseId = safeString(assignment.staircaseId || parsed.staircaseId || assignment.entranceId || parsed.entranceId);
+  const directStaircaseId = safeString(assignment.staircaseId || parsed.staircaseId || assignment.entranceId || parsed.entranceId || parsed.suggestedStaircaseId);
   const directFlatId = safeString(assignment.flatId || parsed.flatId || parsed.suggestedFlatId);
   const hintText = [
     assignment.reason,
@@ -1195,115 +1320,105 @@ async function resolveFlatsForScope(communityId, scope, assignment = {}, parsed 
     parsed.ocrText,
     parsed.extractedText,
     parsed.streetName,
+    parsed.suggestedStreetName,
     parsed.street,
     parsed.buildingNo,
     parsed.apartmentNo,
+    parsed.suggestedApartmentNo,
     parsed.address,
     parsed.description,
   ].map(safeString).filter(Boolean).join("\n");
   const hints = parseAddressHints(hintText);
-  const normalizedStreetId = normalizeStreetName(directStreetId);
-  const normalizedStreetName = normalizeLookup(assignment.streetName || parsed.streetName || parsed.street || hints.streetName);
-  const normalizedBuilding = normalizeBuildingNo(directBuildingId || hints.buildingNo);
-  const normalizedApartment = normalizeBuildingNo(directFlatId ? "" : (assignment.apartmentNo || parsed.apartmentNo || hints.apartmentNo));
 
+  const normalizedStreetId = normalizeStreetName(directStreetId || "");
+  const normalizedStreetName = normalizeLookup(assignment.streetName || parsed.streetName || parsed.suggestedStreetName || parsed.street || hints.streetName);
+  const normalizedBuilding = normalizeBuildingNo(directBuildingId || hints.buildingNo);
+  const normalizedApartment = normalizeBuildingNo(directFlatId ? "" : (assignment.apartmentNo || parsed.apartmentNo || parsed.suggestedApartmentNo || hints.apartmentNo));
+  const normalizedStaircase = normalizeLookup(directStaircaseId || hints.staircaseId);
+  const scopeHint = detectInvoiceScope(hintText, scope);
   const directFlat = directFlatId ? allFlats.find((f) => safeString(f.id) === directFlatId) : null;
 
-  const filterByAddress = (rows) => rows.filter((flat) => {
+  const matchesStreet = (flat) => {
+    if (!normalizedStreetId && !normalizedStreetName) return true;
     const flatStreetId = normalizeStreetName(flat.streetId || "");
     const flatStreetName = normalizeLookup(flat.street || flat.streetName || "");
-    const flatBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId || "");
-    const flatApartment = normalizeBuildingNo(flat.apartmentNo || flat.flatNumber || "");
-    const streetOk = !normalizedStreetId && !normalizedStreetName
-      ? true
-      : (normalizedStreetId && flatStreetId === normalizedStreetId) || (normalizedStreetName && flatStreetName.includes(normalizedStreetName));
-    const buildingOk = !normalizedBuilding ? true : flatBuilding === normalizedBuilding;
-    const apartmentOk = !normalizedApartment ? true : flatApartment === normalizedApartment;
-    return streetOk && buildingOk && apartmentOk;
-  });
+    return (!!normalizedStreetId && flatStreetId === normalizedStreetId) || (!!normalizedStreetName && flatStreetName.includes(normalizedStreetName));
+  };
 
-  if (scope === "FLAT") {
-    if (directFlat) return [directFlat];
-    const byAddress = filterByAddress(allFlats);
-    return byAddress.slice(0, 1);
-  }
+  const matchesBuilding = (flat) => {
+    if (!normalizedBuilding) return true;
+    return normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizedBuilding;
+  };
+
+  const matchesApartment = (flat) => {
+    if (!normalizedApartment) return true;
+    return normalizeBuildingNo(flat.apartmentNo || flat.flatNumber || "") === normalizedApartment;
+  };
+
+  const matchesStaircase = (flat) => {
+    if (!normalizedStaircase) return true;
+    return normalizeLookup(flat.staircaseId || flat.staircase || flat.entranceId || flat.entrance || flat.klatka) === normalizedStaircase;
+  };
+
+  const byAddress = allFlats.filter((flat) => matchesStreet(flat) && matchesBuilding(flat) && matchesApartment(flat));
+  const byBuilding = allFlats.filter((flat) => matchesStreet(flat) && matchesBuilding(flat));
+  const byStaircase = allFlats.filter((flat) => matchesStreet(flat) && matchesBuilding(flat) && matchesStaircase(flat));
+  const byStreet = allFlats.filter((flat) => matchesStreet(flat));
 
   let flats = [];
 
-  if (scope === "BUILDING" || scope === "STAIRCASE") {
+  if (scope === "FLAT") {
+    if (directFlat) return [directFlat];
+    return byAddress.slice(0, 1);
+  }
+
+  if (scope === "BUILDING") {
+    if (directFlat) {
+      return allFlats.filter((flat) => {
+        const sameStreet = normalizeLookup(flat.street || flat.streetName || "") === normalizeLookup(directFlat.street || directFlat.streetName || "") || safeString(flat.streetId) === safeString(directFlat.streetId || "");
+        const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId || "");
+        return sameStreet && sameBuilding;
+      });
+    }
+    flats = byBuilding.length ? byBuilding : byStreet;
+    return Array.from(new Map(flats.map((x) => [x.id, x])).values());
+  }
+
+  if (scope === "STAIRCASE") {
     if (directFlat) {
       flats = allFlats.filter((flat) => {
-        const sameStreet = !safeString(directFlat.streetId) || safeString(flat.streetId) === safeString(directFlat.streetId) || normalizeLookup(flat.street || flat.streetName).includes(normalizeLookup(directFlat.street || directFlat.streetName));
-        const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId) === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId);
-        return sameStreet && sameBuilding;
-      });
-    }
-    if (!flats.length) flats = filterByAddress(allFlats).filter((flat) => !normalizedApartment || true);
-    if (!flats.length && directBuildingId) {
-      flats = allFlats.filter((flat) => normalizeBuildingNo(flat.buildingNo || flat.buildingId) === normalizeBuildingNo(directBuildingId));
-    }
-    if (scope === "STAIRCASE") {
-      const normalizedStair = normalizeLookup(directStaircaseId);
-      if (normalizedStair) {
-        flats = flats.filter((x) => normalizeLookup(x.staircaseId || x.staircase || x.entranceId || x.entrance || x.klatka) === normalizedStair);
-      }
-    }
-  } else if (scope === "COMMUNITY") {
-    flats = allFlats;
-  } else {
-    const lowerHint = normalizeLookup(hintText);
-    const mentionsWholeCommunity = /(?:cal[ae]? wspolnot|cala wspolnot|wszystkie budynki|cale osiedle|cała wspólnota|całe osiedle)/.test(lowerHint);
-    const mentionsCommonOnly = /wspoln|czesc wspoln|nieruchomosc wspoln|teren wspoln|osiedl/.test(lowerHint);
-    if (directFlat) {
-      flats = allFlats.filter((flat) => {
-        const sameStreet = !safeString(directFlat.streetId) || safeString(flat.streetId) === safeString(directFlat.streetId) || normalizeLookup(flat.street || flat.streetName).includes(normalizeLookup(directFlat.street || directFlat.streetName));
-        const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId) === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId);
-        return sameStreet && sameBuilding;
-      });
-    }
-    if (!flats.length && normalizedBuilding) {
-      flats = allFlats.filter((flat) => {
-        const flatStreetId = normalizeStreetName(flat.streetId || "");
-        const flatStreetName = normalizeLookup(flat.street || flat.streetName || "");
-        const sameStreet = !normalizedStreetId && !normalizedStreetName
-          ? true
-          : (normalizedStreetId && flatStreetId === normalizedStreetId) || (normalizedStreetName && flatStreetName.includes(normalizedStreetName));
-        const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizedBuilding;
-        return sameStreet && sameBuilding;
-      });
-    }
-    if (!flats.length && directStaircaseId) {
-      const normalizedStair = normalizeLookup(directStaircaseId);
-      flats = allFlats.filter((flat) => {
-        const sameStreet = !normalizedStreetId && !normalizedStreetName
-          ? true
-          : (normalizedStreetId && normalizeStreetName(flat.streetId || "") === normalizedStreetId) || (normalizedStreetName && normalizeLookup(flat.street || flat.streetName || "").includes(normalizedStreetName));
-        const sameBuilding = !normalizedBuilding ? true : normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizedBuilding;
-        const sameStair = normalizeLookup(flat.staircaseId || flat.staircase || flat.entranceId || flat.entrance || flat.klatka) === normalizedStair;
+        const sameStreet = normalizeLookup(flat.street || flat.streetName || "") === normalizeLookup(directFlat.street || directFlat.streetName || "") || safeString(flat.streetId) === safeString(directFlat.streetId || "");
+        const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId || "");
+        const sameStair = normalizeLookup(flat.staircaseId || flat.staircase || flat.entranceId || flat.entrance || flat.klatka) === normalizeLookup(directFlat.staircaseId || directFlat.staircase || directFlat.entranceId || directFlat.entrance || directFlat.klatka);
         return sameStreet && sameBuilding && sameStair;
       });
     }
-    if (!flats.length) flats = filterByAddress(allFlats).filter((flat) => !normalizedApartment || normalizeBuildingNo(flat.apartmentNo || flat.flatNumber) !== normalizedApartment);
-    if (!flats.length && (normalizedStreetId || normalizedStreetName)) {
-      flats = allFlats.filter((flat) => {
-        const flatStreetId = normalizeStreetName(flat.streetId || "");
-        const flatStreetName = normalizeLookup(flat.street || flat.streetName || "");
-        return (normalizedStreetId && flatStreetId === normalizedStreetId) || (normalizedStreetName && flatStreetName.includes(normalizedStreetName));
-      });
-    }
-    if (!flats.length && mentionsWholeCommunity) flats = allFlats;
-    if (!flats.length && mentionsCommonOnly && normalizedBuilding) {
-      flats = allFlats.filter((flat) => normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizedBuilding);
-    }
-    if (!flats.length && mentionsCommonOnly && (normalizedStreetId || normalizedStreetName)) {
-      flats = allFlats.filter((flat) => {
-        const flatStreetId = normalizeStreetName(flat.streetId || "");
-        const flatStreetName = normalizeLookup(flat.street || flat.streetName || "");
-        return (normalizedStreetId && flatStreetId === normalizedStreetId) || (normalizedStreetName && flatStreetName.includes(normalizedStreetName));
-      });
-    }
-    if (!flats.length) flats = allFlats;
+    if (!flats.length) flats = byStaircase;
+    if (!flats.length && normalizedStaircase) flats = byBuilding.filter(matchesStaircase);
+    return Array.from(new Map(flats.map((x) => [x.id, x])).values());
   }
+
+  if (scope === "COMMUNITY") {
+    return Array.from(new Map(allFlats.map((x) => [x.id, x])).values());
+  }
+
+  if (directFlat) {
+    flats = allFlats.filter((flat) => {
+      const sameStreet = normalizeLookup(flat.street || flat.streetName || "") === normalizeLookup(directFlat.street || directFlat.streetName || "") || safeString(flat.streetId) === safeString(directFlat.streetId || "");
+      const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId || "");
+      const directStair = normalizeLookup(directFlat.staircaseId || directFlat.staircase || directFlat.entranceId || directFlat.entrance || directFlat.klatka);
+      return sameStreet && sameBuilding && (!normalizedStaircase || !directStair || matchesStaircase(flat));
+    });
+  }
+
+  if (!flats.length && normalizedStaircase) flats = byStaircase;
+  if (!flats.length && normalizedBuilding) flats = byBuilding;
+  if (!flats.length && scopeHint.scope === "COMMUNITY") flats = allFlats;
+  if (!flats.length && byStreet.length && (scopeHint.scope === "COMMON" || scopeHint.scope === "BUILDING")) flats = byStreet;
+  if (!flats.length && byAddress.length && normalizedApartment && scopeHint.scope !== "FLAT") {
+    flats = byBuilding.length ? byBuilding : byStreet;
+  }
+  if (!flats.length) flats = allFlats;
 
   return Array.from(new Map(flats.map((x) => [x.id, x])).values());
 }
@@ -1356,56 +1471,69 @@ exports.approveInvoice = onCall(async (request) => {
   const period = safeString(assignment.period || parsed.period || inv.period || inv.ai?.suggestion?.period);
   const category = safeString(assignment.category || parsed.category || inv.category || inv.ai?.suggestion?.category || "INNE");
   const scope = normalizeInvoiceScope(assignment.scope, assignment, parsed, inv);
-  const buildingId = safeString(assignment.buildingId || parsed.buildingId || inv.ai?.suggestion?.buildingId);
-  const streetId = safeString(assignment.streetId || parsed.streetId || inv.ai?.suggestion?.streetId);
-  const staircaseId = safeString(assignment.staircaseId || parsed.staircaseId || inv.ai?.suggestion?.staircaseId);
-  const flatId = safeString(assignment.flatId || parsed.flatId || inv.ai?.suggestion?.flatId);
+  const buildingId = safeString(assignment.buildingId || parsed.buildingId || parsed.suggestedBuildingId || inv.ai?.suggestion?.buildingId);
+  const streetId = safeString(assignment.streetId || parsed.streetId || parsed.suggestedStreetId || inv.ai?.suggestion?.streetId);
+  const staircaseId = safeString(assignment.staircaseId || parsed.staircaseId || parsed.suggestedStaircaseId || inv.ai?.suggestion?.staircaseId);
+  const flatId = safeString(assignment.flatId || parsed.flatId || parsed.suggestedFlatId || inv.ai?.suggestion?.flatId);
+  const archiveMonth = safeString(period || monthFromDateStr(parsed.issueDate || inv.issueDate));
 
   if (!period) throw new HttpsError("invalid-argument", "Brak okresu.");
   if (totalCents <= 0) throw new HttpsError("failed-precondition", "Brak kwoty na fakturze.");
 
-  await ref.set({
-    status: "ZATWIERDZONA",
-    approvedAtMs: nowMs(),
-    approvedByUid: request.auth.uid,
-    assigned: { scope, streetId: streetId || null, buildingId: buildingId || null, staircaseId: staircaseId || null, flatId: flatId || null, category, period }
-  }, { merge: true });
+  const targetFlats = await resolveFlatsForScope(communityId, scope, {
+    scope,
+    streetId,
+    buildingId,
+    staircaseId,
+    flatId,
+    apartmentNo: assignment.apartmentNo,
+    streetName: assignment.streetName,
+  }, parsed);
 
-  const targetFlats = await resolveFlatsForScope(communityId, scope, { streetId, buildingId, staircaseId, flatId }, parsed);
   if (targetFlats.length === 0) {
-    throw new HttpsError("failed-precondition", `Brak lokali do naliczenia dla typu kosztu ${scope}. streetId=${streetId || "-"} buildingId=${buildingId || "-"} flatId=${flatId || "-"}`);
+    throw new HttpsError("failed-precondition", `Brak lokali do naliczenia dla typu kosztu ${scope}. streetId=${streetId || "-"} buildingId=${buildingId || "-"} staircaseId=${staircaseId || "-"} flatId=${flatId || "-"}`);
   }
 
-  const useArea = targetFlats.some(f => Number(f.areaM2 || 0) > 0) && scope !== "FLAT";
+  const useArea = targetFlats.some((f) => Number(f.areaM2 || 0) > 0) && scope !== "FLAT";
   const totalWeight = useArea
-    ? targetFlats.reduce((s, f) => s + Math.max(0, Number(f.areaM2 || 0)), 0)
+    ? targetFlats.reduce((sum, flat) => sum + Math.max(0, Number(flat.areaM2 || 0)), 0)
     : targetFlats.length;
 
   const createdCharges = [];
   let allocated = 0;
   for (let i = 0; i < targetFlats.length; i += 1) {
-    const f = targetFlats[i];
-    const weight = scope === "FLAT" ? 1 : (useArea ? Math.max(0, Number(f.areaM2 || 0)) : 1);
+    const flat = targetFlats[i];
+    const weight = scope === "FLAT" ? 1 : (useArea ? Math.max(0, Number(flat.areaM2 || 0)) : 1);
     let part = scope === "FLAT" ? totalCents : Math.floor((totalCents * weight) / Math.max(1, totalWeight));
     if (i === targetFlats.length - 1) part = totalCents - allocated;
     allocated += part;
+
     createdCharges.push({
       createdAtMs: nowMs(),
       updatedAtMs: nowMs(),
       source: inv.source || "OCR",
       invoiceId,
-      flatId: f.id,
-      buildingId: f.buildingId || f.buildingNo || buildingId || null,
-      streetId: f.streetId || streetId || null,
-      staircaseId: f.staircaseId || f.staircase || f.entranceId || staircaseId || null,
+      flatId: flat.id,
+      buildingId: flat.buildingId || flat.buildingNo || buildingId || null,
+      streetId: flat.streetId || streetId || null,
+      staircaseId: flat.staircaseId || flat.staircase || flat.entranceId || staircaseId || null,
       category,
       period,
       amountCents: part,
       currency: "PLN",
       status: "OPEN",
       scope,
-      costTarget: scope === "FLAT" ? "flat" : scope === "BUILDING" ? "building" : scope === "STAIRCASE" ? "buildingCharges" : scope === "COMMUNITY" ? "community" : "buildingCharges",
+      costTarget: scope === "FLAT"
+        ? "flat"
+        : scope === "BUILDING"
+          ? "building"
+          : scope === "STAIRCASE"
+            ? "staircase"
+            : scope === "COMMUNITY"
+              ? "community"
+              : "buildingCharges",
       allocationMethod: scope === "FLAT" ? "DIRECT" : (useArea ? "AREA" : "EQUAL"),
+      runtimeFixVersion: RUNTIME_FIX_VERSION,
     });
   }
 
@@ -1414,7 +1542,39 @@ exports.approveInvoice = onCall(async (request) => {
     await recalcSettlement(communityId, affectedFlatId, period);
   }
 
-  return { ok: true, chargesCreated: createdCharges.length, affectedFlatIds, scope, runtimeFixVersion: RUNTIME_FIX_VERSION };
+  await ref.set({
+    status: "PRZENIESIONA_DO_SZKICU",
+    approvedAtMs: nowMs(),
+    approvedByUid: request.auth.uid,
+    archivedAtMs: nowMs(),
+    archivedByUid: request.auth.uid,
+    archiveMonth: archiveMonth || period,
+    isArchived: true,
+    movedToDraftAtMs: nowMs(),
+    settlementDraftCount: createdCharges.length,
+    lastDraftPeriod: period,
+    assigned: {
+      scope,
+      streetId: streetId || null,
+      buildingId: buildingId || null,
+      staircaseId: staircaseId || null,
+      flatId: flatId || null,
+      category,
+      period,
+      affectedFlatIds,
+    },
+    runtimeFixVersion: RUNTIME_FIX_VERSION,
+  }, { merge: true });
+
+  return {
+    ok: true,
+    chargesCreated: createdCharges.length,
+    affectedFlatIds,
+    scope,
+    archived: true,
+    archiveMonth: archiveMonth || period,
+    runtimeFixVersion: RUNTIME_FIX_VERSION,
+  };
 });
 
 exports.rebuildSettlementsForPeriod = onCall(async (request) => {
@@ -1567,13 +1727,17 @@ exports.publishSettlement = onCall(async (request) => {
   if (!snap.exists) throw new HttpsError("not-found", "Rozliczenie nie istnieje.");
 
   const settlement = snap.data();
-  await ref.set({
+  const patch = {
     status: "PUBLISHED",
     isPublished: true,
     publishedAtMs: nowMs(),
     publishedByUid: request.auth.uid,
-    sentAtMs: nowMs()
-  }, { merge: true });
+    archiveMonth: safeString(settlement.period || settlement.archiveMonth),
+    updatedAtMs: nowMs(),
+    runtimeFixVersion: RUNTIME_FIX_VERSION,
+  };
+  if (sendEmail) patch.sentAtMs = nowMs();
+  await ref.set(patch, { merge: true });
 
   if (sendEmail && settlement.flatId && settlement.period) {
     await sendSettlementEmailInternal({
@@ -1592,23 +1756,31 @@ exports.publishAllDraftSettlements = onCall(async (request) => {
   const period = safeString(request.data?.period);
   const sendEmail = request.data?.sendEmail === true;
   await assertSameCommunity(me, communityId);
-  if (!period) throw new HttpsError("invalid-argument", "Brak period.");
 
-  const snap = await db.collection(`communities/${communityId}/settlements`)
-    .where("period", "==", period)
-    .where("isPublished", "==", false)
-    .get();
+  const allSnap = await db.collection(`communities/${communityId}/settlements`).get();
+  const docs = allSnap.docs.filter((doc) => {
+    const data = doc.data() || {};
+    const draft = data.isPublished !== true;
+    const samePeriod = !period || safeString(data.period) === period;
+    return draft && samePeriod;
+  });
+
+  if (!docs.length) return { ok: true, publishedCount: 0, settlementIds: [] };
 
   const ids = [];
-  for (const doc of snap.docs) {
+  for (const doc of docs) {
     const s = doc.data();
-    await doc.ref.set({
+    const patch = {
       status: "PUBLISHED",
       isPublished: true,
       publishedAtMs: nowMs(),
       publishedByUid: request.auth.uid,
-      sentAtMs: nowMs()
-    }, { merge: true });
+      archiveMonth: safeString(s.period || s.archiveMonth),
+      updatedAtMs: nowMs(),
+      runtimeFixVersion: RUNTIME_FIX_VERSION,
+    };
+    if (sendEmail) patch.sentAtMs = nowMs();
+    await doc.ref.set(patch, { merge: true });
 
     if (sendEmail && s.flatId && s.period) {
       await sendSettlementEmailInternal({
