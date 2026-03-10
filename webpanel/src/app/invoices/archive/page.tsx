@@ -1,94 +1,69 @@
 "use client";
 
-import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
-import { collection, onSnapshot, orderBy, query } from "firebase/firestore";
-import { RequireAuth } from "../../../../components/RequireAuth";
-import { Nav } from "../../../../components/Nav";
-import { useAuth } from "../../../../lib/authContext";
-import { db } from "../../../../lib/firebase";
+import { useEffect, useState } from "react";
+import Nav from "@/components/Nav";
+import RequireAuth from "@/components/RequireAuth";
+import { db } from "@/lib/firebase";
+import { collection, getDocs } from "firebase/firestore";
 
-type Invoice = any;
+type Invoice = {
+  id: string;
+  supplier: string;
+  amount: number;
+  archiveMonth?: string;
+  period?: string;
+};
 
-const fromCents = (c: unknown) => (Number(c || 0) / 100).toFixed(2);
-const categoryLabel = (v: unknown) => ({
-  PRAD: "PRĄD",
-  WODA: "WODA",
-  GAZ: "GAZ",
-  SPRZATANIE: "SPRZĄTANIE",
-  REMONT: "REMONT",
-} as any)[String(v || "").toUpperCase()] || String(v || "INNE");
-
-export default function InvoicesArchivePage() {
-  const { profile } = useAuth();
-  const communityId = profile?.communityId || "";
-  const [items, setItems] = useState<Invoice[]>([]);
+export default function InvoiceArchivePage() {
+  const [invoices, setInvoices] = useState<Record<string, Invoice[]>>({});
 
   useEffect(() => {
-    if (!communityId) return;
-    let invItems: Invoice[] = [];
-    let ksefItems: Invoice[] = [];
-    const merge = () => setItems([...invItems, ...ksefItems].sort((a, b) => String(b.archiveMonth || b.period || "").localeCompare(String(a.archiveMonth || a.period || ""))));
+    const load = async () => {
+      const snap = await getDocs(collection(db, "invoices"));
+      const grouped: Record<string, Invoice[]> = {};
 
-    const u1 = onSnapshot(query(collection(db, "communities", communityId, "invoices"), orderBy("createdAtMs", "desc")), (snap) => {
-      invItems = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any), _sourceCollection: "invoices" }));
-      merge();
-    });
-    const u2 = onSnapshot(query(collection(db, "communities", communityId, "ksefInvoices"), orderBy("createdAtMs", "desc")), (snap) => {
-      ksefItems = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any), _sourceCollection: "ksefInvoices" }));
-      merge();
-    });
+      snap.docs.forEach((doc) => {
+        const data = doc.data() as Invoice;
+        const month = data.archiveMonth || data.period || "inne";
 
-    return () => {
-      u1();
-      u2();
+        if (!grouped[month]) grouped[month] = [];
+
+        grouped[month].push({
+          id: doc.id,
+          ...data,
+        });
+      });
+
+      setInvoices(grouped);
     };
-  }, [communityId]);
 
-  const groups = useMemo(() => {
-    const archived = items.filter((x) => !x.deletedAtMs && !!x.archivedAtMs && String(x.status || "").toUpperCase() !== "DELETED");
-    return archived.reduce((acc: Record<string, Invoice[]>, x: Invoice) => {
-      const key = String(x.archiveMonth || x.parsed?.period || x.period || "bez-daty");
-      (acc[key] ||= []).push(x);
-      return acc;
-    }, {});
-  }, [items]);
+    load();
+  }, []);
 
   return (
-    <RequireAuth roles={["MASTER", "ACCOUNTANT"]}>
+    <RequireAuth>
       <Nav />
-      <div style={{ padding: 24, display: "grid", gap: 16 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-          <h2>Archiwum faktur</h2>
-          <Link href="/invoices" className="btnGhost" style={{ textDecoration: "none", display: "inline-flex", alignItems: "center" }}>
-            Powrót do faktur
-          </Link>
-        </div>
 
-        <div className="card" style={{ display: "grid", gap: 12 }}>
-          <h3>Faktury zarchiwizowane według miesięcy</h3>
-          {Object.keys(groups).length === 0 ? (
-            <div style={{ opacity: 0.7 }}>Brak archiwum faktur.</div>
-          ) : (
-            Object.entries(groups)
-              .sort((a, b) => String(b[0]).localeCompare(String(a[0])))
-              .map(([period, rows]) => (
-                <div key={period} style={{ display: "grid", gap: 8 }}>
-                  <strong>{period}</strong>
-                  {rows.map((inv: any) => (
-                    <div key={`${inv._sourceCollection || "invoices"}-${inv.id}`} className="card" style={{ display: "grid", gap: 8 }}>
-                      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                        <strong>{inv.vendorName || "Faktura"}</strong>
-                        <span>{inv.title || inv.id}</span>
-                        <span>{fromCents(inv.totalGrossCents || inv.parsed?.amountCents || 0)} PLN</span>
-                        <span>{categoryLabel(inv.category || inv.parsed?.category)}</span>
-                      </div>
-                    </div>
-                  ))}
+      <div className="max-w-6xl mx-auto px-6 py-8 text-white">
+        <h1 className="text-2xl font-semibold mb-6">Archiwum faktur</h1>
+
+        {Object.entries(invoices).map(([month, items]) => (
+          <div key={month} className="mb-8">
+            <h2 className="text-lg font-semibold mb-3">{month}</h2>
+
+            <div className="space-y-2">
+              {items.map((inv) => (
+                <div
+                  key={inv.id}
+                  className="rounded-xl border border-white/10 p-4 flex justify-between"
+                >
+                  <span>{inv.supplier}</span>
+                  <span>{inv.amount} PLN</span>
                 </div>
-              ))
-          )}
-        </div>
+              ))}
+            </div>
+          </div>
+        ))}
       </div>
     </RequireAuth>
   );
