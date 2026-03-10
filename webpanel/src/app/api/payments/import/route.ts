@@ -75,16 +75,20 @@ export async function POST(req: NextRequest) {
     if (!["MASTER", "ACCOUNTANT", "ADMIN"].includes(role)) return NextResponse.json({ error: "Brak uprawnień." }, { status: 403 });
     if (userCommunityId && userCommunityId !== communityId) return NextResponse.json({ error: "Inna wspólnota." }, { status: 403 });
 
-    const [flatsSnap, settlementsSnap, paymentsSnap, communitySnap] = await Promise.all([
+    const [flatsSnap, settlementSnaps, paymentsSnap, communitySnap] = await Promise.all([
       db.collection(`communities/${communityId}/flats`).get(),
-      Promise.all([db.collection(`communities/${communityId}/settlements`).get(), db.collection(`communities/${communityId}/settlementDrafts`).get()]),
+      Promise.all([
+        db.collection(`communities/${communityId}/settlements`).get(),
+        db.collection(`communities/${communityId}/settlementDrafts`).get(),
+      ]) as Promise<[any, any]>,
       db.collection(`communities/${communityId}/payments`).get(),
       db.doc(`communities/${communityId}`).get(),
     ]);
 
     const flats = flatsSnap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
-    const publishedDocs = Array.isArray(settlementsSnap) ? settlementsSnap[0].docs : settlementsSnap.docs;
-    const draftDocs = Array.isArray(settlementsSnap) ? settlementsSnap[1].docs : [];
+    const [publishedSettlementsSnap, draftSettlementsSnap] = settlementSnaps;
+    const publishedDocs = publishedSettlementsSnap.docs;
+    const draftDocs = draftSettlementsSnap.docs;
     const settlementMap = new Map<string, any>();
     draftDocs.forEach((d: any) => settlementMap.set(d.id, { id: d.id, ...(d.data() as any), __collection: "settlementDrafts", isPublished: false }));
     publishedDocs.forEach((d: any) => settlementMap.set(d.id, { id: d.id, ...(d.data() as any), __collection: "settlements", isPublished: true }));

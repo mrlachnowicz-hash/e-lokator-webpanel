@@ -36,9 +36,12 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true, alreadyMatched: true, payment });
     }
 
-    const [flatsSnap, settlementsSnap, communitySnap] = await Promise.all([
+    const [flatsSnap, settlementSnaps, communitySnap] = await Promise.all([
       db.collection(`communities/${communityId}/flats`).limit(300).get(),
-      Promise.all([db.collection(`communities/${communityId}/settlements`).limit(400).get(), db.collection(`communities/${communityId}/settlementDrafts`).limit(400).get()]),
+      Promise.all([
+        db.collection(`communities/${communityId}/settlements`).limit(400).get(),
+        db.collection(`communities/${communityId}/settlementDrafts`).limit(400).get(),
+      ]) as Promise<[any, any]>,
       db.doc(`communities/${communityId}`).get(),
     ]);
 
@@ -51,7 +54,8 @@ export async function POST(req: Request) {
       buildingNo: d.get("buildingNo") || d.get("buildingId") || "",
       apartmentNo: d.get("apartmentNo") || d.get("flatNumber") || "",
     }));
-    const settlementDocs = Array.isArray(settlementsSnap) ? [...settlementsSnap[1].docs, ...settlementsSnap[0].docs] : settlementsSnap.docs;
+    const [publishedSettlementsSnap, draftSettlementsSnap] = settlementSnaps;
+    const settlementDocs = [...draftSettlementsSnap.docs, ...publishedSettlementsSnap.docs];
     const settlementCandidates = settlementDocs.slice(0, 200).map((d) => ({
       id: d.id,
       flatId: d.get("flatId") || "",
