@@ -2,6 +2,7 @@ const admin = require("firebase-admin");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { XMLParser } = require("fast-xml-parser");
 const PDFDocument = require("pdfkit");
 const nodemailer = require("nodemailer");
@@ -1064,6 +1065,174 @@ async function createReviewItem(communityId, data) {
 // KSeF / OCR / AI FACTURE FLOW
 // =========================================================
 
+function normalizeKsefSignatureParts(parts = []) {
+  return parts.map((part) => normalizeLookup(part)).filter(Boolean).join("|");
+}
+
+function buildKsefDedupeKeys(input = {}) {
+  const sellerName = safeString(input.sellerName || input.parsed?.sellerName || input.vendorName);
+  const sellerNip = safeString(input.sellerNip || input.parsed?.sellerNip || input.nip).replace(/\D/g, "");
+  const issueDate = safeString(input.issueDate || input.parsed?.issueDate);
+  const amount = Number(input.totalGrossCents || input.parsed?.totalGrossCents || input.amountCents || 0);
+  const invoiceNumber = safeString(input.invoiceNumber || input.parsed?.invoiceNumber);
+  const ksefNumber = safeString(input.ksefNumber || input.parsed?.ksefNumber);
+  const period = safeString(input.period || input.parsed?.period);
+  const keys = new Set();
+  const base = normalizeKsefSignatureParts([sellerName, sellerNip, issueDate, amount, invoiceNumber, period]);
+  if (base) keys.add(`BASE:${base}`);
+  const fallback = normalizeKsefSignatureParts([sellerName, issueDate, amount, period]);
+  if (fallback) keys.add(`FALLBACK:${fallback}`);
+  if (invoiceNumber) keys.add(`INV:${normalizeLookup(invoiceNumber)}`);
+  if (ksefNumber) keys.add(`KSEF:${normalizeLookup(ksefNumber)}`);
+  return Array.from(keys);
+}
+
+async function findDuplicateKsefInvoice(communityId, dedupeKeys = []) {
+  for (const key of dedupeKeys) {
+    const snap = await db.collection(`communities/${communityId}/ksefInvoices`).where("dedupeKeys", "array-contains", key).limit(1).get();
+    if (!snap.empty) return snap.docs[0];
+  }
+  return null;
+}
+
+async function saveKsefSyncState(communityId, patch) {
+  await db.doc(`communities/${communityId}/ksef/config`).set({
+    ...patch,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+}
+
+async function performKsefFetchForCommunity(communityId, options = {}) {
+  const cfgRef = db.doc(`communities/${communityId}/ksef/config`);
+  const cfgSnap = await cfgRef.get();
+  const cfg = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
+  const mode = safeString(options.mode || cfg.environment || cfg.mode || "MOCK").toUpperCase();
+  const count = Math.max(1, Math.min(20, Number(options.count || cfg.autoSyncCount || 5)));
+  const issueDate = safeString(options.issueDate || cfg.issueDate || "2026-03-01");
+  const sellerName = mode === "MOCK" ? "TAURON" : "KSeF import";
+  const created = [];
+  const duplicates = [];
+
+  if (cfg.syncInProgress === true && Number(cfg.lastSyncStartedAtMs || 0) > nowMs() - 30 * 60 * 1000) {
+    return { ok: true, skipped: true, reason: "SYNC_IN_PROGRESS", created, duplicates, mode };
+  }
+
+  await saveKsefSyncState(communityId, {
+    syncInProgress: true,
+    lastSyncStartedAtMs: nowMs(),
+    lastSyncMode: mode,
+  });
+
+  try {
+    for (let i = 0; i < count; i++) {
+      const total = Number((1234.56 + i).toFixed(2));
+      const totalGrossCents = toCents(total);
+      const ksefNumber = `${mode === "MOCK" ? "MOCK" : "KSEF"}-${issueDate}-${i + 1}`;
+      const invoiceNumber = `${mode === "MOCK" ? "FV-MOCK" : "FV-KSEF"}/${issueDate.replace(/-/g, "")}/${i + 1}`;
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Invoice>
+  <KSeFNumber>${ksefNumber}</KSeFNumber>
+  <IssueDate>${issueDate}</IssueDate>
+  <Seller><Name>${sellerName}</Name><NIP>1234567890</NIP></Seller>
+  <Buyer><Name>Wspólnota ${communityId}</Name><NIP>${safeString(cfg?.nip || options.nip || "")}</NIP></Buyer>
+  <InvoiceNumber>${invoiceNumber}</InvoiceNumber>
+  <Total>${total.toFixed(2)}</Total>
+  <Items><Item><Name>Energia elektryczna</Name><Amount>${total.toFixed(2)}</Amount></Item></Items>
+</Invoice>`;
+
+      const parsed = parseInvoiceXmlBasic(xml);
+      parsed.invoiceNumber = safeString(parsed.invoiceNumber || invoiceNumber);
+      parsed.totalGrossCents = Number(parsed.totalGrossCents || totalGrossCents);
+      parsed.period = safeString(parsed.period || monthFromDateStr(issueDate));
+      const dedupeKeys = cfg.dedupeEnabled === false ? [] : buildKsefDedupeKeys({
+        sellerName,
+        sellerNip: "1234567890",
+        issueDate,
+        totalGrossCents: parsed.totalGrossCents,
+        invoiceNumber: parsed.invoiceNumber,
+        ksefNumber,
+        period: parsed.period,
+        parsed,
+      });
+      const duplicateSnap = dedupeKeys.length ? await findDuplicateKsefInvoice(communityId, dedupeKeys) : null;
+      if (duplicateSnap) {
+        await duplicateSnap.ref.set({
+          updatedAtMs: nowMs(),
+          duplicateBlockedAtMs: nowMs(),
+          dedupeKeys,
+          duplicateSource: mode,
+          lastFetchAttemptAtMs: nowMs(),
+        }, { merge: true });
+        duplicates.push({ id: duplicateSnap.id, ksefNumber, invoiceNumber: parsed.invoiceNumber });
+        continue;
+      }
+
+      const ref = await db.collection(`communities/${communityId}/ksefInvoices`).add({
+        createdAtMs: nowMs(),
+        updatedAtMs: nowMs(),
+        status: "NOWA",
+        source: mode === "MOCK" ? "MOCK" : "KSEF",
+        xml,
+        parsed,
+        invoiceNumber: parsed.invoiceNumber,
+        totalGrossCents: parsed.totalGrossCents,
+        ksefNumber,
+        dedupeKeys,
+        assigned: { scope: null },
+        ai: { status: "PENDING" },
+        fetchedFromKsefAtMs: nowMs(),
+        fetchAttempt: Number(cfg.retryAttempts || 0) + 1,
+        ksefConfigSnapshot: {
+          mode,
+          environment: mode,
+          identifier: safeString(cfg?.identifier || ""),
+          nip: safeString(cfg?.nip || ""),
+        }
+      });
+      created.push({ id: ref.id, ksefNumber, invoiceNumber: parsed.invoiceNumber });
+    }
+
+    await saveKsefSyncState(communityId, {
+      syncInProgress: false,
+      lastSyncAtMs: nowMs(),
+      lastSyncSuccessAtMs: nowMs(),
+      lastSyncError: "",
+      retryAttempts: 0,
+      nextRetryAtMs: null,
+      lastSyncCreated: created.length,
+      lastSyncDuplicates: duplicates.length,
+    });
+
+    return { ok: true, created, duplicates, mode };
+  } catch (error) {
+    const retryEnabled = cfg.retryEnabled !== false;
+    const retryAttempts = Number(cfg.retryAttempts || 0) + 1;
+    const retryMaxAttempts = Math.max(1, Number(cfg.retryMaxAttempts || 3));
+    const retryDelayMinutes = Math.max(5, Number(cfg.retryDelayMinutes || 15));
+    const shouldRetry = retryEnabled && retryAttempts <= retryMaxAttempts;
+    await saveKsefSyncState(communityId, {
+      syncInProgress: false,
+      lastSyncError: safeString(error?.message || error),
+      lastSyncFailedAtMs: nowMs(),
+      retryAttempts,
+      nextRetryAtMs: shouldRetry ? nowMs() + retryDelayMinutes * 60 * 1000 : null,
+    });
+    throw error;
+  }
+}
+
+function shouldRunKsefSyncNow(cfg = {}) {
+  if (cfg.autoSyncEnabled !== true) return false;
+  if (cfg.syncInProgress === true && Number(cfg.lastSyncStartedAtMs || 0) > nowMs() - 30 * 60 * 1000) return false;
+  const now = nowMs();
+  const nextRetryAtMs = Number(cfg.nextRetryAtMs || 0);
+  if (nextRetryAtMs && nextRetryAtMs <= now) return true;
+  const intervalMinutes = Math.max(15, Number(cfg.autoSyncIntervalMinutes || 60));
+  const lastSyncAtMs = Number(cfg.lastSyncAtMs || 0);
+  if (!lastSyncAtMs) return true;
+  return lastSyncAtMs + intervalMinutes * 60 * 1000 <= now;
+}
+
 exports.ksefSetConfig = onCall(async (request) => {
   const me = await assertStaff(request);
   const communityId = safeString(request.data?.communityId || me.communityId);
@@ -1079,6 +1248,13 @@ exports.ksefSetConfig = onCall(async (request) => {
     subjectType: safeString(request.data?.subjectType || "Subject2"),
     syncFrom: safeString(request.data?.syncFrom || ""),
     syncTo: safeString(request.data?.syncTo || ""),
+    autoSyncEnabled: request.data?.autoSyncEnabled === true,
+    autoSyncIntervalMinutes: Math.max(15, Number(request.data?.autoSyncIntervalMinutes || 60)),
+    autoSyncCount: Math.max(1, Math.min(20, Number(request.data?.autoSyncCount || 5))),
+    retryEnabled: request.data?.retryEnabled !== false,
+    retryMaxAttempts: Math.max(1, Math.min(10, Number(request.data?.retryMaxAttempts || 3))),
+    retryDelayMinutes: Math.max(5, Math.min(1440, Number(request.data?.retryDelayMinutes || 15))),
+    dedupeEnabled: request.data?.dedupeEnabled !== false,
     updatedAtMs: nowMs(),
     updatedByUid: request.auth.uid
   }, { merge: true });
@@ -1091,48 +1267,51 @@ exports.ksefFetchInvoices = onCall(async (request) => {
   const communityId = safeString(request.data?.communityId || me.communityId);
   await assertSameCommunity(me, communityId);
 
-  const cfgSnap = await db.doc(`communities/${communityId}/ksef/config`).get();
-  const cfg = cfgSnap.exists ? cfgSnap.data() : {};
-  const mode = safeString(request.data?.mode || cfg?.environment || cfg?.mode || "MOCK").toUpperCase();
-  const count = Math.max(1, Math.min(20, Number(request.data?.count || 5)));
-  const created = [];
+  return await performKsefFetchForCommunity(communityId, {
+    mode: request.data?.mode,
+    count: request.data?.count,
+    issueDate: request.data?.issueDate,
+    nip: request.data?.nip,
+  });
+});
 
-  for (let i = 0; i < count; i++) {
-    const ksefNumber = `${mode === "MOCK" ? "MOCK" : "KSEF"}-${nowMs()}-${i}`;
-    const sellerName = mode === "MOCK" ? "TAURON" : "KSeF import";
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Invoice>
-  <KSeFNumber>${ksefNumber}</KSeFNumber>
-  <IssueDate>${safeString(request.data?.issueDate || "2026-03-01")}</IssueDate>
-  <Seller><Name>${sellerName}</Name><NIP>1234567890</NIP></Seller>
-  <Buyer><Name>Wspólnota ${communityId}</Name><NIP>${safeString(cfg?.nip || request.data?.nip || "")}</NIP></Buyer>
-  <Total>${(1234.56 + i).toFixed(2)}</Total>
-  <Items><Item><Name>Energia elektryczna</Name><Amount>${(1234.56 + i).toFixed(2)}</Amount></Item></Items>
-</Invoice>`;
+exports.ksefRunAutoSync = onSchedule({ schedule: "every 15 minutes", timeZone: "Europe/Warsaw", region: "europe-west1" }, async () => {
+  const communitiesSnap = await db.collection("communities").get();
+  let processed = 0;
+  let success = 0;
+  let failed = 0;
 
-    const parsed = parseInvoiceXmlBasic(xml);
-    const ref = await db.collection(`communities/${communityId}/ksefInvoices`).add({
-      createdAtMs: nowMs(),
-      updatedAtMs: nowMs(),
-      status: "NOWA",
-      source: mode === "MOCK" ? "MOCK" : "KSEF",
-      xml,
-      parsed,
-      ksefNumber,
-      assigned: { scope: null },
-      ai: { status: "PENDING" },
-      fetchedFromKsefAtMs: nowMs(),
-      ksefConfigSnapshot: {
-        mode,
-        environment: mode,
-        identifier: safeString(cfg?.identifier || ""),
-        nip: safeString(cfg?.nip || ""),
-      }
-    });
-    created.push({ id: ref.id, ksefNumber });
+  for (const communityDoc of communitiesSnap.docs) {
+    const communityId = communityDoc.id;
+    const cfgSnap = await db.doc(`communities/${communityId}/ksef/config`).get();
+    const cfg = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
+    if (!shouldRunKsefSyncNow(cfg)) continue;
+    processed += 1;
+    try {
+      await performKsefFetchForCommunity(communityId, {
+        mode: cfg.environment || cfg.mode,
+        count: cfg.autoSyncCount,
+      });
+      success += 1;
+    } catch (error) {
+      failed += 1;
+      console.error("ksefRunAutoSync failed", communityId, error?.message || error);
+    }
   }
 
-  return { ok: true, created, mode };
+  return { processed, success, failed };
+});
+
+exports.ksefRetryNow = onCall(async (request) => {
+  const me = await assertStaff(request);
+  const communityId = safeString(request.data?.communityId || me.communityId);
+  await assertSameCommunity(me, communityId);
+  return await performKsefFetchForCommunity(communityId, {
+    mode: request.data?.mode,
+    count: request.data?.count,
+    issueDate: request.data?.issueDate,
+    nip: request.data?.nip,
+  });
 });
 
 exports.ksefParseInvoice = onCall(async (request) => {
