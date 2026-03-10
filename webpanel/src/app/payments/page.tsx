@@ -8,6 +8,7 @@ import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
 import { buildStablePaymentTitle, normalizeAccountNumber, normalizePaymentRef } from "../../lib/paymentRefs";
+import { mergeSettlementsForView, SETTLEMENTS_COLLECTION, SETTLEMENT_DRAFTS_COLLECTION } from "../../lib/settlementCollections";
 
 const money = (c: unknown) => `${(Number(c || 0) / 100).toFixed(2)} PLN`;
 
@@ -121,14 +122,22 @@ export default function PaymentsPage() {
 
   useEffect(() => {
     if (!communityId) return;
+    let drafts: any[] = [];
+    let published: any[] = [];
+    const syncSettlements = () => setSettlements(mergeSettlementsForView(drafts, published));
     const u1 = onSnapshot(query(collection(db, "communities", communityId, "payments"), orderBy("createdAtMs", "desc")), (s) => {
       setPayments(s.docs.map((d) => ({ id: d.id, ...(d.data() as any) })));
     });
     const u2 = onSnapshot(collection(db, "communities", communityId, "flats"), (s) => {
       setFlats(s.docs.map((d) => ({ id: d.id, ...(d.data() as any) })));
     });
-    const u3 = onSnapshot(collection(db, "communities", communityId, "settlements"), (s) => {
-      setSettlements(s.docs.map((d) => ({ id: d.id, ...(d.data() as any) })));
+    const u3 = onSnapshot(collection(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION), (s) => {
+      drafts = s.docs.map((d) => ({ id: d.id, ...(d.data() as any), __collection: SETTLEMENT_DRAFTS_COLLECTION, isPublished: false }));
+      syncSettlements();
+    });
+    const u3b = onSnapshot(collection(db, "communities", communityId, SETTLEMENTS_COLLECTION), (s) => {
+      published = s.docs.map((d) => ({ id: d.id, ...(d.data() as any), __collection: SETTLEMENTS_COLLECTION, isPublished: true }));
+      syncSettlements();
     });
     const u4 = onSnapshot(doc(db, "communities", communityId), (snap) => {
       const data: any = snap.data() || {};
@@ -147,6 +156,7 @@ export default function PaymentsPage() {
       u1();
       u2();
       u3();
+      u3b();
       u4();
     };
   }, [communityId]);
@@ -233,7 +243,7 @@ export default function PaymentsPage() {
         patch.paymentTitle = paymentRef;
         patch.transferTitle = paymentRef;
         patch.paymentCode = paymentRef;
-        batch.set(doc(db, "communities", communityId, "settlements", settlement.id), patch, { merge: true });
+        batch.set(doc(db, "communities", communityId, settlement.__collection || SETTLEMENT_DRAFTS_COLLECTION, settlement.id), patch, { merge: true });
       });
       await batch.commit();
 

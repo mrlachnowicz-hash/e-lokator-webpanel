@@ -77,13 +77,18 @@ export async function POST(req: NextRequest) {
 
     const [flatsSnap, settlementsSnap, paymentsSnap, communitySnap] = await Promise.all([
       db.collection(`communities/${communityId}/flats`).get(),
-      db.collection(`communities/${communityId}/settlements`).get(),
+      Promise.all([db.collection(`communities/${communityId}/settlements`).get(), db.collection(`communities/${communityId}/settlementDrafts`).get()]),
       db.collection(`communities/${communityId}/payments`).get(),
       db.doc(`communities/${communityId}`).get(),
     ]);
 
     const flats = flatsSnap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
-    const settlements = settlementsSnap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+    const publishedDocs = Array.isArray(settlementsSnap) ? settlementsSnap[0].docs : settlementsSnap.docs;
+    const draftDocs = Array.isArray(settlementsSnap) ? settlementsSnap[1].docs : [];
+    const settlementMap = new Map<string, any>();
+    draftDocs.forEach((d: any) => settlementMap.set(d.id, { id: d.id, ...(d.data() as any), __collection: "settlementDrafts", isPublished: false }));
+    publishedDocs.forEach((d: any) => settlementMap.set(d.id, { id: d.id, ...(d.data() as any), __collection: "settlements", isPublished: true }));
+    const settlements = Array.from(settlementMap.values());
     const community = communitySnap.data() || {};
     const defaults = communityPaymentDefaults(community);
 
@@ -225,7 +230,7 @@ export async function POST(req: NextRequest) {
         const prevPayments = Number(settlement.totalPaymentsCents || settlement.paymentsCents || 0);
         const totalCharges = Number(settlement.totalChargesCents || settlement.chargesCents || 0);
         const nextPayments = prevPayments + amountCents;
-        await db.doc(`communities/${communityId}/settlements/${settlement.id}`).set({
+        await db.doc(`communities/${communityId}/${settlement.__collection || "settlementDrafts"}/${settlement.id}`).set({
           paymentRef: settlementPaymentRef,
           paymentTitle: settlementPaymentRef,
           transferTitle: settlementPaymentRef,

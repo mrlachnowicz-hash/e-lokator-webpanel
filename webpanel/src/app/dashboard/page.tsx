@@ -8,7 +8,7 @@ import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
 import { callable } from "../../lib/functions";
 import { Tile } from "../../components/Tile";
-import { IconSpreadsheet, IconBuilding, IconHome, IconReceipt, IconCoins, IconShield, IconGauge } from "../../components/icons";
+import { IconSpreadsheet, IconBuilding, IconHome, IconReceipt, IconCoins, IconShield, IconGauge, IconKey } from "../../components/icons";
 import { isPanelEnabled } from "../../lib/panelAccess";
 
 export default function DashboardPage() {
@@ -66,6 +66,7 @@ export default function DashboardPage() {
     { href: "/buildings", icon: <IconBuilding />, title: "Budynki", desc: "Budynki utworzone przez aplikację" },
     { href: "/flats", icon: <IconHome />, title: "Lokale", desc: "Lokal jako jednostka rozliczeniowa" },
     { href: "/invoices", icon: <IconReceipt />, title: "Faktury", desc: "Import, odczyt, sprawdzenie, rozliczenie" },
+    { href: "/ksef", icon: <IconKey />, title: "Ustaw KSeF", desc: "Token i pobieranie faktur z KSeF" },
     { href: "/charges", icon: <IconCoins />, title: "Rozliczenia", desc: "Naliczenia, rozliczenia, salda" },
     { href: "/payments", icon: <IconShield />, title: "Przelewy", desc: "Import CSV/XLSX i dopasowanie po tytule przelewu" },
     { href: "/meters", icon: <IconGauge />, title: "Liczniki", desc: "Konfiguracja, odczyty, zużycie, naliczenia" },

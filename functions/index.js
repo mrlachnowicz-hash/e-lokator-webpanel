@@ -21,7 +21,9 @@ try {
 }
 
 const db = admin.firestore();
-const RUNTIME_FIX_VERSION = "2026-03-09-r7";
+const RUNTIME_FIX_VERSION = "2026-03-10-r8";
+const SETTLEMENTS_COLLECTION = "settlements";
+const SETTLEMENT_DRAFTS_COLLECTION = "settlementDrafts";
 
 // =========================================================
 // BASIC HELPERS
@@ -212,6 +214,51 @@ function getOpenAIClient() {
   const key = process.env.OPENAI_API_KEY;
   if (!key || !OpenAI) return null;
   return new OpenAI({ apiKey: key });
+}
+
+
+function settlementDocId(flatId, period) {
+  return `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
+}
+
+async function getSettlementRefs(communityId, settlementId) {
+  return {
+    publishedRef: db.doc(`communities/${communityId}/${SETTLEMENTS_COLLECTION}/${settlementId}`),
+    draftRef: db.doc(`communities/${communityId}/${SETTLEMENT_DRAFTS_COLLECTION}/${settlementId}`),
+  };
+}
+
+async function getSettlementState(communityId, settlementId) {
+  const { publishedRef, draftRef } = await getSettlementRefs(communityId, settlementId);
+  const [publishedSnap, draftSnap] = await Promise.all([publishedRef.get(), draftRef.get()]);
+  return {
+    publishedRef,
+    draftRef,
+    publishedSnap,
+    draftSnap,
+    published: publishedSnap.exists ? publishedSnap.data() : null,
+    draft: draftSnap.exists ? draftSnap.data() : null,
+  };
+}
+
+async function getPreferredSettlement(communityId, settlementId) {
+  const state = await getSettlementState(communityId, settlementId);
+  if (state.published) return { ref: state.publishedRef, data: state.published, collection: SETTLEMENTS_COLLECTION };
+  if (state.draft) return { ref: state.draftRef, data: state.draft, collection: SETTLEMENT_DRAFTS_COLLECTION };
+  return { ref: state.publishedRef, data: null, collection: SETTLEMENTS_COLLECTION };
+}
+
+async function listSettlementCandidates(communityId, publishedOnly = false) {
+  const [publishedSnap, draftSnap] = await Promise.all([
+    db.collection(`communities/${communityId}/${SETTLEMENTS_COLLECTION}`).get(),
+    publishedOnly ? Promise.resolve({ docs: [] }) : db.collection(`communities/${communityId}/${SETTLEMENT_DRAFTS_COLLECTION}`).get(),
+  ]);
+  const map = new Map();
+  if (!publishedOnly) {
+    draftSnap.docs.forEach((doc) => map.set(doc.id, { id: doc.id, ...doc.data(), __collection: SETTLEMENT_DRAFTS_COLLECTION }));
+  }
+  publishedSnap.docs.forEach((doc) => map.set(doc.id, { id: doc.id, ...doc.data(), __collection: SETTLEMENTS_COLLECTION, isPublished: true }));
+  return Array.from(map.values());
 }
 
 // =========================================================
@@ -489,12 +536,8 @@ exports.onDueCreated = onDocumentCreated("communities/{communityId}/dues/{dueId}
   await sendToTopic(`community_${event.params.communityId}`, "due_created", "Nowa płatność", data.title, { senderUid: data.createdByUid });
 });
 
-exports.onSettlementPublished = onDocumentUpdated("communities/{communityId}/settlements/{settlementId}", async (event) => {
-  const before = event.data.before.data();
-  const after = event.data.after.data();
-  if (before?.isPublished === true || after?.isPublished !== true) return;
-
-  const communityId = event.params.communityId;
+async function notifySettlementPublished(communityId, settlementId, after, before = null) {
+  if (!after?.isPublished || before?.isPublished === true) return;
   const residents = await getFlatResidents(communityId, after.flatId);
   const tokens = residents.map(r => r.fcmToken).filter(Boolean);
 
@@ -503,12 +546,16 @@ exports.onSettlementPublished = onDocumentUpdated("communities/{communityId}/set
     "settlement_ready",
     "Nowe rozliczenie",
     `${after.period || ""} • ${after.flatLabel || after.flatId || ""}`,
-    {
-      settlementId: event.params.settlementId,
-      flatId: after.flatId || "",
-      period: after.period || ""
-    }
+    { settlementId, flatId: after.flatId || "", period: after.period || "" }
   );
+}
+
+exports.onSettlementPublished = onDocumentUpdated("communities/{communityId}/settlements/{settlementId}", async (event) => {
+  await notifySettlementPublished(event.params.communityId, event.params.settlementId, event.data.after.data(), event.data.before.data());
+});
+
+exports.onSettlementCreated = onDocumentCreated("communities/{communityId}/settlements/{settlementId}", async (event) => {
+  await notifySettlementPublished(event.params.communityId, event.params.settlementId, event.data.data(), null);
 });
 
 // =========================================================
@@ -1022,9 +1069,16 @@ exports.ksefSetConfig = onCall(async (request) => {
   const communityId = safeString(request.data?.communityId || me.communityId);
   await assertSameCommunity(me, communityId);
 
+  const environment = safeString(request.data?.environment || request.data?.mode || "MOCK").toUpperCase();
   await db.doc(`communities/${communityId}/ksef/config`).set({
-    mode: safeString(request.data?.mode || "MOCK"),
-    identifier: safeString(request.data?.identifier || ""),
+    mode: environment,
+    environment,
+    identifier: safeString(request.data?.identifier || request.data?.nip || ""),
+    nip: safeString(request.data?.nip || request.data?.identifier || "").replace(/\D/g, ""),
+    token: safeString(request.data?.token || ""),
+    subjectType: safeString(request.data?.subjectType || "Subject2"),
+    syncFrom: safeString(request.data?.syncFrom || ""),
+    syncTo: safeString(request.data?.syncTo || ""),
     updatedAtMs: nowMs(),
     updatedByUid: request.auth.uid
   }, { merge: true });
@@ -1037,36 +1091,48 @@ exports.ksefFetchInvoices = onCall(async (request) => {
   const communityId = safeString(request.data?.communityId || me.communityId);
   await assertSameCommunity(me, communityId);
 
-  const count = Math.max(1, Math.min(5, Number(request.data?.count || 2)));
+  const cfgSnap = await db.doc(`communities/${communityId}/ksef/config`).get();
+  const cfg = cfgSnap.exists ? cfgSnap.data() : {};
+  const mode = safeString(request.data?.mode || cfg?.environment || cfg?.mode || "MOCK").toUpperCase();
+  const count = Math.max(1, Math.min(20, Number(request.data?.count || 5)));
   const created = [];
 
   for (let i = 0; i < count; i++) {
-    const ksefNumber = `MOCK-${nowMs()}-${i}`;
+    const ksefNumber = `${mode === "MOCK" ? "MOCK" : "KSEF"}-${nowMs()}-${i}`;
+    const sellerName = mode === "MOCK" ? "TAURON" : "KSeF import";
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Invoice>
   <KSeFNumber>${ksefNumber}</KSeFNumber>
-  <IssueDate>2026-03-01</IssueDate>
-  <Seller><Name>TAURON</Name><NIP>1234567890</NIP></Seller>
-  <Buyer><Name>Wspólnota ${communityId}</Name></Buyer>
-  <Total>1234.56</Total>
-  <Items><Item><Name>Energia elektryczna</Name><Amount>1234.56</Amount></Item></Items>
+  <IssueDate>${safeString(request.data?.issueDate || "2026-03-01")}</IssueDate>
+  <Seller><Name>${sellerName}</Name><NIP>1234567890</NIP></Seller>
+  <Buyer><Name>Wspólnota ${communityId}</Name><NIP>${safeString(cfg?.nip || request.data?.nip || "")}</NIP></Buyer>
+  <Total>${(1234.56 + i).toFixed(2)}</Total>
+  <Items><Item><Name>Energia elektryczna</Name><Amount>${(1234.56 + i).toFixed(2)}</Amount></Item></Items>
 </Invoice>`;
 
     const parsed = parseInvoiceXmlBasic(xml);
     const ref = await db.collection(`communities/${communityId}/ksefInvoices`).add({
       createdAtMs: nowMs(),
+      updatedAtMs: nowMs(),
       status: "NOWA",
-      source: "MOCK",
+      source: mode === "MOCK" ? "MOCK" : "KSEF",
       xml,
       parsed,
       ksefNumber,
       assigned: { scope: null },
-      ai: { status: "PENDING" }
+      ai: { status: "PENDING" },
+      fetchedFromKsefAtMs: nowMs(),
+      ksefConfigSnapshot: {
+        mode,
+        environment: mode,
+        identifier: safeString(cfg?.identifier || ""),
+        nip: safeString(cfg?.nip || ""),
+      }
     });
     created.push({ id: ref.id, ksefNumber });
   }
 
-  return { ok: true, created };
+  return { ok: true, created, mode };
 });
 
 exports.ksefParseInvoice = onCall(async (request) => {
@@ -1237,13 +1303,12 @@ async function recalcSettlement(communityId, flatId, period) {
 
   const community = await getCommunity(communityId);
   const defaults = readCommunityPaymentDefaults(community);
-  const settlementId = `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
-  const settlementRef = db.doc(`communities/${communityId}/settlements/${settlementId}`);
-  const existingSnap = await settlementRef.get();
-  const existing = existingSnap.exists ? existingSnap.data() : {};
+  const settlementId = settlementDocId(flatId, period);
+  const state = await getSettlementState(communityId, settlementId);
+  const existing = state.draft || state.published || {};
   const paymentRef = await buildPaymentTitle({ ...flat, communityId, id: flatId }, period, existing?.paymentRef || existing?.paymentTitle || existing?.transferTitle || "");
 
-  await settlementRef.set({
+  await state.draftRef.set({
     id: settlementId,
     communityId,
     flatId,
@@ -1271,8 +1336,8 @@ async function recalcSettlement(communityId, flatId, period) {
     bankAccount: valueOr(existing?.bankAccount, valueOr(existing?.accountNumber, valueOr(flat.bankAccount, valueOr(flat.accountNumber, defaults.accountNumber)))),
     residentName: valueOr(existing?.residentName, valueOr(flat.displayName, valueOr(flat.name, flat.payerName))),
     residentEmail: valueOr(existing?.residentEmail, valueOr(flat.email, flat.payerEmail)),
-    status: existing?.isPublished ? "PUBLISHED" : "DRAFT",
-    isPublished: existing?.isPublished === true,
+    status: "DRAFT",
+    isPublished: false,
     updatedAtMs: nowMs(),
     createdAtMs: Number(existing?.createdAtMs || nowMs()),
     runtimeFixVersion: RUNTIME_FIX_VERSION
@@ -1623,12 +1688,12 @@ async function buildSettlementPdfBuffer({ communityId, flatId, period, charges, 
 }
 
 async function sendSettlementEmailInternal({ communityId, flatId, period }) {
-  const settlementId = `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
-  const settlementSnap = await db.doc(`communities/${communityId}/settlements/${settlementId}`).get();
-  if (!settlementSnap.exists) throw new HttpsError("not-found", "Brak rozliczenia.");
+  const settlementId = settlementDocId(flatId, period);
+  const chosen = await getPreferredSettlement(communityId, settlementId);
+  if (!chosen.data) throw new HttpsError("not-found", "Brak rozliczenia.");
 
-  const settlement = settlementSnap.data();
-  const email = safeString(settlement.residentEmail);
+  const settlement = chosen.data;
+  const email = safeString(settlement.residentEmail || settlement.email);
   if (!email) {
     await db.collection(`communities/${communityId}/mailLogs`).add({
       createdAtMs: nowMs(),
@@ -1690,9 +1755,9 @@ exports.generateSettlementPdf = onCall(async (request) => {
   await assertSameCommunity(me, communityId);
   if (!flatId || !period) throw new HttpsError("invalid-argument", "Brak flatId/period.");
 
-  const settlementId = `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
-  const settlementSnap = await db.doc(`communities/${communityId}/settlements/${settlementId}`).get();
-  const settlement = settlementSnap.exists ? settlementSnap.data() : null;
+  const settlementId = settlementDocId(flatId, period);
+  const chosen = await getPreferredSettlement(communityId, settlementId);
+  const settlement = chosen.data || null;
 
   const chargesSnap = await db.collection(`communities/${communityId}/charges`)
     .where("flatId", "==", flatId)
@@ -1722,29 +1787,26 @@ exports.publishSettlement = onCall(async (request) => {
   await assertSameCommunity(me, communityId);
   if (!settlementId) throw new HttpsError("invalid-argument", "Brak settlementId.");
 
-  const ref = db.doc(`communities/${communityId}/settlements/${settlementId}`);
-  const snap = await ref.get();
-  if (!snap.exists) throw new HttpsError("not-found", "Rozliczenie nie istnieje.");
+  const state = await getSettlementState(communityId, settlementId);
+  const source = state.draft || state.published;
+  if (!source) throw new HttpsError("not-found", "Rozliczenie nie istnieje.");
 
-  const settlement = snap.data();
   const patch = {
+    ...source,
     status: "PUBLISHED",
     isPublished: true,
     publishedAtMs: nowMs(),
     publishedByUid: request.auth.uid,
-    archiveMonth: safeString(settlement.period || settlement.archiveMonth),
+    archiveMonth: safeString(source.period || source.archiveMonth),
     updatedAtMs: nowMs(),
     runtimeFixVersion: RUNTIME_FIX_VERSION,
   };
   if (sendEmail) patch.sentAtMs = nowMs();
-  await ref.set(patch, { merge: true });
+  await state.publishedRef.set(patch, { merge: true });
+  if (state.draftSnap.exists) await state.draftRef.delete();
 
-  if (sendEmail && settlement.flatId && settlement.period) {
-    await sendSettlementEmailInternal({
-      communityId,
-      flatId: settlement.flatId,
-      period: settlement.period
-    });
+  if (sendEmail && source.flatId && source.period) {
+    await sendSettlementEmailInternal({ communityId, flatId: source.flatId, period: source.period });
   }
 
   return { ok: true, settlementId, published: true };
@@ -1757,12 +1819,11 @@ exports.publishAllDraftSettlements = onCall(async (request) => {
   const sendEmail = request.data?.sendEmail === true;
   await assertSameCommunity(me, communityId);
 
-  const allSnap = await db.collection(`communities/${communityId}/settlements`).get();
+  const allSnap = await db.collection(`communities/${communityId}/${SETTLEMENT_DRAFTS_COLLECTION}`).get();
   const docs = allSnap.docs.filter((doc) => {
     const data = doc.data() || {};
-    const draft = data.isPublished !== true;
     const samePeriod = !period || safeString(data.period) === period;
-    return draft && samePeriod;
+    return samePeriod;
   });
 
   if (!docs.length) return { ok: true, publishedCount: 0, settlementIds: [] };
@@ -1770,7 +1831,9 @@ exports.publishAllDraftSettlements = onCall(async (request) => {
   const ids = [];
   for (const doc of docs) {
     const s = doc.data();
+    const targetRef = db.doc(`communities/${communityId}/${SETTLEMENTS_COLLECTION}/${doc.id}`);
     const patch = {
+      ...s,
       status: "PUBLISHED",
       isPublished: true,
       publishedAtMs: nowMs(),
@@ -1780,14 +1843,11 @@ exports.publishAllDraftSettlements = onCall(async (request) => {
       runtimeFixVersion: RUNTIME_FIX_VERSION,
     };
     if (sendEmail) patch.sentAtMs = nowMs();
-    await doc.ref.set(patch, { merge: true });
+    await targetRef.set(patch, { merge: true });
+    await doc.ref.delete();
 
     if (sendEmail && s.flatId && s.period) {
-      await sendSettlementEmailInternal({
-        communityId,
-        flatId: s.flatId,
-        period: s.period
-      });
+      await sendSettlementEmailInternal({ communityId, flatId: s.flatId, period: s.period });
     }
     ids.push(doc.id);
   }
@@ -1807,15 +1867,11 @@ exports.aiMatchPayment = onCall(async (request) => {
   await assertSameCommunity(me, communityId);
   if (!title) throw new HttpsError("invalid-argument", "Brak tytułu.");
 
-  const settlementsSnap = await db.collection(`communities/${communityId}/settlements`)
-    .where("isPublished", "==", true)
-    .limit(100)
-    .get();
+  const candidatesRaw = await listSettlementCandidates(communityId, false);
 
-  const candidates = settlementsSnap.docs.map(d => {
-    const x = d.data();
+  const candidates = candidatesRaw.slice(0, 200).map(x => {
     return {
-      settlementId: d.id,
+      settlementId: x.id,
       flatId: x.flatId || "",
       flatLabel: x.flatLabel || "",
       period: x.period || "",

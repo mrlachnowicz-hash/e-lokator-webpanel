@@ -38,7 +38,7 @@ export async function POST(req: Request) {
 
     const [flatsSnap, settlementsSnap, communitySnap] = await Promise.all([
       db.collection(`communities/${communityId}/flats`).limit(300).get(),
-      db.collection(`communities/${communityId}/settlements`).limit(400).get(),
+      Promise.all([db.collection(`communities/${communityId}/settlements`).limit(400).get(), db.collection(`communities/${communityId}/settlementDrafts`).limit(400).get()]),
       db.doc(`communities/${communityId}`).get(),
     ]);
 
@@ -51,7 +51,8 @@ export async function POST(req: Request) {
       buildingNo: d.get("buildingNo") || d.get("buildingId") || "",
       apartmentNo: d.get("apartmentNo") || d.get("flatNumber") || "",
     }));
-    const settlementCandidates = settlementsSnap.docs.slice(0, 200).map((d) => ({
+    const settlementDocs = Array.isArray(settlementsSnap) ? [...settlementsSnap[1].docs, ...settlementsSnap[0].docs] : settlementsSnap.docs;
+    const settlementCandidates = settlementDocs.slice(0, 200).map((d) => ({
       id: d.id,
       flatId: d.get("flatId") || "",
       flatLabel: d.get("flatLabel") || "",
@@ -98,9 +99,11 @@ export async function POST(req: Request) {
     }
 
     const settlementId = suggestedSettlementId || `${suggestedFlatId}_${String(payment.period || new Date().toISOString().slice(0, 7))}`;
-    const settlementRef = db.doc(`communities/${communityId}/settlements/${settlementId}`);
-    const settlementSnap = await settlementRef.get();
-    const settlement = settlementSnap.exists ? (settlementSnap.data() as any) : {};
+    const settlementRefPublished = db.doc(`communities/${communityId}/settlements/${settlementId}`);
+    const settlementRefDraft = db.doc(`communities/${communityId}/settlementDrafts/${settlementId}`);
+    const [settlementSnapPublished, settlementSnapDraft] = await Promise.all([settlementRefPublished.get(), settlementRefDraft.get()]);
+    const settlementRef = settlementSnapDraft.exists ? settlementRefDraft : settlementRefPublished;
+    const settlement = settlementSnapDraft.exists ? (settlementSnapDraft.data() as any) : (settlementSnapPublished.exists ? (settlementSnapPublished.data() as any) : {});
     const community = communitySnap.data() || {};
     const defaults = communityPaymentDefaults(community);
     const amountCents = Number(payment.amountCents || Math.round(Number(payment.amount || 0) * 100) || 0);

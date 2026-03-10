@@ -30,6 +30,7 @@ export function Nav() {
             <Link href="/buildings">Budynki</Link>
             <Link href="/flats">Lokale</Link>
             <Link href="/invoices">Faktury</Link>
+            <Link href="/ksef">Ustaw KSeF</Link>
             <Link href="/charges">Rozliczenia</Link>
             <Link href="/meters">Liczniki</Link>
             <Link href="/payments">Przelewy</Link>
@@ -43,6 +44,5 @@ export function Nav() {
     </div>
   );
 }
-
 
 export default Nav;

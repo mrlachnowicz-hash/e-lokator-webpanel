@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { addDoc, collection, onSnapshot } from "firebase/firestore";
+import { addDoc, collection, deleteDoc, doc, getDocs, onSnapshot } from "firebase/firestore";
 import { callable } from "@/lib/functions";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/authContext";
@@ -29,6 +29,7 @@ type StreetOption = { id: string; name: string };
 type FlatItem = any & { id: string };
 
 const approveInvoiceCallable = callable<any, any>("approveInvoice");
+const fetchKsefCallable = callable<any, any>("ksefFetchInvoices");
 
 function normalizeScope(value: any) {
   const raw = String(value || "").trim().toUpperCase();
@@ -298,6 +299,49 @@ export default function InvoicesPage() {
     }
   };
 
+  const canDeleteInvoice = async (item: InvoiceItem) => {
+    const count = Number(item.settlementDraftCount || 0);
+    if (count > 0) return false;
+    const assigned = Array.isArray(item?.assigned?.affectedFlatIds) ? item.assigned.affectedFlatIds : [];
+    if (!assigned.length || !communityId || !inferPeriod(item)) return true;
+    const drafts = await getDocs(collection(db, "communities", communityId, "settlementDrafts"));
+    return !drafts.docs.some((d) => {
+      const data: any = d.data() || {};
+      return String(data.invoiceId || "") === item.id || (assigned.includes(String(data.flatId || "")) && String(data.period || "") === inferPeriod(item));
+    });
+  };
+
+  const deleteInvoice = async (item: InvoiceItem) => {
+    if (!communityId) return;
+    setBusyId(item.id);
+    setMessage(null);
+    try {
+      const allowed = await canDeleteInvoice(item);
+      if (!allowed) throw new Error("Nie można usunąć faktury powiązanej ze szkicem rozliczenia.");
+      await deleteDoc(doc(db, "communities", communityId, item.sourceCollection, item.id));
+      setMessage(`Usunięto fakturę ${item.id}.`);
+    } catch (error: any) {
+      setMessage(error?.message || "Błąd usuwania faktury.");
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  const fetchFromKsef = async () => {
+    if (!communityId) return;
+    setUploading(true);
+    setMessage(null);
+    try {
+      const res: any = await fetchKsefCallable({ communityId, count: 5 });
+      const count = Number(res?.data?.created?.length || 0);
+      setMessage(`Pobrano z KSeF: ${count} faktur.`);
+    } catch (error: any) {
+      setMessage(error?.message || "Błąd pobierania z KSeF.");
+    } finally {
+      setUploading(false);
+    }
+  };
+
   return (
     <RequireAuth roles={["MASTER", "ACCOUNTANT"]}>
       <Nav />
@@ -307,7 +351,11 @@ export default function InvoicesPage() {
             <h1 style={{ margin: 0 }}>Faktury</h1>
             <div style={{ opacity: 0.75 }}>Bieżące faktury robocze i do przeniesienia do szkicu rozliczeń.</div>
           </div>
-          <Link href="/invoices/archive" className="btnGhost" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}>Archiwum faktur</Link>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <button className="btnGhost" onClick={fetchFromKsef} disabled={uploading}>Pobierz z KSeF</button>
+            <Link href="/ksef" className="btnGhost" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}>Ustaw KSeF</Link>
+            <Link href="/invoices/archive" className="btnGhost" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}>Archiwum faktur</Link>
+          </div>
         </div>
 
         <div className="card" style={{ display: "grid", gap: 12 }}>
@@ -411,6 +459,7 @@ export default function InvoicesPage() {
                 </div>
                 <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                   <button className="btn" disabled={busyId === item.id || uploading} onClick={() => stageInvoice(item)}>{busyId === item.id ? "Przenoszenie..." : "Przenieś do szkicu"}</button>
+                  <button className="btnGhost" disabled={busyId === item.id || uploading} onClick={() => deleteInvoice(item)}>Usuń</button>
                   <div style={{ opacity: 0.78 }}>Zakres: <strong>{assignment.scope}</strong> · ID: <strong>{item.id}</strong></div>
                 </div>
               </div>

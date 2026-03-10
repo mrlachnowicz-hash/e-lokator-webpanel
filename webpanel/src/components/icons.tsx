@@ -60,3 +60,10 @@ export const IconGauge = () => (
     <path d="M12 20v1" />
   </Icon>
 );
+
+export const IconKey = () => (
+  <Icon>
+    <path d="M14 7a4 4 0 1 1-7.9 1H2v3h3v3h3v-3h2.1A4 4 0 0 1 14 7Z" />
+    <path d="M18 7h4M20 5v4" />
+  </Icon>
+);
