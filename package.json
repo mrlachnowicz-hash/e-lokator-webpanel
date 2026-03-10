@@ -1,0 +1,13 @@
+{
+  "name": "elokator-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "webpanel",
+    "functions"
+  ],
+  "scripts": {
+    "build:webpanel": "npm --prefix webpanel run build",
+    "deploy:functions": "npm --prefix functions run deploy"
+  }
+}
