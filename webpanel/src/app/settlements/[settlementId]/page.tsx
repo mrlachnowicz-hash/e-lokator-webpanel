@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { collection, doc, getDoc, onSnapshot, orderBy, query } from "firebase/firestore";
+import { normalizeAccountNumber } from "../../../lib/paymentRefs";
 import { Nav } from "../../../components/Nav";
 import { RequireAuth } from "../../../components/RequireAuth";
 import { useAuth } from "../../../lib/authContext";
@@ -123,6 +124,7 @@ export default function SettlementDetailsPage({ params }: { params: { settlement
   const [reviewItems, setReviewItems] = useState<ReviewItem[]>([]);
   const [transferOpen, setTransferOpen] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [communityDefaults, setCommunityDefaults] = useState<any>(null);
 
   useEffect(() => {
     if (!communityId || !settlementId) return;
@@ -137,6 +139,8 @@ export default function SettlementDetailsPage({ params }: { params: { settlement
       setLoadingSettlement(false);
     })();
 
+    const unsubCommunity = onSnapshot(doc(db, "communities", communityId), (snap) => setCommunityDefaults(snap.data() || null));
+
     const paymentsRef = query(collection(db, "communities", communityId, "payments"), orderBy("createdAtMs", "desc"));
     const unsubPayments = onSnapshot(paymentsRef, (snap) => {
       setPayments(snap.docs.map((d) => ({ ...(d.data() as Payment), id: d.id })));
@@ -149,6 +153,7 @@ export default function SettlementDetailsPage({ params }: { params: { settlement
 
     return () => {
       active = false;
+      unsubCommunity();
       unsubPayments();
       unsubReview();
     };
@@ -188,7 +193,8 @@ export default function SettlementDetailsPage({ params }: { params: { settlement
     return reviewItems.filter((item) => item.settlementId === settlementId || (item.flatId === flatId && item.period === period)).slice(0, 20);
   }, [reviewItems, settlement, settlementId]);
 
-  const bankAccount = settlement?.bankAccount || settlement?.accountNumber || "—";
+  const communityAccount = String(communityDefaults?.defaultAccountNumber || communityDefaults?.accountNumber || communityDefaults?.bankAccount || communityDefaults?.paymentSettings?.accountNumber || communityDefaults?.paymentDefaults?.accountNumber || "");
+  const bankAccount = normalizeAccountNumber(settlement?.bankAccount || settlement?.accountNumber) || normalizeAccountNumber(communityAccount) || "—";
   const transferTitle = settlement?.transferTitle || "—";
 
   return (

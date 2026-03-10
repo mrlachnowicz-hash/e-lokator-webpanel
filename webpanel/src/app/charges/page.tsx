@@ -121,7 +121,7 @@ export default function ChargesPage() {
     }, { merge: true });
 
     const batch = writeBatch(db);
-    drafts.forEach((draft) => {
+    items.forEach((draft) => {
       const flat = flats[draft.flatId] || null;
       const patch: Record<string, any> = { updatedAtMs: Date.now() };
       if (nextDefaults.defaultAccountNumber && shouldReplaceAccount(draft.accountNumber || draft.bankAccount, previousDefaults)) {
@@ -135,7 +135,7 @@ export default function ChargesPage() {
       }
       const paymentRef = pickSettlementTitle(draft, flat);
       patch.transferTitle = paymentRef; patch.paymentTitle = paymentRef; patch.paymentRef = paymentRef; patch.paymentCode = paymentRef;
-      batch.set(doc(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION, draft.id), patch, { merge: true });
+      batch.set(doc(db, "communities", communityId, draft.__collection || SETTLEMENT_DRAFTS_COLLECTION, draft.id), patch, { merge: true });
     });
     await batch.commit();
     setDefaults(nextDefaults);
@@ -143,11 +143,14 @@ export default function ChargesPage() {
   };
 
   const clearAllDrafts = async () => {
-    if (!window.confirm("Usunąć wszystkie szkice rozliczeń?")) return;
-    const batch = writeBatch(db);
-    drafts.forEach((item) => batch.delete(doc(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION, item.id)));
-    await batch.commit();
-    setMsg(`Usunięto szkice: ${drafts.length}.`);
+    if (!communityId || !window.confirm("Usunąć wszystkie szkice rozliczeń?")) return;
+    const res = await fetch("/api/settlements/clear-drafts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ communityId }),
+    });
+    const data = await res.json().catch(() => ({} as any));
+    setMsg(res.ok ? `Usunięto szkice: ${data.deleted || 0}.` : `Błąd czyszczenia szkiców: ${data.error || "nieznany"}`);
   };
 
   return (

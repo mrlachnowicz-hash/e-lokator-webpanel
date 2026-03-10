@@ -8,6 +8,7 @@ import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
 import { buildStablePaymentTitle, normalizeAccountNumber, normalizePaymentRef } from "../../lib/paymentRefs";
+import { getFlatDisplayLabel, getFlatResidentName } from "../../lib/flatDisplay";
 import { mergeSettlementsForView, SETTLEMENTS_COLLECTION, SETTLEMENT_DRAFTS_COLLECTION } from "../../lib/settlementCollections";
 
 const money = (c: unknown) => `${(Number(c || 0) / 100).toFixed(2)} PLN`;
@@ -34,7 +35,7 @@ const normalizePaymentRow = (row: any) => ({
   payerAddress: String(pickValue(row, ["payerAddress", "adres", "address"])).trim(),
 });
 
-const flatDisplay = (flat: any) => String(flat?.flatLabel || `${flat?.street || flat?.streetName || ""} ${flat?.buildingNo || ""}/${flat?.apartmentNo || flat?.flatNumber || ""}`.trim() || flat?.id || "—");
+const flatDisplay = (flat: any) => String(getFlatDisplayLabel(flat));
 
 function readCommunityDefaults(data: any): PaymentDefaults {
   return {
@@ -169,8 +170,8 @@ export default function PaymentsPage() {
     const balance = Number(latest?.balanceCents || 0);
     return {
       flat,
-      residentName: String(latest?.residentName || flat.residentName || flat.displayName || `${flat.name || ""} ${flat.surname || flat.lastName || ""}`.trim() || "—"),
-      payerName: String(latest?.payerName || latest?.residentName || flat.displayName || ""),
+      residentName: String(latest?.residentName || getFlatResidentName(flat) || "—"),
+      payerName: String(latest?.payerName || latest?.residentName || getFlatResidentName(flat) || ""),
       status: latest ? (balance <= 0 ? "PAID" : "UNPAID") : "NO_SETTLEMENT",
       paymentTitle: String(latest?.paymentRef || latest?.paymentTitle || latest?.transferTitle || ""),
       balanceCents: balance,

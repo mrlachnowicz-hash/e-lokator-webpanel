@@ -1412,6 +1412,10 @@ exports.aiSuggestInvoice = onCall(async (request) => {
   if (!snap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
 
   const inv = snap.data();
+  const invoiceStatus = safeString(inv.status).toUpperCase();
+  if (invoiceStatus === "PRZENIESIONA_DO_SZKICU" || invoiceStatus === "ARCHIVED") {
+    throw new HttpsError("already-exists", "Ta faktura została już wcześniej przeniesiona do szkicu rozliczeń.");
+  }
   const parsed = inv.parsed || {};
   const invoiceText = [
     inv.ksefNumber || "",
@@ -1710,6 +1714,10 @@ exports.approveInvoice = onCall(async (request) => {
   if (!snap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
 
   const inv = snap.data();
+  const invoiceStatus = safeString(inv.status).toUpperCase();
+  if (invoiceStatus === "PRZENIESIONA_DO_SZKICU" || invoiceStatus === "ARCHIVED") {
+    throw new HttpsError("already-exists", "Ta faktura została już wcześniej przeniesiona do szkicu rozliczeń.");
+  }
   const parsed = inv.parsed || {};
   const totalCents = Number(parsed.totalGrossCents || parsed.amountCents || inv.totalGrossCents || inv.amountCents || 0);
   const period = safeString(assignment.period || parsed.period || inv.period || inv.ai?.suggestion?.period);
@@ -1736,6 +1744,32 @@ exports.approveInvoice = onCall(async (request) => {
 
   if (targetFlats.length === 0) {
     throw new HttpsError("failed-precondition", `Brak lokali do naliczenia dla typu kosztu ${scope}. streetId=${streetId || "-"} buildingId=${buildingId || "-"} staircaseId=${staircaseId || "-"} flatId=${flatId || "-"}`);
+  }
+
+  const duplicateSignature = normalizeLookup([
+    safeString(inv.invoiceNumber || parsed.invoiceNumber),
+    safeString(inv.supplierName || inv.vendorName || parsed.sellerName),
+    String(totalCents),
+    period,
+    scope,
+  ].join("|"));
+  if (duplicateSignature) {
+    const existingChargesSnap = await db.collection(`communities/${communityId}/charges`).where("period", "==", period).get();
+    const duplicateForFlat = new Set(existingChargesSnap.docs
+      .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
+      .filter((charge) => normalizeLookup([
+        safeString(charge.invoiceNumber),
+        safeString(charge.supplierName || charge.vendorName || charge.sellerName),
+        String(Number(charge.invoiceTotalCents || charge.totalGrossCents || 0)),
+        safeString(charge.period),
+        safeString(charge.scope),
+      ].join("|")) === duplicateSignature)
+      .map((charge) => safeString(charge.flatId))
+      .filter(Boolean));
+    const duplicatedTarget = targetFlats.find((flat) => duplicateForFlat.has(safeString(flat.id)));
+    if (duplicatedTarget) {
+      throw new HttpsError("already-exists", `W szkicach istnieje już naliczenie tej faktury dla lokalu ${duplicatedTarget.flatLabel || duplicatedTarget.id}.`);
+    }
   }
 
   const useArea = targetFlats.some((f) => Number(f.areaM2 || 0) > 0) && scope !== "FLAT";
@@ -1777,6 +1811,10 @@ exports.approveInvoice = onCall(async (request) => {
               ? "community"
               : "buildingCharges",
       allocationMethod: scope === "FLAT" ? "DIRECT" : (useArea ? "AREA" : "EQUAL"),
+      invoiceNumber: safeString(inv.invoiceNumber || parsed.invoiceNumber),
+      supplierName: safeString(inv.supplierName || inv.vendorName || parsed.sellerName),
+      totalGrossCents,
+      invoiceTotalCents: totalCents,
       runtimeFixVersion: RUNTIME_FIX_VERSION,
     });
   }
