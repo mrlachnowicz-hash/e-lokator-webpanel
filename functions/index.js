@@ -544,8 +544,8 @@ async function notifySettlementPublished(communityId, settlementId, after, befor
   const afterSentAtMs = Number(after?.sentAtMs || 0);
   const justPublishedAndSent = isPublished && !wasPublished && afterSentAtMs > 0;
   const justSentAfterPublish = isPublished && wasPublished && afterSentAtMs > 0 && afterSentAtMs !== beforeSentAtMs;
-
   if (!justPublishedAndSent && !justSentAfterPublish) return;
+
   const residents = await getFlatResidents(communityId, after.flatId);
   const tokens = residents.map(r => r.fcmToken).filter(Boolean);
 
@@ -1196,7 +1196,17 @@ async function performKsefFetchForCommunity(communityId, options = {}) {
           nip: safeString(cfg?.nip || ""),
         }
       });
-      created.push({ id: ref.id, ksefNumber, invoiceNumber: parsed.invoiceNumber });
+      created.push({
+        id: ref.id,
+        ksefNumber,
+        invoiceNumber: parsed.invoiceNumber,
+        sourceCollection: "ksefInvoices",
+        status: "NOWA",
+        supplierName,
+        totalGrossCents: parsed.totalGrossCents,
+        period: parsed.period,
+        parsed,
+      });
     }
 
     await saveKsefSyncState(communityId, {
@@ -1307,6 +1317,32 @@ exports.ksefRunAutoSync = onSchedule({ schedule: "every 15 minutes", timeZone: "
   }
 
   return { processed, success, failed };
+});
+
+
+exports.clearSettlementDrafts = onCall(async (request) => {
+  const me = await assertStaff(request);
+  const communityId = safeString(request.data?.communityId || me.communityId);
+  await assertSameCommunity(me, communityId);
+
+  const snap = await db.collection(`communities/${communityId}/${SETTLEMENT_DRAFTS_COLLECTION}`).get();
+  if (snap.empty) return { ok: true, deleted: 0 };
+
+  let deleted = 0;
+  let batch = db.batch();
+  let ops = 0;
+  for (const d of snap.docs) {
+    batch.delete(d.ref);
+    deleted += 1;
+    ops += 1;
+    if (ops >= 450) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+  if (ops > 0) await batch.commit();
+  return { ok: true, deleted };
 });
 
 exports.ksefRetryNow = onCall(async (request) => {

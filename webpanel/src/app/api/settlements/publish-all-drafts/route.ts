@@ -24,7 +24,7 @@ export async function POST(req: Request) {
     const now = Date.now();
     for (const docSnap of docs) {
       const data: any = docSnap.data() || {};
-      await adminDb.doc(`communities/${communityId}/settlements/${docSnap.id}`).set({ ...data, isPublished: true, status: "PUBLISHED", publishedAtMs: now, updatedAtMs: now, archiveMonth: String(data.period || data.archiveMonth || "").trim(), sentAtMs: now }, { merge: true });
+      await adminDb.doc(`communities/${communityId}/settlements/${docSnap.id}`).set({ ...data, isPublished: true, status: "PUBLISHED", publishedAtMs: now, updatedAtMs: now, archiveMonth: String(data.period || data.archiveMonth || "").trim() }, { merge: true });
       await docSnap.ref.delete();
     }
 

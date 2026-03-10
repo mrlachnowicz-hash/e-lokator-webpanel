@@ -26,7 +26,7 @@ export async function POST(req: Request) {
     const period = String(data.period || data.archiveMonth || "").trim();
     const now = Date.now();
 
-    await publishedRef.set({ ...data, isPublished: true, status: "PUBLISHED", publishedAtMs: now, updatedAtMs: now, archiveMonth: period, sentAtMs: now }, { merge: true });
+    await publishedRef.set({ ...data, isPublished: true, status: "PUBLISHED", publishedAtMs: now, updatedAtMs: now, archiveMonth: period }, { merge: true });
     if (draftSnap.exists) await draftRef.delete();
 
     let emailFallback = false;
