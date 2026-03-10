@@ -34,5 +34,5 @@ export async function getSettlementBundle(communityId: string, settlementId: str
       || ""
   ).trim();
 
-  return { settlement, relatedPayments, flat, payer, community, email };
+  return { settlementRef, settlement, relatedPayments, flat, payer, community, email };
 }

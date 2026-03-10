@@ -32,7 +32,7 @@ export async function POST(req: Request, context: { params: { settlementId: stri
       (sgMail as any).setDataResidency("eu");
     }
 
-    const { settlement, relatedPayments, flat, payer, community, email } = await getSettlementBundle(communityId, settlementId);
+    const { settlementRef, settlement, relatedPayments, flat, payer, community, email } = await getSettlementBundle(communityId, settlementId);
     if (!email) {
       return NextResponse.json({ error: "No recipient email on settlement / flat / payer" }, { status: 400 });
     }
@@ -103,7 +103,7 @@ export async function POST(req: Request, context: { params: { settlementId: stri
       ],
     });
 
-    await settlement.ref.set({ sentAtMs: Date.now(), updatedAtMs: Date.now() }, { merge: true });
+    await settlementRef.set({ sentAtMs: Date.now(), updatedAtMs: Date.now() }, { merge: true });
 
     return NextResponse.json({ ok: true, email, pdfUrl });
   } catch (error: any) {
