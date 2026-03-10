@@ -538,7 +538,14 @@ exports.onDueCreated = onDocumentCreated("communities/{communityId}/dues/{dueId}
 });
 
 async function notifySettlementPublished(communityId, settlementId, after, before = null) {
-  if (!after?.isPublished || before?.isPublished === true) return;
+  const wasPublished = before?.isPublished === true;
+  const isPublished = after?.isPublished === true;
+  const beforeSentAtMs = Number(before?.sentAtMs || 0);
+  const afterSentAtMs = Number(after?.sentAtMs || 0);
+  const justPublishedAndSent = isPublished && !wasPublished && afterSentAtMs > 0;
+  const justSentAfterPublish = isPublished && wasPublished && afterSentAtMs > 0 && afterSentAtMs !== beforeSentAtMs;
+
+  if (!justPublishedAndSent && !justSentAfterPublish) return;
   const residents = await getFlatResidents(communityId, after.flatId);
   const tokens = residents.map(r => r.fcmToken).filter(Boolean);
 
@@ -1300,37 +1307,6 @@ exports.ksefRunAutoSync = onSchedule({ schedule: "every 15 minutes", timeZone: "
   }
 
   return { processed, success, failed };
-});
-
-
-exports.clearSettlementDrafts = onCall(async (request) => {
-  const communityId = safeString(request.data?.communityId);
-  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
-
-  const caller = await getCallerProfile(request.auth?.uid);
-  assertPanelRole(caller);
-  if (!sameCommunity(caller, communityId) && !isOwnerEmail(caller?.email)) {
-    throw new HttpsError("permission-denied", "Brak dostępu do tej wspólnoty.");
-  }
-
-  const snap = await db.collection(`communities/${communityId}/settlementDrafts`).get();
-  if (snap.empty) return { ok: true, deleted: 0 };
-
-  let deleted = 0;
-  let batch = db.batch();
-  let ops = 0;
-  for (const d of snap.docs) {
-    batch.delete(d.ref);
-    deleted += 1;
-    ops += 1;
-    if (ops >= 450) {
-      await batch.commit();
-      batch = db.batch();
-      ops = 0;
-    }
-  }
-  if (ops > 0) await batch.commit();
-  return { ok: true, deleted };
 });
 
 exports.ksefRetryNow = onCall(async (request) => {
