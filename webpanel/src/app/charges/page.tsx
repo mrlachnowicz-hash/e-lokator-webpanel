@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { collection, deleteDoc, doc, onSnapshot, orderBy, query, setDoc, updateDoc, writeBatch } from "firebase/firestore";
+import { collection, deleteDoc, doc, getDocs, onSnapshot, orderBy, query, setDoc, updateDoc, writeBatch } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
@@ -144,13 +144,30 @@ export default function ChargesPage() {
 
   const clearAllDrafts = async () => {
     if (!communityId || !window.confirm("Usunąć wszystkie szkice rozliczeń?")) return;
-    const res = await fetch("/api/settlements/clear-drafts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ communityId }),
-    });
-    const data = await res.json().catch(() => ({} as any));
-    setMsg(res.ok ? `Usunięto szkice: ${data.deleted || 0}.` : `Błąd czyszczenia szkiców: ${data.error || "nieznany"}`);
+    try {
+      const snap = await getDocs(collection(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION));
+      if (snap.empty) {
+        setMsg("Brak szkiców do usunięcia.");
+        return;
+      }
+      let deleted = 0;
+      let batch = writeBatch(db);
+      let ops = 0;
+      for (const d of snap.docs) {
+        batch.delete(d.ref);
+        deleted += 1;
+        ops += 1;
+        if (ops >= 450) {
+          await batch.commit();
+          batch = writeBatch(db);
+          ops = 0;
+        }
+      }
+      if (ops > 0) await batch.commit();
+      setMsg(`Usunięto szkice: ${deleted}.`);
+    } catch (error: any) {
+      setMsg(`Błąd czyszczenia szkiców: ${error?.message || "nieznany"}`);
+    }
   };
 
   return (
