@@ -1,13 +1,20 @@
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
+export const revalidate = 0;
+export const fetchCache = 'force-no-store';
 
 import { NextRequest, NextResponse } from 'next/server';
-import { FieldValue } from 'firebase-admin/firestore';
-import { getAdminApp, getAdminDb } from '../../../lib/server/firebaseAdmin';
-import { getSeatUsed } from '../../../lib/server/seatLimits';
 
 export async function POST(req: NextRequest) {
   try {
+    const [{ getAdminApp, getAdminDb }, { getSeatUsed }, adminModule] = await Promise.all([
+      import('../../../lib/server/firebaseAdmin'),
+      import('../../../lib/server/seatLimits'),
+      import('firebase-admin'),
+    ]);
+
+    const FieldValue = adminModule.firestore.FieldValue;
+
     const authHeader = req.headers.get('authorization') || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
     if (!token) return NextResponse.json({ error: 'Brak tokenu autoryzacji.' }, { status: 401 });
@@ -20,7 +27,9 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const communityId = String(body?.communityId || '').trim();
     const flatId = String(body?.flatId || '').trim();
-    if (!communityId || !flatId) return NextResponse.json({ error: 'Brak communityId lub flatId.' }, { status: 400 });
+    if (!communityId || !flatId) {
+      return NextResponse.json({ error: 'Brak communityId lub flatId.' }, { status: 400 });
+    }
 
     const userSnap = await db.collection('users').doc(uid).get();
     const userData = userSnap.data() || {};
@@ -42,24 +51,30 @@ export async function POST(req: NextRequest) {
       db.collection('users').where('communityId', '==', communityId).where('flatId', '==', flatId).get(),
     ]);
 
-    if (!flatSnap.exists) return NextResponse.json({ error: 'Lokal nie istnieje.' }, { status: 404 });
+    if (!flatSnap.exists) {
+      return NextResponse.json({ error: 'Lokal nie istnieje.' }, { status: 404 });
+    }
 
     const batch = db.batch();
     batch.delete(flatRef);
     batch.delete(payerRef);
     linkedUsers.docs.forEach((u) => {
-      batch.set(u.ref, {
-        role: 'REMOVED',
-        appBlocked: true,
-        flatId: FieldValue.delete(),
-        flatLabel: FieldValue.delete(),
-        staircaseId: FieldValue.delete(),
-        street: FieldValue.delete(),
-        buildingNo: FieldValue.delete(),
-        apartmentNo: FieldValue.delete(),
-        removedAtMs: Date.now(),
-        removedByUid: uid,
-      }, { merge: true });
+      batch.set(
+        u.ref,
+        {
+          role: 'REMOVED',
+          appBlocked: true,
+          flatId: FieldValue.delete(),
+          flatLabel: FieldValue.delete(),
+          staircaseId: FieldValue.delete(),
+          street: FieldValue.delete(),
+          buildingNo: FieldValue.delete(),
+          apartmentNo: FieldValue.delete(),
+          removedAtMs: Date.now(),
+          removedByUid: uid,
+        },
+        { merge: true },
+      );
     });
     await batch.commit();
 
@@ -72,4 +87,8 @@ export async function POST(req: NextRequest) {
   } catch (error: any) {
     return NextResponse.json({ error: error?.message || 'Błąd usuwania lokalu.' }, { status: 500 });
   }
+}
+
+export async function GET() {
+  return NextResponse.json({ error: 'Method not allowed.' }, { status: 405 });
 }
