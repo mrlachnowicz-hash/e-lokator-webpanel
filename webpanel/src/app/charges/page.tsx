@@ -7,14 +7,12 @@ import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
-import { callable } from "../../lib/functions";
 import { buildStablePaymentTitle, normalizeAccountNumber, normalizePaymentRef } from "../../lib/paymentRefs";
 import { mergeSettlementsForView, SETTLEMENTS_COLLECTION, SETTLEMENT_DRAFTS_COLLECTION } from "../../lib/settlementCollections";
 
 type Settlement = any;
 type Flat = any;
 type PaymentDefaults = { defaultAccountNumber: string; recipientName: string; recipientAddress: string };
-const clearDraftsCallable = callable<any, any>("clearSettlementDrafts");
 
 function money(v: any) { return `${Number(v || 0).toFixed(2)} PLN`; }
 function centsOrAmount(cents: any, amount: any) { return cents != null ? Number(cents) / 100 : Number(amount || 0); }
@@ -147,8 +145,14 @@ export default function ChargesPage() {
   const clearAllDrafts = async () => {
     if (!communityId || !window.confirm("Usunąć wszystkie szkice rozliczeń?")) return;
     try {
-      const res: any = await clearDraftsCallable({ communityId });
-      const deleted = Number(res?.data?.deleted || 0);
+      const res = await fetch("/api/settlements/clear-drafts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ communityId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || "Błąd czyszczenia szkiców.");
+      const deleted = Number(data?.deleted || 0);
       setMsg(deleted > 0 ? `Usunięto szkice: ${deleted}.` : "Brak szkiców do usunięcia.");
     } catch (error: any) {
       setMsg(`Błąd czyszczenia szkiców: ${error?.message || error?.details || "nieznany"}`);

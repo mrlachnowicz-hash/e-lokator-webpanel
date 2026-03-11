@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { addDoc, collection, deleteDoc, doc, getDocs, onSnapshot } from "firebase/firestore";
 import { callable } from "@/lib/functions";
 import { db } from "@/lib/firebase";
@@ -104,12 +104,10 @@ export default function InvoicesPage() {
   const [flats, setFlats] = useState<FlatItem[]>([]);
   const [assignments, setAssignments] = useState<Record<string, AssignmentState>>({});
   const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number; name: string } | null>(null);
   const [busyId, setBusyId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [ksefDebug, setKsefDebug] = useState<{ created: number; duplicates: number; totalVisible: number }>({ created: 0, duplicates: 0, totalVisible: 0 });
   const [ksefRecent, setKsefRecent] = useState<InvoiceItem[]>([]);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (!communityId) return;
@@ -127,8 +125,9 @@ export default function InvoicesPage() {
         const other = prev.filter((item) => item.sourceCollection !== "ksefInvoices");
         return [...other, ...own];
       });
-    }, (error) => {
-      setMessage(error?.message || "Brak dostępu do listy KSeF.");
+    }, () => {
+      setKsefRecent([]);
+      setInvoices((prev) => prev.filter((item) => item.sourceCollection !== "ksefInvoices"));
     });
     const unsubFlats = onSnapshot(collection(db, "communities", communityId, "flats"), (snap) => {
       setFlats(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })));
@@ -180,132 +179,127 @@ export default function InvoicesPage() {
     }));
   };
 
-  const uploadSingleFile = async (file: File) => {
-    const form = new FormData();
-    form.append("file", file);
-    form.append("communityId", communityId);
-    const res = await fetch("/api/ai/invoice-ocr", { method: "POST", body: form });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || `Błąd OCR faktury ${file.name}.`);
-
-    const grossAmount = Number(data.grossAmount || 0);
-    const totalGrossCents = Math.round(grossAmount * 100);
-    const period = String((data.issueDate || "").slice(0, 7) || "").trim();
-    const scope = normalizeScope(data.allocationType || "COMMON");
-    const now = Date.now();
-
-    await addDoc(collection(db, "communities", communityId, "invoices"), {
-      createdAtMs: now,
-      updatedAtMs: now,
-      source: "WEBPANEL_OCR",
-      status: data.needsReview ? "NOWA" : "READY_TO_STAGE",
-      filename: String(data.filename || file.name || "invoice"),
-      supplierName: String(data.supplierName || ""),
-      vendorName: String(data.supplierName || ""),
-      invoiceNumber: String(data.invoiceNumber || ""),
-      issueDate: String(data.issueDate || ""),
-      dueDate: String(data.dueDate || ""),
-      currency: String(data.currency || "PLN"),
-      amountCents: totalGrossCents,
-      totalGrossCents,
-      period,
-      category: String(data.category || "INNE"),
-      scope,
-      extractedText: String(data.extractedText || ""),
-      parsed: {
-        sellerName: String(data.supplierName || ""),
+  const handleSingleUpload = async (file: File | null) => {
+    if (!file || !communityId) return;
+    setUploading(true);
+    setMessage(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("communityId", communityId);
+      const res = await fetch("/api/ai/invoice-ocr", { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Błąd OCR faktury.");
+      const grossAmount = Number(data.grossAmount || 0);
+      const totalGrossCents = Math.round(grossAmount * 100);
+      const period = String((data.issueDate || "").slice(0, 7) || "").trim();
+      const scope = normalizeScope(data.allocationType || "COMMON");
+      const now = Date.now();
+      await addDoc(collection(db, "communities", communityId, "invoices"), {
+        createdAtMs: now,
+        updatedAtMs: now,
+        source: "WEBPANEL_OCR",
+        status: data.needsReview ? "NOWA" : "READY_TO_STAGE",
+        filename: String(data.filename || file.name || "invoice"),
+        supplierName: String(data.supplierName || ""),
+        vendorName: String(data.supplierName || ""),
+        invoiceNumber: String(data.invoiceNumber || ""),
         issueDate: String(data.issueDate || ""),
         dueDate: String(data.dueDate || ""),
-        period,
-        totalGrossCents,
-        amountCents: totalGrossCents,
         currency: String(data.currency || "PLN"),
-        category: String(data.category || "INNE"),
-        scope,
-        allocationType: scope,
-        suggestedBuildingId: String(data.suggestedBuildingId || ""),
-        suggestedFlatId: String(data.suggestedFlatId || ""),
-        suggestedStreetId: String(data.suggestedStreetId || ""),
-        suggestedStreetName: String(data.suggestedStreetName || ""),
-        suggestedApartmentNo: String(data.suggestedApartmentNo || ""),
-        suggestedStaircaseId: String(data.suggestedStaircaseId || ""),
-        reason: String(data.reason || ""),
-        ocrText: String(data.extractedText || ""),
-        extractedText: String(data.extractedText || ""),
-      },
-      assigned: {
-        scope,
-        streetId: String(data.suggestedStreetId || ""),
-        streetName: String(data.suggestedStreetName || ""),
-        buildingId: String(data.suggestedBuildingId || ""),
-        staircaseId: String(data.suggestedStaircaseId || ""),
-        flatId: String(data.suggestedFlatId || ""),
-        apartmentNo: String(data.suggestedApartmentNo || ""),
+        amountCents: totalGrossCents,
+        totalGrossCents,
         period,
         category: String(data.category || "INNE"),
-      },
-      ocr: {
-        pipeline: String(data.pipeline || ""),
-        confidence: Number(data.confidence || 0),
-        needsReview: Boolean(data.needsReview),
-        reason: String(data.reason || ""),
-      },
-      ai: {
-        status: "READY",
-        suggestion: {
+        scope,
+        extractedText: String(data.extractedText || ""),
+        parsed: {
+          sellerName: String(data.supplierName || ""),
+          issueDate: String(data.issueDate || ""),
+          dueDate: String(data.dueDate || ""),
+          period,
+          totalGrossCents,
+          amountCents: totalGrossCents,
+          currency: String(data.currency || "PLN"),
           category: String(data.category || "INNE"),
-          allocationType: scope,
           scope,
-          buildingId: String(data.suggestedBuildingId || ""),
-          flatId: String(data.suggestedFlatId || ""),
+          allocationType: scope,
+          suggestedBuildingId: String(data.suggestedBuildingId || ""),
+          suggestedFlatId: String(data.suggestedFlatId || ""),
+          suggestedStreetId: String(data.suggestedStreetId || ""),
+          suggestedStreetName: String(data.suggestedStreetName || ""),
+          suggestedApartmentNo: String(data.suggestedApartmentNo || ""),
+          suggestedStaircaseId: String(data.suggestedStaircaseId || ""),
+          reason: String(data.reason || ""),
+          ocrText: String(data.extractedText || ""),
+          extractedText: String(data.extractedText || ""),
+        },
+        assigned: {
+          scope,
           streetId: String(data.suggestedStreetId || ""),
           streetName: String(data.suggestedStreetName || ""),
-          apartmentNo: String(data.suggestedApartmentNo || ""),
+          buildingId: String(data.suggestedBuildingId || ""),
           staircaseId: String(data.suggestedStaircaseId || ""),
+          flatId: String(data.suggestedFlatId || ""),
+          apartmentNo: String(data.suggestedApartmentNo || ""),
+          period,
+          category: String(data.category || "INNE"),
+        },
+        ocr: {
+          pipeline: String(data.pipeline || ""),
           confidence: Number(data.confidence || 0),
           needsReview: Boolean(data.needsReview),
           reason: String(data.reason || ""),
-          period,
         },
-        updatedAtMs: now,
-      },
-    });
+        ai: {
+          status: "READY",
+          suggestion: {
+            category: String(data.category || "INNE"),
+            allocationType: scope,
+            scope,
+            buildingId: String(data.suggestedBuildingId || ""),
+            flatId: String(data.suggestedFlatId || ""),
+            streetId: String(data.suggestedStreetId || ""),
+            streetName: String(data.suggestedStreetName || ""),
+            apartmentNo: String(data.suggestedApartmentNo || ""),
+            staircaseId: String(data.suggestedStaircaseId || ""),
+            confidence: Number(data.confidence || 0),
+            needsReview: Boolean(data.needsReview),
+            reason: String(data.reason || ""),
+            period,
+          },
+          updatedAtMs: now,
+        },
+      });
+      setMessage(`Dodano fakturę ${String(data.supplierName || file.name)} do listy roboczej.`);
+    } catch (error: any) {
+      const err = new Error(error?.message || "Błąd dodawania faktury.");
+      setMessage(err.message);
+      throw err;
+    } finally {
+      setUploading(false);
+    }
   };
 
-  const handleUploadFiles = async (files: FileList | File[] | null) => {
-    if (!files || !communityId) return;
-    const queue = Array.from(files).filter(Boolean);
+
+  const handleUploadQueue = async (files: File[]) => {
+    const queue = files.filter(Boolean);
     if (!queue.length) return;
-
-    setUploading(true);
-    setMessage(null);
-    let success = 0;
+    const successes: string[] = [];
     const failures: string[] = [];
-
-    try {
-      for (let i = 0; i < queue.length; i += 1) {
-        const file = queue[i];
-        setUploadProgress({ current: i + 1, total: queue.length, name: file.name });
-        try {
-          await uploadSingleFile(file);
-          success += 1;
-        } catch (error: any) {
-          failures.push(`${file.name}: ${error?.message || "Błąd OCR faktury."}`);
-        }
+    for (const file of queue) {
+      try {
+        await handleSingleUpload(file);
+        successes.push(file.name);
+      } catch (error: any) {
+        failures.push(`${file.name}: ${error?.message || "Błąd dodawania faktury."}`);
       }
-
-      if (failures.length) {
-        setMessage(`Dodano ${success}/${queue.length} faktur. Błędy: ${failures.join(" | ")}`);
-      } else {
-        setMessage(queue.length === 1
-          ? `Dodano fakturę ${queue[0]?.name || ""}.`
-          : `Dodano ${success} faktury. Wszystkie pliki zostały przetworzone po kolei.`);
-      }
-    } finally {
-      setUploadProgress(null);
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
     }
+    if (queue.length === 1 && failures.length === 0) return;
+    const parts: string[] = [];
+    parts.push(`Dodano ${successes.length}/${queue.length} faktur.`);
+    if (failures.length) parts.push(`Błędy: ${failures.join(" | ")}`);
+    setMessage(parts.join(" "));
   };
 
   const stageInvoice = async (item: InvoiceItem) => {
@@ -355,25 +349,10 @@ export default function InvoicesPage() {
     setBusyId(item.id);
     setMessage(null);
     try {
-      const period = inferPeriod(item);
-      const assigned = Array.isArray(item?.assigned?.affectedFlatIds) ? item.assigned.affectedFlatIds.map((x: any) => String(x)) : [];
-      const drafts = await getDocs(collection(db, "communities", communityId, "settlementDrafts"));
-      const linkedDrafts = drafts.docs.filter((d) => {
-        const data: any = d.data() || {};
-        return String(data.invoiceId || "") === item.id || (!!period && assigned.includes(String(data.flatId || "")) && String(data.period || "") === period);
-      });
       const allowed = await canDeleteInvoice(item);
-      if (!allowed && linkedDrafts.length > 0) {
-        const confirmed = typeof window === "undefined" ? true : window.confirm(`Faktura jest powiązana ze szkicami (${linkedDrafts.length}). Usunąć fakturę razem z tymi szkicami?`);
-        if (!confirmed) throw new Error("Usuwanie anulowane.");
-        for (const draft of linkedDrafts) {
-          await deleteDoc(draft.ref);
-        }
-      } else if (!allowed) {
-        throw new Error("Nie można usunąć faktury powiązanej ze szkicem rozliczenia.");
-      }
+      if (!allowed) throw new Error("Nie można usunąć faktury powiązanej ze szkicem rozliczenia.");
       await deleteDoc(doc(db, "communities", communityId, item.sourceCollection, item.id));
-      setMessage(linkedDrafts.length > 0 ? `Usunięto fakturę ${item.id} i ${linkedDrafts.length} powiązanych szkiców.` : `Usunięto fakturę ${item.id}.`);
+      setMessage(`Usunięto fakturę ${item.id}.`);
     } catch (error: any) {
       setMessage(error?.message || "Błąd usuwania faktury.");
     } finally {
@@ -438,11 +417,11 @@ export default function InvoicesPage() {
 
         <div className="card" style={{ display: "grid", gap: 12 }}>
           <h3>Dodaj fakturę OCR</h3>
-          <input ref={fileInputRef} type="file" accept=".pdf,.jpg,.jpeg,.png,.webp" multiple onChange={async (e) => {
-            await handleUploadFiles(e.target.files);
+          <input type="file" multiple accept=".pdf,.jpg,.jpeg,.png,.webp" onChange={async (e) => {
+            await handleUploadQueue(Array.from(e.target.files || []));
+            e.currentTarget.value = "";
           }} />
           <div style={{ opacity: 0.78 }}>Obsługa: PDF, JPG, JPEG, PNG, WEBP. Możesz dodać kilka faktur naraz — pliki zostaną przetworzone po kolei i zakolejkowane.</div>
-          {uploadProgress ? <div style={{ opacity: 0.88 }}>Przetwarzanie {uploadProgress.current}/{uploadProgress.total}: <strong>{uploadProgress.name}</strong></div> : null}
         </div>
 
         {message ? <div style={{ color: "#8ef0c8" }}>{message}</div> : null}
