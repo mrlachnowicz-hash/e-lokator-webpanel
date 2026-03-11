@@ -145,15 +145,17 @@ export default function ChargesPage() {
   const clearAllDrafts = async () => {
     if (!communityId || !window.confirm("Usunąć wszystkie szkice rozliczeń?")) return;
     try {
-      const res = await fetch("/api/settlements/clear-drafts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ communityId }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error || "Błąd czyszczenia szkiców.");
-      const deleted = Number(data?.deleted || 0);
-      setMsg(deleted > 0 ? `Usunięto szkice: ${deleted}.` : "Brak szkiców do usunięcia.");
+      const draftRefs = drafts.map((item) => doc(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION, item.id));
+      if (!draftRefs.length) {
+        setMsg("Brak szkiców do usunięcia.");
+        return;
+      }
+      for (let i = 0; i < draftRefs.length; i += 400) {
+        const batch = writeBatch(db);
+        draftRefs.slice(i, i + 400).forEach((ref) => batch.delete(ref));
+        await batch.commit();
+      }
+      setMsg(`Usunięto szkice: ${draftRefs.length}.`);
     } catch (error: any) {
       setMsg(`Błąd czyszczenia szkiców: ${error?.message || error?.details || "nieznany"}`);
     }
@@ -163,8 +165,13 @@ export default function ChargesPage() {
     <RequireAuth roles={["MASTER", "ACCOUNTANT"]}>
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 16 }}>
-        <h2>Rozliczenia lokali</h2>
-        <p style={{ opacity: 0.8, marginTop: -8 }}>Szkice możesz usuwać lub publikować. Po wysłaniu rozliczenie trafia do archiwum i jest grupowane miesiącami.</p>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+          <div>
+            <h2 style={{ margin: 0 }}>Rozliczenia lokali</h2>
+            <p style={{ opacity: 0.8, marginTop: 6 }}>Szkice możesz usuwać lub publikować. Archiwum jest dostępne jako osobny widok miesięczny.</p>
+          </div>
+          <Link href="/charges/archive" className="btnGhost" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}>Archiwum rozliczeń</Link>
+        </div>
         <div className="card" style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "center" }}>
           <div>Szkice: <strong>{drafts.length}</strong></div>
           <div>Archiwum: <strong>{archived.length}</strong></div>
@@ -192,14 +199,10 @@ export default function ChargesPage() {
           {drafts.map((s) => <SettlementCard key={s.id} s={s} communityId={communityId} flat={flats[s.flatId] || null} setMsg={setMsg} defaults={defaults} buildTransferTitle={buildTransferTitle} archived={false} />)}
         </div>
 
-        <div className="card" style={{ display: "grid", gap: 12 }}>
-          <h3>Archiwum wysłanych rozliczeń</h3>
-          {Object.keys(archivedGroups).length === 0 ? <div style={{ opacity: 0.7 }}>Brak archiwum.</div> : Object.entries(archivedGroups).sort((a, b) => b[0].localeCompare(a[0])).map(([period, rows]) => (
-            <div key={period} style={{ display: "grid", gap: 10 }}>
-              <strong>{monthLabel(period)}</strong>
-              {rows.map((s) => <SettlementCard key={s.id} s={s} communityId={communityId} flat={flats[s.flatId] || null} setMsg={setMsg} defaults={defaults} buildTransferTitle={buildTransferTitle} archived />)}
-            </div>
-          ))}
+        <div className="card" style={{ display: "flex", gap: 16, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
+          <div>Archiwum wysłanych rozliczeń: <strong>{archived.length}</strong></div>
+          <div>Miesiące w archiwum: <strong>{Object.keys(archivedGroups).length}</strong></div>
+          <Link href="/charges/archive" className="btnGhost" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}>Otwórz archiwum</Link>
         </div>
       </div>
     </RequireAuth>

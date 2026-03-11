@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { addDoc, collection, deleteDoc, doc, getDocs, onSnapshot } from "firebase/firestore";
-import { callable } from "@/lib/functions";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/authContext";
 import { normalizeStreetId } from "@/lib/streetUtils";
@@ -27,8 +26,8 @@ type AssignmentState = {
 type StreetOption = { id: string; name: string };
 
 type FlatItem = any & { id: string };
+type UploadQueueItem = { id: string; name: string; status: "waiting" | "processing" | "done" | "error"; message?: string };
 
-const approveInvoiceCallable = callable<any, any>("approveInvoice");
 const fetchKsefCallable = callable<any, any>("ksefFetchInvoices");
 
 function normalizeScope(value: any) {
@@ -108,6 +107,7 @@ export default function InvoicesPage() {
   const [message, setMessage] = useState<string | null>(null);
   const [ksefDebug, setKsefDebug] = useState<{ created: number; duplicates: number; totalVisible: number }>({ created: 0, duplicates: 0, totalVisible: 0 });
   const [ksefRecent, setKsefRecent] = useState<InvoiceItem[]>([]);
+  const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
 
   useEffect(() => {
     if (!communityId) return;
@@ -285,17 +285,26 @@ export default function InvoicesPage() {
   const handleUploadQueue = async (files: File[]) => {
     const queue = files.filter(Boolean);
     if (!queue.length) return;
+    const initialQueue = queue.map((file, index) => ({ id: `${Date.now()}-${index}-${file.name}`, name: file.name, status: "waiting" as const, message: "Oczekuje w kolejce" }));
+    setUploadQueue(initialQueue);
+
     const successes: string[] = [];
     const failures: string[] = [];
-    for (const file of queue) {
+    for (let index = 0; index < queue.length; index += 1) {
+      const file = queue[index];
+      const currentId = initialQueue[index]?.id;
+      setUploadQueue((prev) => prev.map((item) => item.id === currentId ? { ...item, status: "processing", message: "Trwa przetwarzanie OCR/AI" } : item));
       try {
         await handleSingleUpload(file);
         successes.push(file.name);
+        setUploadQueue((prev) => prev.map((item) => item.id === currentId ? { ...item, status: "done", message: "Dodano poprawnie" } : item));
       } catch (error: any) {
-        failures.push(`${file.name}: ${error?.message || "Błąd dodawania faktury."}`);
+        const errMessage = error?.message || "Błąd dodawania faktury.";
+        failures.push(`${file.name}: ${errMessage}`);
+        setUploadQueue((prev) => prev.map((item) => item.id === currentId ? { ...item, status: "error", message: errMessage } : item));
       }
     }
-    if (queue.length === 1 && failures.length === 0) return;
+
     const parts: string[] = [];
     parts.push(`Dodano ${successes.length}/${queue.length} faktur.`);
     if (failures.length) parts.push(`Błędy: ${failures.join(" | ")}`);
@@ -308,22 +317,27 @@ export default function InvoicesPage() {
     setBusyId(item.id);
     setMessage(null);
     try {
-      const response = await approveInvoiceCallable({
-        communityId,
-        invoiceId: item.id,
-        assignment: {
-          scope: normalizeScope(assignment.scope),
-          streetId: assignment.streetId || normalizeStreetId(assignment.streetName || ""),
-          streetName: assignment.streetName || "",
-          buildingId: assignment.buildingId || "",
-          staircaseId: assignment.staircaseId || "",
-          flatId: assignment.flatId || "",
-          apartmentNo: assignment.apartmentNo || "",
-          period: assignment.period || inferPeriod(item),
-          category: assignment.category || inferCategory(item),
-        },
+      const res = await fetch("/api/invoices/stage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          communityId,
+          invoiceId: item.id,
+          assignment: {
+            scope: normalizeScope(assignment.scope),
+            streetId: assignment.streetId || normalizeStreetId(assignment.streetName || ""),
+            streetName: assignment.streetName || "",
+            buildingId: assignment.buildingId || "",
+            staircaseId: assignment.staircaseId || "",
+            flatId: assignment.flatId || "",
+            apartmentNo: assignment.apartmentNo || "",
+            period: assignment.period || inferPeriod(item),
+            category: assignment.category || inferCategory(item),
+          },
+        }),
       });
-      const data: any = response.data || {};
+      const data: any = await res.json();
+      if (!res.ok) throw new Error(data.error || "Błąd przenoszenia faktury do szkicu.");
       setMessage(`Przeniesiono do szkicu: ${data.chargesCreated || 0} naliczeń, zakres ${data.scope || normalizeScope(assignment.scope)}.`);
     } catch (error: any) {
       setMessage(error?.message || error?.details || "Błąd przenoszenia faktury do szkicu.");
@@ -425,6 +439,18 @@ export default function InvoicesPage() {
         </div>
 
         {message ? <div style={{ color: "#8ef0c8" }}>{message}</div> : null}
+
+        {uploadQueue.length > 0 ? (
+          <div className="card" style={{ display: "grid", gap: 8 }}>
+            <strong>Kolejka OCR / AI</strong>
+            {uploadQueue.map((item, index) => (
+              <div key={item.id} style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", padding: "8px 10px", borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", background: "rgba(255,255,255,0.03)" }}>
+                <div>{index + 1}. {item.name}</div>
+                <div style={{ opacity: 0.9 }}>{item.status === "waiting" ? "Oczekuje" : item.status === "processing" ? "Przetwarzanie" : item.status === "done" ? "Gotowe" : "Błąd"}{item.message ? ` — ${item.message}` : ""}</div>
+              </div>
+            ))}
+          </div>
+        ) : null}
 
         <div className="card" style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
           <div>Aktywne faktury: <strong>{activeInvoices.length}</strong></div>
