@@ -32,8 +32,10 @@ export async function POST(req: NextRequest) {
     const dedupeDrafts = new Map<string, any>();
     for (const d of draftSnap.docs) dedupeDrafts.set(d.id, { id: d.id, ...(d.data() || {}), __collection: "settlementDrafts", isPublished: false });
     for (const d of legacyDraftSnap.docs || []) if (!dedupeDrafts.has(d.id)) dedupeDrafts.set(d.id, { id: d.id, ...(d.data() || {}), __collection: "settlementDrafts", isPublished: false });
-    const drafts = Array.from(dedupeDrafts.values()).sort((a, b) => Number(b.updatedAtMs || b.createdAtMs || 0) - Number(a.updatedAtMs || a.createdAtMs || 0));
-    const settlements = publishedSnap.docs.map((d) => ({ id: d.id, ...(d.data() || {}), __collection: "settlements", isPublished: true })).sort((a, b) => Number(b.updatedAtMs || b.createdAtMs || 0) - Number(a.updatedAtMs || a.createdAtMs || 0));
+    const drafts: any[] = Array.from(dedupeDrafts.values()).sort((a: any, b: any) => Number(b?.updatedAtMs || b?.createdAtMs || 0) - Number(a?.updatedAtMs || a?.createdAtMs || 0));
+    const settlements: any[] = publishedSnap.docs
+      .map((d: any) => ({ id: d.id, ...(d.data() || {}), __collection: "settlements", isPublished: true }))
+      .sort((a: any, b: any) => Number(b?.updatedAtMs || b?.createdAtMs || 0) - Number(a?.updatedAtMs || a?.createdAtMs || 0));
 
     return NextResponse.json({ ok: true, drafts, settlements });
   } catch (error: any) {
