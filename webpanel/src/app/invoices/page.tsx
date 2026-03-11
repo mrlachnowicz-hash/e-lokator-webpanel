@@ -34,11 +34,32 @@ const fetchKsefCallable = httpsCallable<any, any>(getFunctions(undefined, "europ
 function normalizeScope(value: any) {
   const raw = String(value || "").trim().toUpperCase();
   if (["LOCAL", "LOKAL"].includes(raw)) return "FLAT";
+  if (["ULICA", "STREET"].includes(raw)) return "STREET";
   if (["BUDYNEK"].includes(raw)) return "BUILDING";
   if (["KLATKA", "ENTRANCE"].includes(raw)) return "STAIRCASE";
   if (["WSPOLNOTA"].includes(raw)) return "COMMUNITY";
   if (["WSPOLNE", "CZESCI_WSPOLNE"].includes(raw)) return "COMMON";
-  return ["FLAT", "BUILDING", "STAIRCASE", "COMMON", "COMMUNITY"].includes(raw) ? raw : "COMMON";
+  return ["FLAT", "STREET", "BUILDING", "STAIRCASE", "COMMON", "COMMUNITY"].includes(raw) ? raw : "COMMON";
+}
+
+
+function normalizeLookup(value: any) {
+  return String(value || "")
+    .trim()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function buildInvoiceSignature(item: any) {
+  return normalizeLookup([
+    item?.invoiceNumber || item?.parsed?.invoiceNumber || item?.ksefNumber || "",
+    item?.supplierName || item?.vendorName || item?.parsed?.sellerName || "",
+    String(Number(item?.parsed?.totalGrossCents || item?.parsed?.amountCents || item?.totalGrossCents || item?.amountCents || 0)),
+    item?.period || item?.parsed?.period || item?.archiveMonth || "",
+    inferScope(item),
+  ].join("|"));
 }
 
 function monthLabel(period: string) {
@@ -109,6 +130,12 @@ export default function InvoicesPage() {
   const [ksefDebug, setKsefDebug] = useState<{ created: number; duplicates: number; totalVisible: number }>({ created: 0, duplicates: 0, totalVisible: 0 });
   const [ksefRecent, setKsefRecent] = useState<InvoiceItem[]>([]);
   const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
+
+  const hasDuplicateInvoice = (candidate: any) => {
+    const signature = buildInvoiceSignature(candidate);
+    if (!signature) return false;
+    return invoices.some((row) => buildInvoiceSignature(row) === signature);
+  };
 
   useEffect(() => {
     if (!communityId) return;
@@ -195,6 +222,16 @@ export default function InvoicesPage() {
       const totalGrossCents = Math.round(grossAmount * 100);
       const period = String((data.issueDate || "").slice(0, 7) || "").trim();
       const scope = normalizeScope(data.allocationType || "COMMON");
+      const candidate = {
+        invoiceNumber: String(data.invoiceNumber || ""),
+        supplierName: String(data.supplierName || ""),
+        totalGrossCents,
+        amountCents: totalGrossCents,
+        period,
+        scope,
+        parsed: { invoiceNumber: String(data.invoiceNumber || ""), sellerName: String(data.supplierName || ""), totalGrossCents, amountCents: totalGrossCents, period, scope },
+      };
+      if (hasDuplicateInvoice(candidate)) throw new Error("Nie dodano DUPLIKAT");
       const now = Date.now();
       await addDoc(collection(db, "communities", communityId, "invoices"), {
         createdAtMs: now,
@@ -339,7 +376,7 @@ export default function InvoicesPage() {
       });
       const data: any = await res.json();
       if (!res.ok) throw new Error(data.error || "Błąd przenoszenia faktury do szkicu.");
-      setMessage(`Przeniesiono do szkicu: ${data.chargesCreated || 0} naliczeń, zakres ${data.scope || normalizeScope(assignment.scope)}.`);
+      setMessage(`Przeniesiono do szkicu: ${data.chargesCreated || 0} naliczeń i ${data.draftCount || 0} szkiców, zakres ${data.scope || normalizeScope(assignment.scope)}.`);
     } catch (error: any) {
       setMessage(error?.message || error?.details || "Błąd przenoszenia faktury do szkicu.");
     } finally {
@@ -527,6 +564,7 @@ export default function InvoicesPage() {
                 <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
                   <select className="select" value={assignment.scope} onChange={(e) => updateAssignment(item.id, { scope: e.target.value, flatId: e.target.value === "FLAT" ? assignment.flatId : "", staircaseId: e.target.value === "STAIRCASE" || e.target.value === "COMMON" ? assignment.staircaseId : "" })}>
                     <option value="FLAT">FLAT · lokal</option>
+                    <option value="STREET">STREET · ulica</option>
                     <option value="BUILDING">BUILDING · budynek</option>
                     <option value="STAIRCASE">STAIRCASE · klatka</option>
                     <option value="COMMON">COMMON · części wspólne</option>

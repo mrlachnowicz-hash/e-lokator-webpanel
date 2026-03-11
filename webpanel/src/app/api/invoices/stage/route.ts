@@ -13,6 +13,9 @@ function norm(value: any) {
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
 }
+function normalizeLookup(value: any) {
+  return norm(value).replace(/[^a-z0-9]+/g, "");
+}
 function normId(value: any) {
   return norm(value).replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
@@ -43,6 +46,69 @@ function readCommunityDefaults(data: any) {
     recipientAddress: valueOr(data?.recipientAddress, data?.receiverAddress, data?.transferAddress, data?.paymentSettings?.recipientAddress, data?.paymentDefaults?.recipientAddress),
   };
 }
+
+function buildInvoiceSignature(input: any) {
+  const invoiceNumber = safe(input?.invoiceNumber || input?.parsed?.invoiceNumber);
+  const sellerName = safe(input?.supplierName || input?.vendorName || input?.parsed?.sellerName);
+  const totalCents = Number(input?.totalGrossCents || input?.amountCents || input?.parsed?.totalGrossCents || input?.parsed?.amountCents || 0);
+  const period = safe(input?.period || input?.parsed?.period);
+  const scope = normalizeScope(input?.scope || input?.parsed?.scope || input?.parsed?.allocationType);
+  return normalizeLookup([invoiceNumber, sellerName, String(totalCents), period, scope].join("|"));
+}
+
+async function forceUpsertDraft(adminDb: any, communityId: string, flat: Flat, period: string, communityData: any, invoiceId: string) {
+  const chargesSnap = await adminDb.collection(`communities/${communityId}/charges`).where("flatId", "==", flat.id).where("period", "==", period).get();
+  const totalChargesCents = chargesSnap.docs.reduce((sum: number, d: any) => sum + Number(d?.data?.()?.amountCents || 0), 0);
+  const chargeIds = chargesSnap.docs.map((d: any) => String(d.id));
+  const invoiceIds = Array.from(new Set(chargesSnap.docs.map((d: any) => String(d.data()?.invoiceId || "")).filter(Boolean)));
+  const defaults = readCommunityDefaults(communityData);
+  const paymentRef = buildStablePaymentTitle({
+    communityId,
+    flatId: flat.id,
+    street: flat.street || flat.streetName,
+    buildingNo: flat.buildingNo || flat.buildingId,
+    apartmentNo: flat.apartmentNo || flat.flatNumber,
+    flatLabel: flatLabel(flat),
+    period,
+  });
+  await adminDb.doc(`communities/${communityId}/settlementDrafts/${settlementDocId(flat.id, period)}`).set({
+    id: settlementDocId(flat.id, period),
+    communityId,
+    flatId: flat.id,
+    flatLabel: flatLabel(flat),
+    street: valueOr(flat.street, flat.streetName),
+    buildingNo: valueOr(flat.buildingNo, flat.buildingId),
+    apartmentNo: valueOr(flat.apartmentNo, flat.flatNumber),
+    period,
+    dueDate: `${period}-15`,
+    chargeIds,
+    invoiceId: invoiceIds[0] || invoiceId,
+    invoiceIds: invoiceIds.length ? invoiceIds : [invoiceId],
+    paymentRef,
+    paymentTitle: paymentRef,
+    paymentCode: paymentRef,
+    transferTitle: paymentRef,
+    chargesCents: totalChargesCents,
+    totalChargesCents,
+    paymentsCents: 0,
+    totalPaymentsCents: 0,
+    balanceCents: totalChargesCents,
+    totalDueCents: totalChargesCents,
+    transferName: valueOr(flat.recipientName, flat.receiverName, defaults.recipientName),
+    receiverName: valueOr(flat.receiverName, flat.recipientName, defaults.recipientName),
+    transferAddress: valueOr(flat.recipientAddress, flat.receiverAddress, defaults.recipientAddress),
+    receiverAddress: valueOr(flat.receiverAddress, flat.recipientAddress, defaults.recipientAddress),
+    accountNumber: normalizeAccountNumber(valueOr(flat.accountNumber, flat.bankAccount, defaults.accountNumber)),
+    bankAccount: normalizeAccountNumber(valueOr(flat.bankAccount, flat.accountNumber, defaults.accountNumber)),
+    residentName: valueOr(flat.displayName, flat.name, flat.payerName),
+    residentEmail: valueOr(flat.email, flat.payerEmail),
+    status: "DRAFT",
+    isPublished: false,
+    updatedAtMs: Date.now(),
+    createdAtMs: Date.now(),
+  }, { merge: true });
+}
+
 function flatLabel(flat: any) {
   return valueOr(flat?.flatLabel, `${safe(flat?.street || flat?.streetName)} ${safe(flat?.buildingNo || flat?.buildingId)}/${safe(flat?.apartmentNo || flat?.flatNumber)}`.trim(), flat?.id);
 }
@@ -203,6 +269,24 @@ export async function POST(req: Request) {
     const targetFlats = matchFlats(flats, assignment, parsed, scope);
     if (!targetFlats.length) return NextResponse.json({ error: "Brak lokali do rozliczenia dla tej faktury." }, { status: 400 });
 
+    const duplicateSignature = buildInvoiceSignature({ ...inv, parsed, totalGrossCents: totalCents, amountCents: totalCents, period, scope });
+    if (duplicateSignature) {
+      const existingChargesSnap = await adminDb.collection(`communities/${communityId}/charges`).where("period", "==", period).get();
+      const duplicateFlatIds = new Set(existingChargesSnap.docs
+        .map((doc: any) => ({ id: doc.id, ...(doc.data() || {}) }))
+        .filter((charge: any) => normalizeLookup([
+          safe(charge.invoiceNumber),
+          safe(charge.supplierName || charge.vendorName || charge.sellerName),
+          String(Number(charge.invoiceTotalCents || charge.totalGrossCents || 0)),
+          safe(charge.period),
+          normalizeScope(charge.scope),
+        ].join("|")) === duplicateSignature)
+        .map((charge: any) => safe(charge.flatId))
+        .filter(Boolean));
+      const duplicatedTarget = targetFlats.find((flat) => duplicateFlatIds.has(safe(flat.id)));
+      if (duplicatedTarget) return NextResponse.json({ error: `Nie dodano DUPLIKAT: faktura jest już w rozliczeniach dla lokalu ${flatLabel(duplicatedTarget)}.` }, { status: 409 });
+    }
+
     const useArea = scope !== "FLAT" && targetFlats.some((flat) => Number(flat.areaM2 || 0) > 0);
     const totalWeight = scope === "FLAT" ? 1 : (useArea ? targetFlats.reduce((sum, flat) => sum + Math.max(0, Number(flat.areaM2 || 0)), 0) : targetFlats.length);
 
@@ -255,8 +339,15 @@ export async function POST(req: Request) {
     }
     await flush();
 
+    const createdDraftIds: string[] = [];
     for (const flat of targetFlats) {
       await rebuildSettlement(adminDb as any, communityId, flat, period, communitySnap.data() || {});
+      const draftRef = adminDb.doc(`communities/${communityId}/settlementDrafts/${settlementDocId(flat.id, period)}`);
+      const draftSnap = await draftRef.get();
+      if (!draftSnap.exists) {
+        await forceUpsertDraft(adminDb as any, communityId, flat, period, communitySnap.data() || {}, invoiceId);
+      }
+      createdDraftIds.push(settlementDocId(flat.id, period));
     }
 
     await ref.set({
@@ -282,7 +373,7 @@ export async function POST(req: Request) {
       },
     }, { merge: true });
 
-    return NextResponse.json({ ok: true, sourceCollection, chargesCreated: createdCharges.length, affectedFlatIds: targetFlats.map((flat) => flat.id), scope, archived: true, archiveMonth: archiveMonth || period });
+    return NextResponse.json({ ok: true, sourceCollection, chargesCreated: createdCharges.length, draftCount: createdDraftIds.length, settlementDraftIds: createdDraftIds, affectedFlatIds: targetFlats.map((flat) => flat.id), scope, archived: true, archiveMonth: archiveMonth || period });
   } catch (error: any) {
     return NextResponse.json({ error: error?.message || "Stage invoice error" }, { status: 500 });
   }
