@@ -279,6 +279,15 @@ async function assertSignedIn(request) {
   const me = await getMe(request.auth.uid);
   if (!me) throw new HttpsError("failed-precondition", "Brak profilu użytkownika.");
   if (me.appBlocked === true) throw new HttpsError("permission-denied", "Konto zablokowane.");
+
+  const communityId = safeString(me.communityId || me.customerId);
+  if (communityId) {
+    const communitySnap = await db.doc(`communities/${communityId}`).get();
+    if (communitySnap.exists && communitySnap.data()?.blocked === true) {
+      throw new HttpsError("permission-denied", "Wspólnota jest zablokowana.");
+    }
+  }
+
   return me;
 }
 
@@ -835,7 +844,11 @@ exports.activateCommunity = onCall(async (request) => {
     const codeRef = db.doc(`activation_codes/${code}`);
     const codeSnap = await tx.get(codeRef);
     if (!codeSnap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
-    if (codeSnap.data().used === true) throw new HttpsError("failed-precondition", "Kod już użyty.");
+    const codeData = codeSnap.data() || {};
+    if (codeData.used === true) throw new HttpsError("failed-precondition", "Kod już użyty.");
+    if (codeData.disabled === true || String(codeData.status || "").toUpperCase() === "DISABLED") {
+      throw new HttpsError("failed-precondition", "Kod aktywacyjny jest wyłączony.");
+    }
 
     tx.set(communityRef, {
       id: communityRef.id,
@@ -2564,4 +2577,1042 @@ exports.aiExplainReview = onCall(async (request) => {
   }, { merge: true });
 
   return { ok: true, explanation };
+});
+
+
+// =========================================================
+// OWNER PANEL CALLABLES
+// =========================================================
+
+exports.disableActivationCode = onCall(async (request) => {
+  assertOwner(request);
+  const code = safeString(request.data?.code).toUpperCase();
+  if (!code) throw new HttpsError("invalid-argument", "Brak kodu.");
+
+  const ref = db.doc(`activation_codes/${code}`);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
+
+  await ref.set({
+    disabled: true,
+    status: "DISABLED",
+    updatedAtMs: nowMs(),
+    disabledAtMs: nowMs(),
+    disabledByUid: request.auth.uid,
+  }, { merge: true });
+
+  return { ok: true };
+});
+
+exports.setCommunityBlocked = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeString(request.data?.communityId);
+  const blocked = request.data?.blocked === true;
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+
+  const ref = db.doc(`communities/${communityId}`);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Wspólnota nie istnieje.");
+
+  await ref.set({
+    blocked,
+    updatedAtMs: nowMs(),
+    blockedAtMs: blocked ? nowMs() : admin.firestore.FieldValue.delete(),
+    blockedByUid: blocked ? request.auth.uid : admin.firestore.FieldValue.delete(),
+  }, { merge: true });
+
+  return { ok: true, communityId, blocked };
+});
+
+exports.setCommunityPanelAccess = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeString(request.data?.communityId);
+  const enabled = request.data?.enabled === true;
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+
+  const ref = db.doc(`communities/${communityId}`);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Wspólnota nie istnieje.");
+
+  await ref.set({
+    panelAccessEnabled: enabled,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+
+  return { ok: true, communityId, enabled };
+});
+
+exports.approveSeatRequest = onCall(async (request) => {
+  assertOwner(request);
+  const requestId = safeString(request.data?.requestId);
+  const communityId = safeString(request.data?.communityId);
+  const deltaSeats = Number(request.data?.deltaSeats || 0);
+  if (!requestId || !communityId) throw new HttpsError("invalid-argument", "Brak requestId lub communityId.");
+  if (!Number.isFinite(deltaSeats) || deltaSeats === 0) {
+    throw new HttpsError("invalid-argument", "deltaSeats musi być różne od 0.");
+  }
+
+  const reqRef = db.doc(`seat_requests/${requestId}`);
+  const commRef = db.doc(`communities/${communityId}`);
+  const now = nowMs();
+
+  return await db.runTransaction(async (tx) => {
+    const [reqSnap, commSnap] = await Promise.all([tx.get(reqRef), tx.get(commRef)]);
+    if (!reqSnap.exists) throw new HttpsError("not-found", "Wniosek nie istnieje.");
+    if (!commSnap.exists) throw new HttpsError("not-found", "Wspólnota nie istnieje.");
+
+    const req = reqSnap.data() || {};
+    const reqCommunityId = safeString(req.communityId);
+    if (reqCommunityId && reqCommunityId !== communityId) {
+      throw new HttpsError("failed-precondition", "Wniosek dotyczy innej wspólnoty.");
+    }
+    const status = String(req.status || "PENDING").toUpperCase();
+    if (status !== "PENDING") {
+      throw new HttpsError("failed-precondition", "Wniosek został już przetworzony.");
+    }
+
+    const current = Number(commSnap.data()?.seatsTotal || 0);
+    const updated = Math.max(0, current + deltaSeats);
+    tx.set(commRef, {
+      seatsTotal: updated,
+      updatedAtMs: now,
+    }, { merge: true });
+
+    if (deltaSeats > 0) {
+      const purchaseRef = commRef.collection("seat_purchases").doc();
+      tx.set(purchaseRef, {
+        seats: deltaSeats,
+        purchasedAtMs: now,
+        validUntilMs: now + 365 * 24 * 60 * 60 * 1000,
+        blocked: false,
+        createdAtMs: now,
+        updatedAtMs: now,
+        createdByUid: request.auth.uid,
+        source: "OWNER_APPROVAL",
+        sourceRequestId: requestId,
+      });
+    }
+
+    tx.set(reqRef, {
+      status: "APPROVED",
+      processedAtMs: now,
+      processedByUid: request.auth.uid,
+      approvedDeltaSeats: deltaSeats,
+      updatedAtMs: now,
+    }, { merge: true });
+
+    return { ok: true, communityId, requestId, seatsTotal: updated };
+  });
+});
+
+exports.rejectSeatRequest = onCall(async (request) => {
+  assertOwner(request);
+  const requestId = safeString(request.data?.requestId);
+  if (!requestId) throw new HttpsError("invalid-argument", "Brak requestId.");
+
+  const reqRef = db.doc(`seat_requests/${requestId}`);
+  const snap = await reqRef.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Wniosek nie istnieje.");
+  const status = String(snap.data()?.status || "PENDING").toUpperCase();
+  if (status !== "PENDING") {
+    throw new HttpsError("failed-precondition", "Wniosek został już przetworzony.");
+  }
+
+  await reqRef.set({
+    status: "REJECTED",
+    processedAtMs: nowMs(),
+    processedByUid: request.auth.uid,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+
+  return { ok: true, requestId };
+});
+
+exports.deleteCommunity = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeString(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+
+  const ref = db.doc(`communities/${communityId}`);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Wspólnota nie istnieje.");
+
+  await ref.delete();
+  return { ok: true, communityId };
+});
+
+exports.extendPurchaseByYear = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeString(request.data?.communityId);
+  const purchaseId = safeString(request.data?.purchaseId);
+  if (!communityId || !purchaseId) throw new HttpsError("invalid-argument", "Brak communityId lub purchaseId.");
+
+  const ref = db.doc(`communities/${communityId}/seat_purchases/${purchaseId}`);
+  const now = nowMs();
+  return await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new HttpsError("not-found", "Zakup nie istnieje.");
+    const current = Number(snap.data()?.validUntilMs || 0);
+    const base = Math.max(current, now);
+    const validUntilMs = base + 365 * 24 * 60 * 60 * 1000;
+    tx.set(ref, { validUntilMs, updatedAtMs: now }, { merge: true });
+    return { ok: true, communityId, purchaseId, validUntilMs };
+  });
+});
+
+exports.setPurchaseBlocked = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeString(request.data?.communityId);
+  const purchaseId = safeString(request.data?.purchaseId);
+  const blocked = request.data?.blocked === true;
+  if (!communityId || !purchaseId) throw new HttpsError("invalid-argument", "Brak communityId lub purchaseId.");
+
+  const ref = db.doc(`communities/${communityId}/seat_purchases/${purchaseId}`);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Zakup nie istnieje.");
+
+  await ref.set({ blocked, updatedAtMs: nowMs() }, { merge: true });
+  return { ok: true, communityId, purchaseId, blocked };
+});
+// =========================================================
+// APP / WEBPANEL / OWNER COMPATIBILITY LAYER
+// Overrides selected callables with a superset implementation so
+// owner_generator can be deployed without breaking E-Lokator app
+// and webpanel flows that share the same Firebase project.
+// =========================================================
+
+function compatSafeText(v, fallback = "") {
+  return String(v == null ? fallback : v).trim();
+}
+
+function compatRequireAuth(request) {
+  if (!request.auth || !request.auth.uid) {
+    throw new HttpsError("unauthenticated", "Zaloguj się.");
+  }
+  return request.auth.uid;
+}
+
+async function compatGetMyProfile(uid) {
+  return await getMe(uid);
+}
+
+async function compatRequireCommunityStaff(request, communityId) {
+  const profile = await assertSignedIn(request);
+  const uid = compatRequireAuth(request);
+  const role = String(profile?.role || "");
+  const ok = ["MASTER", "ADMIN", "ACCOUNTANT"].includes(role) && String(profile?.communityId || "") === String(communityId || "");
+  if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień do tej wspólnoty.");
+  return { uid, profile, role };
+}
+
+async function compatRequireCommunityRole(request, communityId, allowedRoles) {
+  const profile = await assertSignedIn(request);
+  const uid = compatRequireAuth(request);
+  const role = String(profile?.role || "");
+  const ok = Array.isArray(allowedRoles) && allowedRoles.includes(role) && String(profile?.communityId || "") === String(communityId || "");
+  if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień do tej operacji.");
+  return { uid, profile, role };
+}
+
+async function compatAssertPanelAccessEnabled(communityId) {
+  const community = await getCommunity(communityId);
+  if (!community || community.panelAccessEnabled !== true) {
+    throw new HttpsError("permission-denied", "Panel nie jest aktywny dla tej wspólnoty.");
+  }
+  return community;
+}
+
+function compatSanitizeEmail(email) {
+  const e = compatSafeText(email).toLowerCase();
+  return e.includes("@") ? e : "";
+}
+
+function compatNormalizeFlatPart(value) {
+  return compatSafeText(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9_-]/g, "");
+}
+
+function compatBuildFlatKey(communityId, street, buildingNo, apartmentNo) {
+  const parts = [communityId, street, buildingNo, apartmentNo].map(compatNormalizeFlatPart).filter(Boolean);
+  return parts.join("|");
+}
+
+function compatMakeFlatLabel(street, buildingNo, apartmentNo) {
+  const base = [compatSafeText(street), compatSafeText(buildingNo)].filter(Boolean).join(" ");
+  const apt = compatSafeText(apartmentNo);
+  return apt ? `${base}/${apt}`.trim() : base;
+}
+
+async function compatGetResidentTokensForFlat(communityId, flatId) {
+  if (!communityId || !flatId) return [];
+  const snap = await db.collection("users")
+    .where("communityId", "==", communityId)
+    .where("flatId", "==", flatId)
+    .where("role", "==", "RESIDENT")
+    .get();
+  return snap.docs.map((d) => d.data().fcmToken).filter(Boolean);
+}
+
+async function compatFindFlatByKeyOrAddress(communityId, { flatId = "", flatKey = "", street = "", buildingNo = "", apartmentNo = "" } = {}) {
+  const flatsCol = db.collection("communities").doc(communityId).collection("flats");
+  if (compatSafeText(flatId)) {
+    const snap = await flatsCol.doc(compatSafeText(flatId)).get();
+    if (snap.exists) return snap;
+  }
+  const normalizedKey = compatSafeText(flatKey) || compatBuildFlatKey(communityId, street, buildingNo, apartmentNo);
+  if (normalizedKey) {
+    const byKey = await flatsCol.where("flatKey", "==", normalizedKey).limit(1).get();
+    if (!byKey.empty) return byKey.docs[0];
+  }
+  if (compatSafeText(street) && compatSafeText(buildingNo) && compatSafeText(apartmentNo)) {
+    const byAddress = await flatsCol
+      .where("street", "==", compatSafeText(street))
+      .where("buildingNo", "==", compatSafeText(buildingNo))
+      .where("apartmentNo", "==", compatSafeText(apartmentNo))
+      .limit(1)
+      .get();
+    if (!byAddress.empty) return byAddress.docs[0];
+  }
+  return null;
+}
+
+async function compatUpsertFlatWithSeat({ communityId, flatId = "", staircaseId = "", streetId = "", street = "", buildingNo = "", apartmentNo = "", flatLabel = "", flatKey = "", residentUid = null, extra = {}, payer = null }) {
+  if (!compatSafeText(communityId)) throw new HttpsError("invalid-argument", "Brak communityId.");
+  if (!compatSafeText(apartmentNo)) throw new HttpsError("invalid-argument", "Brak numeru lokalu.");
+
+  const flatsCol = db.collection("communities").doc(communityId).collection("flats");
+  const normalizedStreet = compatSafeText(street);
+  const normalizedBuilding = compatSafeText(buildingNo);
+  const normalizedApartment = compatSafeText(apartmentNo);
+  const computedKey = compatSafeText(flatKey) || compatBuildFlatKey(communityId, normalizedStreet, normalizedBuilding, normalizedApartment);
+
+  let existing = null;
+  if (compatSafeText(flatId)) {
+    const byId = await flatsCol.doc(compatSafeText(flatId)).get();
+    if (byId.exists) existing = byId;
+  }
+  if (!existing && computedKey) {
+    const byKey = await flatsCol.where("flatKey", "==", computedKey).limit(1).get();
+    if (!byKey.empty) existing = byKey.docs[0];
+  }
+  if (!existing && normalizedStreet && normalizedBuilding && normalizedApartment) {
+    const byAddress = await flatsCol
+      .where("street", "==", normalizedStreet)
+      .where("buildingNo", "==", normalizedBuilding)
+      .where("apartmentNo", "==", normalizedApartment)
+      .limit(1)
+      .get();
+    if (!byAddress.empty) existing = byAddress.docs[0];
+  }
+
+  const targetRef = existing ? existing.ref : (compatSafeText(flatId) ? flatsCol.doc(compatSafeText(flatId)) : flatsCol.doc());
+  const payerRef = db.doc(`communities/${communityId}/payers/${targetRef.id}`);
+  const communityRef = db.doc(`communities/${communityId}`);
+  const now = nowMs();
+
+  return await db.runTransaction(async (tx) => {
+    const communitySnap = await tx.get(communityRef);
+    if (!communitySnap.exists) throw new HttpsError("not-found", "Wspólnota nie istnieje.");
+
+    const targetSnap = await tx.get(targetRef);
+    const exists = targetSnap.exists;
+    const current = exists ? (targetSnap.data() || {}) : {};
+    const payerSnap = payer ? await tx.get(payerRef) : null;
+
+    if (!exists) {
+      const seatsTotal = Number(communitySnap.get("seatsTotal") || 0);
+      const seatsUsed = Number(communitySnap.get("seatsUsed") || 0);
+      if (seatsTotal > 0 && seatsUsed >= seatsTotal) {
+        throw new HttpsError("failed-precondition", "Brak wolnych seats. Dokup i zatwierdź seats w generatorze ownera.");
+      }
+      tx.set(communityRef, { seatsUsed: seatsUsed + 1, updatedAtMs: now }, { merge: true });
+    }
+
+    const mergedStreet = compatSafeText(normalizedStreet || current.street);
+    const mergedBuilding = compatSafeText(normalizedBuilding || current.buildingNo);
+    const mergedApartment = compatSafeText(normalizedApartment || current.apartmentNo || current.flatNumber);
+    const finalKey = compatSafeText(computedKey || current.flatKey || compatBuildFlatKey(communityId, mergedStreet, mergedBuilding, mergedApartment));
+    const finalLabel = compatSafeText(flatLabel || current.flatLabel || compatMakeFlatLabel(mergedStreet, mergedBuilding, mergedApartment) || mergedApartment);
+    const finalStreetId = compatSafeText(streetId || payer?.streetId || current.streetId || (mergedStreet ? normalizeStreetName(mergedStreet) : ""));
+
+    tx.set(targetRef, {
+      communityId,
+      staircaseId: compatSafeText(staircaseId || current.staircaseId),
+      streetId: finalStreetId,
+      street: mergedStreet,
+      buildingNo: mergedBuilding,
+      apartmentNo: mergedApartment,
+      flatNumber: compatSafeText(extra.flatNumber || mergedApartment || current.flatNumber),
+      flatLabel: finalLabel,
+      flatKey: finalKey,
+      residentUid: residentUid === null ? (current.residentUid || null) : residentUid,
+      updatedAtMs: now,
+      createdAtMs: Number(current.createdAtMs || now),
+      ...extra,
+    }, { merge: true });
+
+    if (mergedStreet) {
+      const streetRef = db.doc(`communities/${communityId}/streets/${finalStreetId || normalizeStreetName(mergedStreet)}`);
+      const assignmentRef = db.doc(`communities/${communityId}/streetAssignments/${finalStreetId || normalizeStreetName(mergedStreet)}`);
+      tx.set(streetRef, {
+        id: finalStreetId || normalizeStreetName(mergedStreet),
+        communityId,
+        name: mergedStreet,
+        normalizedName: normalizeStreetName(mergedStreet),
+        isActive: true,
+        updatedAtMs: now,
+        createdAtMs: Number(current.createdAtMs || now),
+      }, { merge: true });
+      tx.set(assignmentRef, {
+        id: finalStreetId || normalizeStreetName(mergedStreet),
+        communityId,
+        name: mergedStreet,
+        street: mergedStreet,
+        isActive: true,
+        updatedAtMs: now,
+      }, { merge: true });
+    }
+
+    if (payer) {
+      tx.set(payerRef, {
+        flatId: targetRef.id,
+        communityId,
+        streetId: finalStreetId,
+        street: mergedStreet,
+        buildingNo: mergedBuilding,
+        apartmentNo: mergedApartment,
+        flatLabel: finalLabel,
+        flatKey: finalKey,
+        name: compatSafeText(payer.name),
+        surname: compatSafeText(payer.surname),
+        displayName: [compatSafeText(payer.name), compatSafeText(payer.surname)].filter(Boolean).join(" "),
+        email: compatSafeText(payer.email),
+        phone: compatSafeText(payer.phone),
+        mailOnly: !!payer.mailOnly,
+        updatedAtMs: now,
+        createdAtMs: Number(payerSnap?.data()?.createdAtMs || now),
+      }, { merge: true });
+    }
+
+    return {
+      flatId: targetRef.id,
+      created: !exists,
+      seatsUsed: exists ? Number(communitySnap.get("seatsUsed") || 0) : Number(communitySnap.get("seatsUsed") || 0) + 1,
+      seatsTotal: Number(communitySnap.get("seatsTotal") || 0),
+    };
+  });
+}
+
+async function compatClaimOrCreateFlatForResident({ communityId, uid, flatId = "", flatKey = "", street = "", buildingNo = "", apartmentNo = "", flatLabel = "", staircaseId = "" }) {
+  const result = await compatUpsertFlatWithSeat({
+    communityId,
+    flatId,
+    staircaseId,
+    street,
+    buildingNo,
+    apartmentNo,
+    flatLabel,
+    flatKey,
+    residentUid: uid,
+  });
+  const targetRef = db.collection("communities").doc(communityId).collection("flats").doc(result.flatId);
+  const snap = await targetRef.get();
+  const data = snap.data() || {};
+  await targetRef.set({
+    occupantsUids: admin.firestore.FieldValue.arrayUnion(uid),
+    status: "ACTIVE",
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  return {
+    flatId: targetRef.id,
+    flatLabel: compatSafeText(data.flatLabel),
+    street: compatSafeText(data.street),
+    buildingNo: compatSafeText(data.buildingNo),
+    apartmentNo: compatSafeText(data.apartmentNo),
+    staircaseId: compatSafeText(data.staircaseId),
+    flatKey: compatSafeText(data.flatKey),
+    residentUid: uid,
+  };
+}
+
+function compatParsePeriod(input) {
+  const raw = compatSafeText(input);
+  if (/^\d{4}-\d{2}$/.test(raw)) return raw;
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function compatPeriodToDueDateMs(period) {
+  if (!/^\d{4}-\d{2}$/.test(period)) return 0;
+  const [year, month] = period.split("-").map(Number);
+  return Date.UTC(year, month - 1, 15, 12, 0, 0, 0);
+}
+
+function compatMonthTitle(period) {
+  const names = ["Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec", "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"];
+  if (!/^\d{4}-\d{2}$/.test(period)) return period || "Rozliczenie";
+  const [y, m] = period.split("-");
+  return `${names[Number(m) - 1] || period} ${y}`;
+}
+
+function compatParseAmountToCents(value) {
+  if (typeof value === "number") return Math.round(value * 100);
+  const txt = compatSafeText(value).replace(/\s/g, "").replace(/,/g, ".").replace(/[^0-9.-]/g, "");
+  const num = Number(txt);
+  return Number.isFinite(num) ? Math.round(num * 100) : 0;
+}
+
+function compatPaymentCodeFromText(text) {
+  const m = compatSafeText(text).match(/EL-(\d+)/i);
+  return m ? m[1] : null;
+}
+
+function compatNormalizeForMatch(value) {
+  return compatSafeText(value)
+    .toUpperCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Z0-9]+/g, " ")
+    .trim();
+}
+
+function compatExtractFlatHints(text) {
+  const src = compatNormalizeForMatch(text);
+  const hints = new Set();
+  if (!src) return [];
+  const patterns = [
+    /(?:LOKAL|MIESZKANIE|M\.?|NR|NUMER)\s*([A-Z0-9\/-]{1,12})/g,
+    /\b([0-9]{1,4}[A-Z]?)\b/g,
+  ];
+  patterns.forEach((re) => {
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      const v = compatSafeText(m[1]).toUpperCase();
+      if (v) hints.add(v);
+    }
+  });
+  return [...hints];
+}
+
+function compatScorePaymentToFlat(rowText, flat, amountCents) {
+  const hay = compatNormalizeForMatch(rowText);
+  if (!hay) return 0;
+  let score = 0;
+  const addIfContains = (val, pts) => {
+    const token = compatNormalizeForMatch(val);
+    if (token && hay.includes(token)) score += pts;
+  };
+  addIfContains(flat.flatNumber, 70);
+  addIfContains(flat.apartmentNo, 70);
+  addIfContains(flat.localNumber, 70);
+  addIfContains(flat.flatLabel, 45);
+  addIfContains(flat.street, 15);
+  addIfContains(flat.buildingNo, 20);
+  addIfContains(flat.name, 35);
+  addIfContains(flat.surname, 35);
+  addIfContains(flat.email, 20);
+  if (Array.isArray(flat.aliases)) {
+    flat.aliases.forEach((x) => addIfContains(x, 25));
+  }
+  const hints = compatExtractFlatHints(rowText);
+  if (hints.some((x) => [flat.flatNumber, flat.apartmentNo, flat.localNumber].map((v) => compatSafeText(v).toUpperCase()).includes(x))) {
+    score += 45;
+  }
+  if (amountCents > 0 && Number(flat.lastKnownBalanceCents || 0) > 0) {
+    const diff = Math.abs(Number(flat.lastKnownBalanceCents || 0) - amountCents);
+    if (diff <= 50) score += 10;
+  }
+  return score;
+}
+
+async function compatFuzzyFindFlatForPayment(communityId, row) {
+  const title = compatSafeText(row.title || row.description || row.tytul || row.tytuł || row.opis);
+  const source = compatSafeText(row.source || row.bank || row.konto);
+  const code = compatSafeText(row.code);
+  const rowText = `${title} ${source} ${code}`;
+  const amountCents = compatParseAmountToCents(row.amount ?? row.kwota);
+  const flatsSnap = await db.collection("communities").doc(communityId).collection("flats").get();
+  let best = null;
+  for (const doc of flatsSnap.docs) {
+    const data = doc.data() || {};
+    const score = compatScorePaymentToFlat(rowText, data, amountCents);
+    if (!best || score > best.score) best = { doc, score };
+  }
+  return best && best.score >= 70 ? best.doc : null;
+}
+
+async function compatSumCollection(query) {
+  const snap = await query.get();
+  return snap.docs.reduce((acc, d) => acc + Number(d.get("amountCents") || 0), 0);
+}
+
+async function compatRefreshBalanceDoc(communityId, flatId) {
+  const chargesQ = db.collection("communities").doc(communityId).collection("charges").where("flatId", "==", flatId);
+  const paymentsQ = db.collection("communities").doc(communityId).collection("payments").where("flatId", "==", flatId);
+  const [chargesCents, paymentsCents] = await Promise.all([compatSumCollection(chargesQ), compatSumCollection(paymentsQ)]);
+  const balanceCents = chargesCents - paymentsCents;
+  await db.collection("communities").doc(communityId).collection("balances").doc(flatId).set({
+    flatId,
+    chargesCents,
+    paymentsCents,
+    balanceCents,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  return { chargesCents, paymentsCents, balanceCents };
+}
+
+exports.createActivationCode = onCall(async (request) => {
+  assertOwner(request);
+  const data = request.data || {};
+  const name = compatSafeText(data.name || data.orgName);
+  const nip = compatSafeText(data.nip).replace(/\D/g, "");
+  const initialSeatsRaw = Number(data.initialSeats);
+  const initialSeats = Number.isFinite(initialSeatsRaw) ? Math.max(0, Math.floor(initialSeatsRaw)) : 0;
+
+  if (!name || nip.length !== 10) {
+    throw new HttpsError("invalid-argument", "Podaj nazwę i poprawny NIP.");
+  }
+
+  for (let i = 0; i < 10; i++) {
+    const code = randomCode(10);
+    const ref = db.doc(`activation_codes/${code}`);
+    try {
+      await ref.create({
+        code,
+        name,
+        nip,
+        initialSeats,
+        used: false,
+        status: "ACTIVE",
+        createdAtMs: nowMs(),
+        createdByUid: request.auth.uid,
+      });
+      return { code, docPath: ref.path };
+    } catch (e) {
+      if (e.code !== 6) throw e;
+    }
+  }
+
+  throw new HttpsError("resource-exhausted", "Błąd generowania kodu.");
+});
+
+exports.activateCommunity = onCall(async (request) => {
+  const uid = compatRequireAuth(request);
+  const code = compatSafeText(request.data?.code).toUpperCase();
+  const inputNip = compatSafeText(request.data?.nip).replace(/\D/g, "");
+  const inputName = compatSafeText(request.data?.name);
+  if (!code) throw new HttpsError("invalid-argument", "Brak kodu aktywacyjnego.");
+
+  const communityRef = db.collection("communities").doc();
+
+  return await db.runTransaction(async (tx) => {
+    const codeRef = db.doc(`activation_codes/${code}`);
+    const codeSnap = await tx.get(codeRef);
+    if (!codeSnap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
+
+    const codeData = codeSnap.data() || {};
+    if (codeData.used === true) throw new HttpsError("failed-precondition", "Kod już użyty.");
+    if (codeData.disabled === true || String(codeData.status || "").toUpperCase() === "DISABLED") {
+      throw new HttpsError("failed-precondition", "Kod aktywacyjny jest wyłączony.");
+    }
+
+    const name = inputName || compatSafeText(codeData.name);
+    const nip = inputNip || compatSafeText(codeData.nip).replace(/\D/g, "");
+    const initialSeatsRaw = Number(codeData.initialSeats);
+    const initialSeats = Number.isFinite(initialSeatsRaw) ? Math.max(0, Math.floor(initialSeatsRaw)) : 0;
+    const now = nowMs();
+
+    if (!name || nip.length !== 10) {
+      throw new HttpsError("invalid-argument", "Brak danych aktywacji.");
+    }
+
+    tx.set(communityRef, {
+      id: communityRef.id,
+      name,
+      nip,
+      createdAtMs: now,
+      updatedAtMs: now,
+      panelAccessEnabled: true,
+      enableExternalPayments: false,
+      paymentsUrl: "",
+      seatsTotal: initialSeats,
+      seatsUsed: 0,
+      panelSeatsUsed: 0,
+      appSeatsUsed: 0,
+      residentCount: 0,
+      usersCount: 0,
+      occupiedSeats: 0,
+    });
+
+    tx.set(db.doc(`users/${uid}`), {
+      role: "MASTER",
+      communityId: communityRef.id,
+      customerId: communityRef.id,
+      updatedAtMs: now,
+    }, { merge: true });
+
+    if (initialSeats > 0) {
+      const purchaseRef = communityRef.collection("seat_purchases").doc();
+      tx.set(purchaseRef, {
+        seats: initialSeats,
+        purchasedAtMs: now,
+        validUntilMs: now + 365 * 24 * 60 * 60 * 1000,
+        blocked: false,
+        createdAtMs: now,
+        updatedAtMs: now,
+        createdByUid: request.auth.uid,
+        source: "INITIAL_ACTIVATION",
+        sourceCode: code,
+      });
+    }
+
+    tx.set(codeRef, {
+      used: true,
+      usedAtMs: now,
+      communityId: communityRef.id,
+      activatedByUid: uid,
+      initialSeats,
+    }, { merge: true });
+
+    return { ok: true, communityId: communityRef.id, initialSeats };
+  });
+});
+
+exports.createInvite = onCall(async (request) => {
+  const uid = compatRequireAuth(request);
+  const me = await compatGetMyProfile(uid);
+  const communityId = compatSafeText(request.data?.communityId || me?.communityId);
+  const role = compatSafeText(request.data?.role || "RESIDENT");
+  const invite = {
+    customerId: compatSafeText(request.data?.customerId || me?.customerId || me?.communityId || communityId),
+    communityId,
+    role,
+    status: "active",
+    createdAtMs: nowMs(),
+    expiresAtMs: Number(request.data?.expiresAtMs || nowMs() + 7 * 24 * 3600 * 1000),
+    staircaseId: compatSafeText(request.data?.staircaseId),
+    flatId: compatSafeText(request.data?.flatId),
+    flatLabel: compatSafeText(request.data?.flatLabel),
+    street: compatSafeText(request.data?.street),
+    buildingNo: compatSafeText(request.data?.buildingNo),
+    apartmentNo: compatSafeText(request.data?.apartmentNo),
+    flatKey: compatSafeText(request.data?.flatKey) || compatBuildFlatKey(communityId, request.data?.street, request.data?.buildingNo, request.data?.apartmentNo),
+    adminFullName: compatSafeText(request.data?.adminFullName),
+    adminPhone: compatSafeText(request.data?.adminPhone),
+    senderName: compatSafeText(request.data?.senderName),
+    companyName: compatSafeText(request.data?.companyName),
+    nip: compatSafeText(request.data?.nip),
+    industry: compatSafeText(request.data?.industry),
+  };
+  const ref = await db.collection("invites").add(invite);
+  return { ok: true, inviteId: ref.id };
+});
+
+exports.claimInvite = onCall(async (request) => {
+  const uid = compatRequireAuth(request);
+  const inviteId = compatSafeText(request.data?.inviteId);
+  if (!inviteId) throw new HttpsError("invalid-argument", "Brak inviteId.");
+
+  const requestStreet = compatSafeText(request.data?.street);
+  const requestBuildingNo = compatSafeText(request.data?.buildingNo);
+  const requestApartmentNo = compatSafeText(request.data?.apartmentNo);
+  const senderName = compatSafeText(request.data?.name);
+
+  const inviteRef = db.doc(`invites/${inviteId}`);
+  const snap = await inviteRef.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Invite nie istnieje.");
+
+  const inv = snap.data() || {};
+  const communityId = compatSafeText(inv.communityId);
+  const role = compatSafeText(inv.role || "RESIDENT");
+  let flat = null;
+
+  if (role === "RESIDENT" && communityId) {
+    flat = await compatClaimOrCreateFlatForResident({
+      communityId,
+      uid,
+      flatId: compatSafeText(inv.flatId),
+      flatKey: compatSafeText(inv.flatKey),
+      street: requestStreet || compatSafeText(inv.street),
+      buildingNo: requestBuildingNo || compatSafeText(inv.buildingNo),
+      apartmentNo: requestApartmentNo || compatSafeText(inv.apartmentNo),
+      flatLabel: compatSafeText(inv.flatLabel),
+      staircaseId: compatSafeText(inv.staircaseId),
+    });
+  }
+
+  await db.doc(`users/${uid}`).set({
+    role,
+    communityId,
+    customerId: compatSafeText(inv.customerId || communityId),
+    displayName: senderName || undefined,
+    street: flat?.street || requestStreet || compatSafeText(inv.street),
+    buildingNo: flat?.buildingNo || requestBuildingNo || compatSafeText(inv.buildingNo),
+    apartmentNo: flat?.apartmentNo || requestApartmentNo || compatSafeText(inv.apartmentNo),
+    flatId: flat?.flatId || compatSafeText(inv.flatId) || undefined,
+    staircaseId: flat?.staircaseId || compatSafeText(inv.staircaseId) || undefined,
+    flatLabel: flat?.flatLabel || compatSafeText(inv.flatLabel) || undefined,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+
+  await inviteRef.set({
+    status: "used",
+    usedByUid: uid,
+    usedAtMs: nowMs(),
+  }, { merge: true });
+
+  return { ok: true, flatId: flat?.flatId || null, flatLabel: flat?.flatLabel || null };
+});
+
+exports.upsertFlat = onCall(async (request) => {
+  const communityId = compatSafeText(request.data?.communityId);
+  await compatRequireCommunityRole(request, communityId, ["MASTER", "ACCOUNTANT", "ADMIN"]);
+  const profile = await compatGetMyProfile(compatRequireAuth(request));
+  const role = String(profile?.role || "");
+  const panelFlow = request.data?.source === "WEBPANEL";
+  if (panelFlow) {
+    await compatAssertPanelAccessEnabled(communityId);
+    if (!["MASTER", "ACCOUNTANT"].includes(role)) {
+      throw new HttpsError("permission-denied", "Administrator nie ma dostępu do webpanelu.");
+    }
+  }
+
+  return await compatUpsertFlatWithSeat({
+    communityId,
+    flatId: compatSafeText(request.data?.flatId),
+    staircaseId: compatSafeText(request.data?.staircaseId),
+    streetId: compatSafeText(request.data?.streetId),
+    street: compatSafeText(request.data?.street),
+    buildingNo: compatSafeText(request.data?.buildingNo),
+    apartmentNo: compatSafeText(request.data?.apartmentNo),
+    flatLabel: compatSafeText(request.data?.flatLabel),
+    flatKey: compatSafeText(request.data?.flatKey),
+    extra: {
+      name: compatSafeText(request.data?.name),
+      surname: compatSafeText(request.data?.surname),
+      email: compatSafeText(request.data?.email),
+      phone: compatSafeText(request.data?.phone),
+      displayName: [compatSafeText(request.data?.name), compatSafeText(request.data?.surname)].filter(Boolean).join(" "),
+      residentName: [compatSafeText(request.data?.name), compatSafeText(request.data?.surname)].filter(Boolean).join(" "),
+      areaM2: request.data?.areaM2 == null || request.data?.areaM2 === "" ? null : Number(request.data?.areaM2),
+      flatNumber: compatSafeText(request.data?.flatNumber || request.data?.apartmentNo),
+    },
+    payer: request.data?.withPayer ? {
+      streetId: compatSafeText(request.data?.streetId),
+      name: compatSafeText(request.data?.name),
+      surname: compatSafeText(request.data?.surname),
+      email: compatSafeText(request.data?.email),
+      phone: compatSafeText(request.data?.phone),
+      mailOnly: !!request.data?.email && !compatSafeText(request.data?.phone),
+    } : null,
+  });
+});
+
+exports.importFlats = onCall(async (request) => {
+  const communityId = compatSafeText(request.data?.communityId);
+  const rows = Array.isArray(request.data?.rows) ? request.data.rows : [];
+  await compatRequireCommunityRole(request, communityId, ["MASTER", "ACCOUNTANT"]);
+  await compatAssertPanelAccessEnabled(communityId);
+
+  let created = 0;
+  let updated = 0;
+  const results = [];
+
+  for (const row of rows) {
+    const apartmentNo = compatSafeText(row.apartmentNo || row.flatNumber);
+    if (!apartmentNo) continue;
+    const res = await compatUpsertFlatWithSeat({
+      communityId,
+      streetId: compatSafeText(row.streetId),
+      street: compatSafeText(row.street),
+      buildingNo: compatSafeText(row.buildingNo),
+      apartmentNo,
+      flatLabel: compatSafeText(row.flatLabel),
+      flatKey: compatSafeText(row.flatKey),
+      extra: {
+        flatNumber: apartmentNo,
+        name: compatSafeText(row.name),
+        surname: compatSafeText(row.surname),
+        displayName: [compatSafeText(row.name), compatSafeText(row.surname)].filter(Boolean).join(" "),
+        residentName: [compatSafeText(row.name), compatSafeText(row.surname)].filter(Boolean).join(" "),
+        email: compatSafeText(row.email),
+        phone: compatSafeText(row.phone),
+        areaM2: row.areaM2 == null || row.areaM2 === "" ? null : Number(row.areaM2),
+      },
+      payer: {
+        streetId: compatSafeText(row.streetId),
+        name: compatSafeText(row.name),
+        surname: compatSafeText(row.surname),
+        email: compatSafeText(row.email),
+        phone: compatSafeText(row.phone),
+        mailOnly: !!compatSafeText(row.email) && !compatSafeText(row.phone),
+      },
+    });
+    if (res.created) created += 1; else updated += 1;
+    results.push(res);
+  }
+
+  return { ok: true, created, updated, results };
+});
+
+exports.claimResidentFlat = onCall(async (request) => {
+  const uid = compatRequireAuth(request);
+  const communityId = compatSafeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+
+  const flat = await compatClaimOrCreateFlatForResident({
+    communityId,
+    uid,
+    flatId: compatSafeText(request.data?.flatId),
+    flatKey: compatSafeText(request.data?.flatKey),
+    street: compatSafeText(request.data?.street),
+    buildingNo: compatSafeText(request.data?.buildingNo),
+    apartmentNo: compatSafeText(request.data?.apartmentNo),
+    flatLabel: compatSafeText(request.data?.flatLabel),
+    staircaseId: compatSafeText(request.data?.staircaseId),
+  });
+
+  await db.doc(`users/${uid}`).set({
+    communityId,
+    street: flat.street,
+    buildingNo: flat.buildingNo,
+    apartmentNo: flat.apartmentNo,
+    flatId: flat.flatId,
+    staircaseId: flat.staircaseId || undefined,
+    flatLabel: flat.flatLabel,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+
+  return { ok: true, ...flat };
+});
+
+exports.importPayments = onCall(async (request) => {
+  const communityId = compatSafeText(request.data?.communityId);
+  const rows = Array.isArray(request.data?.rows) ? request.data.rows : [];
+  await compatRequireCommunityStaff(request, communityId);
+  await compatAssertPanelAccessEnabled(communityId);
+
+  let matched = 0;
+  let unmatched = 0;
+  const created = [];
+
+  for (const row of rows) {
+    const title = compatSafeText(row.title || row.description || row.tytul || row.tytuł || row.opis);
+    const amountCents = compatParseAmountToCents(row.amount ?? row.kwota);
+    const bookedAtMs = Number(row.bookedAtMs || row.dateMs || Date.parse(row.date || row.data || new Date().toISOString()) || nowMs());
+    const code = compatPaymentCodeFromText(`${title} ${compatSafeText(row.code)}`);
+
+    let flatSnap = null;
+    let matchedBy = "NONE";
+    if (code) {
+      const q = await db.collection("communities").doc(communityId).collection("flats").where("flatNumber", "==", code).limit(1).get();
+      flatSnap = q.docs[0] || null;
+      if (flatSnap) matchedBy = "CODE";
+    }
+    if (!flatSnap) {
+      flatSnap = await compatFuzzyFindFlatForPayment(communityId, row);
+      if (flatSnap) matchedBy = "AI_HINT";
+    }
+
+    const paymentRef = db.collection("communities").doc(communityId).collection("payments").doc();
+    const period = compatParsePeriod(row.period || new Date(bookedAtMs).toISOString().slice(0, 7));
+    const payload = {
+      flatId: flatSnap?.id || null,
+      period,
+      code: code || null,
+      title,
+      source: compatSafeText(row.source || "CSV_IMPORT"),
+      amountCents,
+      bookedAtMs,
+      createdAtMs: nowMs(),
+      updatedAtMs: nowMs(),
+      matched: !!flatSnap,
+      matchedBy,
+    };
+
+    await paymentRef.set(payload);
+    created.push(paymentRef.id);
+
+    if (flatSnap) {
+      matched += 1;
+      const settlementRef = db.collection("communities").doc(communityId).collection("settlements").doc(`${flatSnap.id}_${period}`);
+      const settlementSnap = await settlementRef.get();
+      const settlement = settlementSnap.exists ? (settlementSnap.data() || {}) : {
+        chargesCents: 0,
+        accountNumber: "",
+        transferTitle: `EL-${code || compatSafeText(flatSnap.get("flatNumber") || flatSnap.id)} ${period}`,
+        dueDateMs: compatPeriodToDueDateMs(period),
+        dueDate: new Date(compatPeriodToDueDateMs(period)).toISOString().slice(0, 10),
+      };
+      const paymentsCents = Number(settlement?.paymentsCents || 0) + amountCents;
+      const chargesCents = Number(settlement?.chargesCents || 0);
+      await settlementRef.set({
+        flatId: flatSnap.id,
+        buildingId: flatSnap.get("buildingId") || null,
+        period,
+        title: `Rozliczenie za ${compatMonthTitle(period)}`,
+        chargesCents,
+        paymentsCents,
+        balanceCents: chargesCents - paymentsCents,
+        accountNumber: settlement.accountNumber || "",
+        transferTitle: settlement.transferTitle || `EL-${code || compatSafeText(flatSnap.get("flatNumber") || flatSnap.id)} ${period}`,
+        isPublished: Boolean(settlement.isPublished),
+        status: settlement.status || "DRAFT",
+        dueDateMs: settlement.dueDateMs || compatPeriodToDueDateMs(period),
+        dueDate: settlement.dueDate || new Date(compatPeriodToDueDateMs(period)).toISOString().slice(0, 10),
+        createdAtMs: Number(settlement.createdAtMs || nowMs()),
+        updatedAtMs: nowMs(),
+      }, { merge: true });
+      await compatRefreshBalanceDoc(communityId, flatSnap.id);
+    } else {
+      unmatched += 1;
+      await db.collection("communities").doc(communityId).collection("reviewQueue").add({
+        type: "PAYMENT_UNMATCHED",
+        paymentId: paymentRef.id,
+        title,
+        amountCents,
+        code: code || null,
+        source: compatSafeText(row.source || ""),
+        status: "OPEN",
+        createdAtMs: nowMs(),
+      });
+    }
+  }
+
+  return { ok: true, matched, unmatched, created };
+});
+
+exports.closeReviewItem = onCall(async (request) => {
+  const communityId = compatSafeText(request.data?.communityId);
+  const reviewId = compatSafeText(request.data?.reviewId);
+  await compatRequireCommunityStaff(request, communityId);
+  await compatAssertPanelAccessEnabled(communityId);
+  await db.collection("communities").doc(communityId).collection("reviewQueue").doc(reviewId).set({
+    status: compatSafeText(request.data?.status || "CLOSED"),
+    resolution: compatSafeText(request.data?.resolution || ""),
+    closedAtMs: nowMs(),
+  }, { merge: true });
+  return { ok: true };
+});
+
+exports.onSettlementUpdated = onDocumentUpdated("communities/{communityId}/settlements/{settlementId}", async (event) => {
+  const before = event.data.before.data() || {};
+  const after = event.data.after.data() || {};
+  const changed = Number(before.balanceCents || 0) !== Number(after.balanceCents || 0)
+    || Number(before.chargesCents || 0) !== Number(after.chargesCents || 0)
+    || Number(before.paymentsCents || 0) !== Number(after.paymentsCents || 0)
+    || compatSafeText(before.pdfUrl) !== compatSafeText(after.pdfUrl);
+  if (!changed) return;
+
+  const flatId = compatSafeText(after.flatId);
+  const tokens = await compatGetResidentTokensForFlat(event.params.communityId, flatId);
+  await sendToTokens(tokens, "due_created", "Aktualizacja rozliczenia", compatSafeText(after.title || `Rozliczenie za ${after.period || ""}`), {
+    settlementId: event.params.settlementId,
+    flatId,
+    period: compatSafeText(after.period),
+  });
 });
