@@ -105,8 +105,8 @@ async function rebuildSettlement(adminDb: any, communityId: string, flat: Flat, 
     adminDb.doc(`communities/${communityId}/settlements/${settlementDocId(flat.id, period)}`).get(),
   ]);
   const existing: any = draftSnap.exists ? draftSnap.data() : (publishedSnap.exists ? publishedSnap.data() : {});
-  const totalChargesCents = chargesSnap.docs.reduce((sum, d) => sum + Number((d.data() as any)?.amountCents || 0), 0);
-  const totalPaymentsCents = paymentsSnap.docs.reduce((sum, d) => sum + Number((d.data() as any)?.amountCents || 0), 0);
+  const totalChargesCents = (chargesSnap.docs as any[]).reduce((sum: number, d: any) => sum + Number(d?.data?.()?.amountCents || 0), 0);
+  const totalPaymentsCents = (paymentsSnap.docs as any[]).reduce((sum: number, d: any) => sum + Number(d?.data?.()?.amountCents || 0), 0);
   const balanceCents = totalChargesCents - totalPaymentsCents;
   const defaults = readCommunityDefaults(communityData);
   const paymentRef = normalizePaymentRef(existing?.paymentRef || existing?.paymentTitle || existing?.transferTitle) || buildStablePaymentTitle({
