@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect } from "react";
 import { signOut } from "firebase/auth";
 import { auth } from "../lib/firebase";
 import { useAuth } from "../lib/authContext";
@@ -11,6 +12,25 @@ export function Nav() {
   const role = profile?.role || "";
   const comm = profile?.communityId || "";
   const panelEnabled = isPanelEnabled(community?.panelAccessEnabled);
+
+  useEffect(() => {
+    const run = async () => {
+      try {
+        if (!auth.currentUser || !comm || !panelEnabled) return;
+        const key = `repair_sync_${comm}`;
+        const prev = Number(window.localStorage.getItem(key) || 0);
+        if (Date.now() - prev < 5 * 60 * 1000) return;
+        window.localStorage.setItem(key, String(Date.now()));
+        const token = await auth.currentUser.getIdToken();
+        await fetch("/api/community-repair-sync", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ communityId: comm }),
+        }).catch(() => null);
+      } catch (_) {}
+    };
+    run();
+  }, [comm, panelEnabled]);
 
   return (
     <div className="topBar">

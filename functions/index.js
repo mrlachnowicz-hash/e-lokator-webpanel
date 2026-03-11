@@ -411,6 +411,10 @@ async function ensureSeatAvailable(communityId) {
 
 
 function shadowUserId(communityId, flatId) {
+  return `payer_${safeString(communityId)}_${safeString(flatId)}`;
+}
+
+function legacyShadowUserId(communityId, flatId) {
   return `shadow_${safeString(communityId)}_${safeString(flatId)}`;
 }
 
@@ -418,47 +422,64 @@ async function syncPayerShadowUser(communityId, flatId) {
   const payerRef = db.doc(`communities/${communityId}/payers/${flatId}`);
   const payerSnap = await payerRef.get();
   const shadowRef = db.doc(`users/${shadowUserId(communityId, flatId)}`);
+  const legacyRef = db.doc(`users/${legacyShadowUserId(communityId, flatId)}`);
   if (!payerSnap.exists) {
     const existing = await shadowRef.get();
-    if (existing.exists && existing.data()?.isShadow === true) {
+    if (existing.exists && (existing.data()?.placeholderResident === true || existing.data()?.isShadow === true)) {
       await shadowRef.delete().catch(() => null);
     }
+    const legacyExisting = await legacyRef.get();
+    if (legacyExisting.exists) await legacyRef.delete().catch(() => null);
     return;
   }
   const payer = payerSnap.data() || {};
   const residentUid = safeString(payer.residentUid || payer.userId);
   if (residentUid) {
     const existing = await shadowRef.get();
-    if (existing.exists && existing.data()?.isShadow === true) {
+    if (existing.exists && (existing.data()?.placeholderResident === true || existing.data()?.isShadow === true)) {
       await shadowRef.delete().catch(() => null);
     }
+    const legacyExisting = await legacyRef.get();
+    if (legacyExisting.exists) await legacyRef.delete().catch(() => null);
     return;
   }
-  await shadowRef.set({
-    uid: shadowUserId(communityId, flatId),
-    communityId,
-    flatId,
-    role: 'RESIDENT',
-    displayName: safeString(payer.displayName || `${payer.name || ''} ${payer.surname || ''}`),
-    firstName: safeString(payer.name),
-    lastName: safeString(payer.surname),
-    name: safeString(payer.name),
-    surname: safeString(payer.surname),
-    email: safeString(payer.email),
-    phone: safeString(payer.phone),
-    street: safeString(payer.street),
-    streetId: safeString(payer.streetId),
-    buildingNo: safeString(payer.buildingNo),
-    apartmentNo: safeString(payer.apartmentNo || payer.flatNumber),
-    flatLabel: safeString(payer.flatLabel),
-    flatKey: safeString(payer.flatKey),
-    mailOnly: true,
-    isShadow: true,
-    authLinked: false,
-    source: 'WEBPANEL_PAYER',
-    createdAtMs: Number(payer.createdAtMs || nowMs()),
-    updatedAtMs: nowMs(),
-  }, { merge: true });
+  const placeholderUid = shadowUserId(communityId, flatId);
+  await Promise.all([
+    shadowRef.set({
+      uid: placeholderUid,
+      communityId,
+      customerId: communityId,
+      flatId,
+      role: 'RESIDENT',
+      displayName: safeString(payer.displayName || `${payer.name || ''} ${payer.surname || ''}`),
+      firstName: safeString(payer.name),
+      lastName: safeString(payer.surname),
+      name: safeString(payer.name),
+      surname: safeString(payer.surname),
+      email: safeString(payer.email),
+      emailLower: safeString(payer.email).toLowerCase(),
+      phone: safeString(payer.phone),
+      street: safeString(payer.street),
+      streetId: safeString(payer.streetId),
+      buildingNo: safeString(payer.buildingNo),
+      apartmentNo: safeString(payer.apartmentNo || payer.flatNumber),
+      flatLabel: safeString(payer.flatLabel),
+      flatKey: safeString(payer.flatKey),
+      mailOnly: false,
+      placeholderResident: false,
+      isShadow: false,
+      authLinked: false,
+      appVisible: true,
+      active: true,
+      source: 'WEBPANEL_PAYER',
+      createdAtMs: Number(payer.createdAtMs || nowMs()),
+      updatedAtMs: nowMs(),
+    }, { merge: true }),
+    db.doc(`communities/${communityId}/payers/${flatId}`).set({ residentUid: placeholderUid, userId: placeholderUid, appVisible: true, updatedAtMs: nowMs() }, { merge: true }),
+    db.doc(`communities/${communityId}/flats/${flatId}`).set({ residentUid: placeholderUid, userId: placeholderUid, appVisible: true, updatedAtMs: nowMs() }, { merge: true }),
+  ]);
+  const legacyExisting = await legacyRef.get();
+  if (legacyExisting.exists) await legacyRef.delete().catch(() => null);
 }
 
 async function linkRealUserByEmail(uid) {
@@ -501,8 +522,13 @@ async function linkRealUserByEmail(uid) {
   ]);
   const shadowRef = db.doc(`users/${shadowUserId(communityId, flatId)}`);
   const shadowSnap = await shadowRef.get();
-  if (shadowSnap.exists && shadowSnap.data()?.isShadow === true) {
+  if (shadowSnap.exists && (shadowSnap.data()?.placeholderResident === true || shadowSnap.data()?.isShadow === true)) {
     await shadowRef.delete().catch(() => null);
+  }
+  const legacyShadowRef = db.doc(`users/${legacyShadowUserId(communityId, flatId)}`);
+  const legacyShadowSnap = await legacyShadowRef.get();
+  if (legacyShadowSnap.exists) {
+    await legacyShadowRef.delete().catch(() => null);
   }
 }
 
@@ -510,31 +536,76 @@ async function linkRealUserByEmail(uid) {
 // FCM HELPERS
 // =========================================================
 
+async function syncAllPayerShadowUsers(communityId) {
+  const payersSnap = await db.collection(`communities/${communityId}/payers`).get();
+  let count = 0;
+  for (const payerDoc of payersSnap.docs) {
+    count += 1;
+    await syncPayerShadowUser(communityId, payerDoc.id);
+  }
+  return count;
+}
+
 async function syncCommunitySeats(communityId) {
-  const flatsSnap = await db.collection(`communities/${communityId}/flats`).get();
-  const used = flatsSnap.size;
+  const payerCount = await syncAllPayerShadowUsers(communityId);
+  const residentsSnap = await db.collection('users').where('communityId', '==', communityId).where('role', '==', 'RESIDENT').get();
+  const residentCount = residentsSnap.size;
+  const seatsUsed = Math.max(payerCount, residentCount);
   await db.doc(`communities/${communityId}`).set({
-    seatsUsed: used,
-    panelSeatsUsed: used,
+    seatsUsed,
+    panelSeatsUsed: payerCount,
+    appSeatsUsed: residentCount,
+    residentCount,
+    usersCount: residentCount,
+    occupiedSeats: seatsUsed,
     updatedAtMs: nowMs(),
   }, { merge: true });
-  return used;
+  return seatsUsed;
 }
 
 async function syncCommunityStreetRegistry(communityId) {
-  const streetsSnap = await db.collection(`communities/${communityId}/streets`).get();
-  const active = streetsSnap.docs
-    .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
-    .filter((item) => item.isActive !== false && !item.deletedAtMs);
-  const streetIds = active.map((item) => safeString(item.id)).filter(Boolean);
-  const streetNames = active.map((item) => safeString(item.name || item.street || item.id)).filter(Boolean);
+  const [streetsSnap, assignmentsSnap] = await Promise.all([
+    db.collection(`communities/${communityId}/streets`).get(),
+    db.collection(`communities/${communityId}/streetAssignments`).get(),
+  ]);
+  const activeMap = new Map();
+  const pushStreet = (id, name) => {
+    const sid = safeString(id || normalizeStreetName(name));
+    const sname = safeString(name || id);
+    if (!sid || !sname) return;
+    if (!activeMap.has(sid)) activeMap.set(sid, { id: sid, name: sname });
+  };
+  streetsSnap.docs.forEach((doc) => {
+    const data = doc.data() || {};
+    if (data.isActive === false || data.deletedAtMs) return;
+    pushStreet(doc.id || data.id, data.name || data.street || doc.id);
+  });
+  assignmentsSnap.docs.forEach((doc) => {
+    const data = doc.data() || {};
+    if (data.isActive === false || data.deletedAtMs) return;
+    pushStreet(data.id || doc.id, data.name || data.street || doc.id);
+  });
+  const items = Array.from(activeMap.values());
+  for (const item of items) {
+    const streetRef = db.doc(`communities/${communityId}/streets/${item.id}`);
+    const assignRef = db.doc(`communities/${communityId}/streetAssignments/${item.id}`);
+    const [streetSnap, assignSnap] = await Promise.all([streetRef.get(), assignRef.get()]);
+    const streetData = streetSnap.data() || {};
+    const assignData = assignSnap.data() || {};
+    if (!streetSnap.exists || safeString(streetData.name || streetData.street || streetSnap.id) !== item.name || streetData.isActive === false) {
+      await streetRef.set({ id: item.id, communityId, name: item.name, normalizedName: item.id, isActive: true, updatedAtMs: nowMs() }, { merge: true });
+    }
+    if (!assignSnap.exists || safeString(assignData.name || assignData.street || assignSnap.id) !== item.name || assignData.isActive === false) {
+      await assignRef.set({ id: item.id, communityId, name: item.name, street: item.name, isActive: true, updatedAtMs: nowMs() }, { merge: true });
+    }
+  }
   await db.doc(`communities/${communityId}`).set({
-    streetIds,
-    streetNames,
-    streetsList: active.map((item) => ({ id: safeString(item.id), name: safeString(item.name || item.street || item.id) })),
+    streetIds: items.map((item) => safeString(item.id)).filter(Boolean),
+    streetNames: items.map((item) => safeString(item.name)).filter(Boolean),
+    streetsList: items.map((item) => ({ id: safeString(item.id), name: safeString(item.name) })),
     updatedAtMs: nowMs(),
   }, { merge: true });
-  return streetIds.length;
+  return items.length;
 }
 
 async function getUserToken(uid) {
@@ -615,6 +686,11 @@ exports.onFlatSeatSync = onDocumentWritten("communities/{communityId}/flats/{fla
 });
 
 exports.onStreetRegistrySync = onDocumentWritten("communities/{communityId}/streets/{streetId}", async (event) => {
+  const communityId = event.params.communityId;
+  await syncCommunityStreetRegistry(communityId);
+});
+
+exports.onStreetAssignmentsSync = onDocumentWritten("communities/{communityId}/streetAssignments/{streetId}", async (event) => {
   const communityId = event.params.communityId;
   await syncCommunityStreetRegistry(communityId);
 });

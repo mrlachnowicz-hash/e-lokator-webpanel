@@ -2,11 +2,11 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { collection, deleteDoc, doc, getDocs, onSnapshot, orderBy, query, setDoc, updateDoc, writeBatch } from "firebase/firestore";
+import { collection, deleteDoc, doc, getDocs, onSnapshot, setDoc, updateDoc, writeBatch } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
-import { db } from "../../lib/firebase";
+import { auth, db } from "../../lib/firebase";
 import { buildStablePaymentTitle, normalizeAccountNumber, normalizePaymentRef } from "../../lib/paymentRefs";
 import { mergeSettlementsForView, SETTLEMENTS_COLLECTION, SETTLEMENT_DRAFTS_COLLECTION } from "../../lib/settlementCollections";
 
@@ -68,30 +68,30 @@ export default function ChargesPage() {
 
   useEffect(() => {
     if (!communityId) return;
-    let draftItems: Settlement[] = [];
-    let legacyDraftItems: Settlement[] = [];
-    let publishedItems: Settlement[] = [];
-    const sync = () => {
-      const mergedDrafts = [...draftItems, ...legacyDraftItems].reduce((acc: Record<string, Settlement>, item: Settlement) => {
-        acc[item.id] = { ...(acc[item.id] || {}), ...item };
-        return acc;
-      }, {} as Record<string, Settlement>);
-      setItems(mergeSettlementsForView(Object.values(mergedDrafts), publishedItems));
+    let cancelled = false;
+
+    const loadViaAdmin = async () => {
+      try {
+        const token = await auth.currentUser?.getIdToken();
+        if (!token) return;
+        const res = await fetch('/api/charges/overview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', authorization: `Bearer ${token}` },
+          body: JSON.stringify({ communityId }),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const drafts = Array.isArray(data?.drafts) ? data.drafts : [];
+        const settlements = Array.isArray(data?.settlements) ? data.settlements : [];
+        setItems(mergeSettlementsForView(drafts, settlements));
+      } catch (_) {}
     };
 
-    const unsubDrafts = onSnapshot(query(collection(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION), orderBy("updatedAtMs", "desc")), (snap) => {
-      draftItems = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any), __collection: SETTLEMENT_DRAFTS_COLLECTION, isPublished: false }));
-      sync();
-    });
-    const unsubLegacyDrafts = onSnapshot(query(collection(db, SETTLEMENT_DRAFTS_COLLECTION), orderBy("updatedAtMs", "desc")), (snap) => {
-      legacyDraftItems = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any), __collection: SETTLEMENT_DRAFTS_COLLECTION, isPublished: false })).filter((item: any) => String(item.communityId || "") === communityId);
-      sync();
-    }, () => { legacyDraftItems = []; sync(); });
-    const unsubSettlements = onSnapshot(query(collection(db, "communities", communityId, SETTLEMENTS_COLLECTION), orderBy("updatedAtMs", "desc")), (snap) => {
-      publishedItems = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any), __collection: SETTLEMENTS_COLLECTION, isPublished: true }));
-      sync();
-    });
-    const unsubFlats = onSnapshot(query(collection(db, "communities", communityId, "flats")), (snap) => {
+    loadViaAdmin();
+    const refreshTimer = window.setInterval(loadViaAdmin, 10000);
+
+    const unsubFlats = onSnapshot(collection(db, "communities", communityId, "flats"), (snap) => {
       const map: Record<string, Flat> = {};
       snap.docs.forEach((d) => { map[d.id] = { id: d.id, ...(d.data() as any) }; });
       setFlats(map);
@@ -101,7 +101,15 @@ export default function ChargesPage() {
       setCommunityDoc(data);
       setDefaults(readCommunityDefaults(data));
     });
-    return () => { unsubDrafts(); unsubLegacyDrafts(); unsubSettlements(); unsubFlats(); unsubCommunity(); };
+    const onVisible = () => { if (!document.hidden) loadViaAdmin(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(refreshTimer);
+      document.removeEventListener('visibilitychange', onVisible);
+      unsubFlats();
+      unsubCommunity();
+    };
   }, [communityId]);
 
   const drafts = useMemo(() => items.filter((s) => s.__collection === SETTLEMENT_DRAFTS_COLLECTION), [items]);
