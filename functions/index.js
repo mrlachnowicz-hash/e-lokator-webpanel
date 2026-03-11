@@ -409,6 +409,103 @@ async function ensureSeatAvailable(communityId) {
   }
 }
 
+
+function shadowUserId(communityId, flatId) {
+  return `shadow_${safeString(communityId)}_${safeString(flatId)}`;
+}
+
+async function syncPayerShadowUser(communityId, flatId) {
+  const payerRef = db.doc(`communities/${communityId}/payers/${flatId}`);
+  const payerSnap = await payerRef.get();
+  const shadowRef = db.doc(`users/${shadowUserId(communityId, flatId)}`);
+  if (!payerSnap.exists) {
+    const existing = await shadowRef.get();
+    if (existing.exists && existing.data()?.isShadow === true) {
+      await shadowRef.delete().catch(() => null);
+    }
+    return;
+  }
+  const payer = payerSnap.data() || {};
+  const residentUid = safeString(payer.residentUid || payer.userId);
+  if (residentUid) {
+    const existing = await shadowRef.get();
+    if (existing.exists && existing.data()?.isShadow === true) {
+      await shadowRef.delete().catch(() => null);
+    }
+    return;
+  }
+  await shadowRef.set({
+    uid: shadowUserId(communityId, flatId),
+    communityId,
+    flatId,
+    role: 'RESIDENT',
+    displayName: safeString(payer.displayName || `${payer.name || ''} ${payer.surname || ''}`),
+    firstName: safeString(payer.name),
+    lastName: safeString(payer.surname),
+    name: safeString(payer.name),
+    surname: safeString(payer.surname),
+    email: safeString(payer.email),
+    phone: safeString(payer.phone),
+    street: safeString(payer.street),
+    streetId: safeString(payer.streetId),
+    buildingNo: safeString(payer.buildingNo),
+    apartmentNo: safeString(payer.apartmentNo || payer.flatNumber),
+    flatLabel: safeString(payer.flatLabel),
+    flatKey: safeString(payer.flatKey),
+    mailOnly: true,
+    isShadow: true,
+    authLinked: false,
+    source: 'WEBPANEL_PAYER',
+    createdAtMs: Number(payer.createdAtMs || nowMs()),
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+}
+
+async function linkRealUserByEmail(uid) {
+  const userSnap = await db.doc(`users/${uid}`).get();
+  if (!userSnap.exists) return;
+  const user = userSnap.data() || {};
+  if (user.isShadow === true) return;
+  const communityId = safeString(user.communityId || user.customerId);
+  const email = safeString(user.email).toLowerCase();
+  if (!communityId || !email) return;
+  const payersSnap = await db.collection(`communities/${communityId}/payers`).where('email', '==', email).limit(1).get();
+  if (payersSnap.empty) return;
+  const payerDoc = payersSnap.docs[0];
+  const payer = payerDoc.data() || {};
+  const flatId = safeString(payer.flatId || payerDoc.id);
+  const flatPatch = {
+    residentUid: uid,
+    userId: uid,
+    email: safeString(user.email || payer.email),
+    phone: safeString(user.phone || payer.phone),
+    displayName: safeString(user.displayName || `${user.firstName || user.name || payer.name || ''} ${user.lastName || user.surname || payer.surname || ''}`),
+    name: safeString(user.firstName || user.name || payer.name),
+    surname: safeString(user.lastName || user.surname || payer.surname),
+    updatedAtMs: nowMs(),
+  };
+  await Promise.all([
+    db.doc(`communities/${communityId}/flats/${flatId}`).set(flatPatch, { merge: true }),
+    db.doc(`communities/${communityId}/payers/${flatId}`).set({ ...flatPatch, mailOnly: false, residentUid: uid, userId: uid }, { merge: true }),
+    db.doc(`users/${uid}`).set({
+      communityId,
+      flatId,
+      role: safeString(user.role || 'RESIDENT') || 'RESIDENT',
+      street: safeString(user.street || payer.street),
+      streetId: safeString(user.streetId || payer.streetId),
+      buildingNo: safeString(user.buildingNo || payer.buildingNo),
+      apartmentNo: safeString(user.apartmentNo || payer.apartmentNo || payer.flatNumber),
+      flatLabel: safeString(user.flatLabel || payer.flatLabel),
+      updatedAtMs: nowMs(),
+    }, { merge: true }),
+  ]);
+  const shadowRef = db.doc(`users/${shadowUserId(communityId, flatId)}`);
+  const shadowSnap = await shadowRef.get();
+  if (shadowSnap.exists && shadowSnap.data()?.isShadow === true) {
+    await shadowRef.delete().catch(() => null);
+  }
+}
+
 // =========================================================
 // FCM HELPERS
 // =========================================================
@@ -520,6 +617,18 @@ exports.onFlatSeatSync = onDocumentWritten("communities/{communityId}/flats/{fla
 exports.onStreetRegistrySync = onDocumentWritten("communities/{communityId}/streets/{streetId}", async (event) => {
   const communityId = event.params.communityId;
   await syncCommunityStreetRegistry(communityId);
+});
+
+exports.onPayerShadowSync = onDocumentWritten("communities/{communityId}/payers/{flatId}", async (event) => {
+  const communityId = event.params.communityId;
+  const flatId = event.params.flatId;
+  await syncPayerShadowUser(communityId, flatId);
+  await syncCommunitySeats(communityId);
+});
+
+exports.onUserEmailLinkSync = onDocumentWritten("users/{uid}", async (event) => {
+  const uid = event.params.uid;
+  await linkRealUserByEmail(uid);
 });
 
 exports.onAnnouncementCreated = onDocumentCreated("communities/{communityId}/announcements/{announcementId}", async (event) => {

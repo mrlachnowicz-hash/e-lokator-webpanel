@@ -69,13 +69,24 @@ export default function ChargesPage() {
   useEffect(() => {
     if (!communityId) return;
     let draftItems: Settlement[] = [];
+    let legacyDraftItems: Settlement[] = [];
     let publishedItems: Settlement[] = [];
-    const sync = () => setItems(mergeSettlementsForView(draftItems, publishedItems));
+    const sync = () => {
+      const mergedDrafts = [...draftItems, ...legacyDraftItems].reduce((acc: Record<string, Settlement>, item: Settlement) => {
+        acc[item.id] = { ...(acc[item.id] || {}), ...item };
+        return acc;
+      }, {} as Record<string, Settlement>);
+      setItems(mergeSettlementsForView(Object.values(mergedDrafts), publishedItems));
+    };
 
     const unsubDrafts = onSnapshot(query(collection(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION), orderBy("updatedAtMs", "desc")), (snap) => {
       draftItems = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any), __collection: SETTLEMENT_DRAFTS_COLLECTION, isPublished: false }));
       sync();
     });
+    const unsubLegacyDrafts = onSnapshot(query(collection(db, SETTLEMENT_DRAFTS_COLLECTION), orderBy("updatedAtMs", "desc")), (snap) => {
+      legacyDraftItems = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any), __collection: SETTLEMENT_DRAFTS_COLLECTION, isPublished: false })).filter((item: any) => String(item.communityId || "") === communityId);
+      sync();
+    }, () => { legacyDraftItems = []; sync(); });
     const unsubSettlements = onSnapshot(query(collection(db, "communities", communityId, SETTLEMENTS_COLLECTION), orderBy("updatedAtMs", "desc")), (snap) => {
       publishedItems = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any), __collection: SETTLEMENTS_COLLECTION, isPublished: true }));
       sync();
@@ -90,7 +101,7 @@ export default function ChargesPage() {
       setCommunityDoc(data);
       setDefaults(readCommunityDefaults(data));
     });
-    return () => { unsubDrafts(); unsubSettlements(); unsubFlats(); unsubCommunity(); };
+    return () => { unsubDrafts(); unsubLegacyDrafts(); unsubSettlements(); unsubFlats(); unsubCommunity(); };
   }, [communityId]);
 
   const drafts = useMemo(() => items.filter((s) => s.__collection === SETTLEMENT_DRAFTS_COLLECTION), [items]);
@@ -196,7 +207,7 @@ export default function ChargesPage() {
         {msg && <div style={{ color: "#8ef0c8" }}>{msg}</div>}
 
         <div style={{ display: "grid", gap: 10 }}>
-          {drafts.map((s) => <SettlementCard key={s.id} s={s} communityId={communityId} flat={flats[s.flatId] || null} setMsg={setMsg} defaults={defaults} buildTransferTitle={buildTransferTitle} archived={false} />)}
+          {drafts.length ? drafts.map((s) => <SettlementCard key={s.id} s={s} communityId={communityId} flat={flats[s.flatId] || null} setMsg={setMsg} defaults={defaults} buildTransferTitle={buildTransferTitle} archived={false} />) : <div style={{ color: "#8ef0c8" }}>Brak szkiców do wyświetlenia.</div>}
         </div>
 
         <div className="card" style={{ display: "flex", gap: 16, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
