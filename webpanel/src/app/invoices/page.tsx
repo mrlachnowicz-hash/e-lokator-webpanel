@@ -35,11 +35,10 @@ function normalizeScope(value: any) {
   const raw = String(value || "").trim().toUpperCase();
   if (["LOCAL", "LOKAL"].includes(raw)) return "FLAT";
   if (["BUDYNEK"].includes(raw)) return "BUILDING";
-  if (["ULICA"].includes(raw)) return "STREET";
   if (["KLATKA", "ENTRANCE"].includes(raw)) return "STAIRCASE";
   if (["WSPOLNOTA"].includes(raw)) return "COMMUNITY";
   if (["WSPOLNE", "CZESCI_WSPOLNE"].includes(raw)) return "COMMON";
-  return ["FLAT", "BUILDING", "STREET", "STAIRCASE", "COMMON", "COMMUNITY"].includes(raw) ? raw : "COMMON";
+  return ["FLAT", "BUILDING", "STAIRCASE", "COMMON", "COMMUNITY"].includes(raw) ? raw : "COMMON";
 }
 
 function monthLabel(period: string) {
@@ -529,7 +528,6 @@ export default function InvoicesPage() {
                   <select className="select" value={assignment.scope} onChange={(e) => updateAssignment(item.id, { scope: e.target.value, flatId: e.target.value === "FLAT" ? assignment.flatId : "", staircaseId: e.target.value === "STAIRCASE" || e.target.value === "COMMON" ? assignment.staircaseId : "" })}>
                     <option value="FLAT">FLAT · lokal</option>
                     <option value="BUILDING">BUILDING · budynek</option>
-                    <option value="STREET">STREET · ulica</option>
                     <option value="STAIRCASE">STAIRCASE · klatka</option>
                     <option value="COMMON">COMMON · części wspólne</option>
                     <option value="COMMUNITY">COMMUNITY · wspólnota</option>

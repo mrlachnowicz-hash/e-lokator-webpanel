@@ -19,12 +19,12 @@ function normId(value: any) {
 function normalizeScope(value: any) {
   const raw = safe(value).toUpperCase();
   if (["LOCAL", "LOKAL"].includes(raw)) return "FLAT";
+  if (["ULICA", "STREET"].includes(raw)) return "STREET";
   if (["BUDYNEK"].includes(raw)) return "BUILDING";
-  if (["ULICA"].includes(raw)) return "STREET";
   if (["KLATKA", "ENTRANCE"].includes(raw)) return "STAIRCASE";
   if (["WSPOLNOTA"].includes(raw)) return "COMMUNITY";
   if (["WSPOLNE", "CZESCI_WSPOLNE"].includes(raw)) return "COMMON";
-  return ["FLAT", "BUILDING", "STREET", "STAIRCASE", "COMMON", "COMMUNITY"].includes(raw) ? raw : "COMMON";
+  return ["FLAT", "STREET", "BUILDING", "STAIRCASE", "COMMON", "COMMUNITY"].includes(raw) ? raw : "COMMON";
 }
 function settlementDocId(flatId: string, period: string) {
   return `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
@@ -79,15 +79,12 @@ function matchFlats(flats: Flat[], assignment: any, parsed: any, scope: string) 
       const directStreet = normId(direct.streetId || direct.street || direct.streetName);
       const directBuilding = norm(direct.buildingNo || direct.buildingId);
       const directStair = norm(direct.staircaseId || direct.staircase || direct.entranceId || direct.entrance || direct.klatka);
-      if (scope === "BUILDING" || scope === "COMMON") return flats.filter((flat) => normId(flat.streetId || flat.street || flat.streetName) === directStreet && norm(flat.buildingNo || flat.buildingId) === directBuilding);
       if (scope === "STREET") return flats.filter((flat) => normId(flat.streetId || flat.street || flat.streetName) === directStreet);
+      if (scope === "BUILDING" || scope === "COMMON") return flats.filter((flat) => normId(flat.streetId || flat.street || flat.streetName) === directStreet && norm(flat.buildingNo || flat.buildingId) === directBuilding);
       if (scope === "STAIRCASE") return flats.filter((flat) => normId(flat.streetId || flat.street || flat.streetName) === directStreet && norm(flat.buildingNo || flat.buildingId) === directBuilding && norm(flat.staircaseId || flat.staircase || flat.entranceId || flat.entrance || flat.klatka) === directStair);
     }
   }
   if (scope === "FLAT") return matches.slice(0, 1);
-  if (scope === "STREET" && wantedStreetId) {
-    return flats.filter((flat) => normId(flat.streetId || flat.street || flat.streetName) === wantedStreetId);
-  }
   if (matches.length) return matches;
   if (wantedStreetId || wantedBuilding || wantedStaircase) {
     return flats.filter((flat) => {
@@ -95,7 +92,7 @@ function matchFlats(flats: Flat[], assignment: any, parsed: any, scope: string) 
       const flatBuilding = norm(flat.buildingNo || flat.buildingId);
       const flatStaircase = norm(flat.staircaseId || flat.staircase || flat.entranceId || flat.entrance || flat.klatka);
       return (!wantedStreetId || flatStreetId === wantedStreetId)
-        && (!wantedBuilding || flatBuilding === wantedBuilding)
+        && (scope === "STREET" || !wantedBuilding || flatBuilding === wantedBuilding)
         && (scope !== "STAIRCASE" || !wantedStaircase || flatStaircase === wantedStaircase);
     });
   }
@@ -124,6 +121,8 @@ async function rebuildSettlement(adminDb: any, communityId: string, flat: Flat, 
     period,
   });
   const ref = adminDb.doc(`communities/${communityId}/settlementDrafts/${settlementDocId(flat.id, period)}`);
+  const chargeIds = chargesSnap.docs.map((d: any) => String(d.id));
+  const invoiceIds = Array.from(new Set(chargesSnap.docs.map((d: any) => String(d.data()?.invoiceId || "")).filter(Boolean)));
   await ref.set({
     id: settlementDocId(flat.id, period),
     communityId,
@@ -134,6 +133,9 @@ async function rebuildSettlement(adminDb: any, communityId: string, flat: Flat, 
     apartmentNo: valueOr(flat.apartmentNo, flat.flatNumber),
     period,
     dueDate: `${period}-15`,
+    chargeIds,
+    invoiceId: invoiceIds[0] || existing?.invoiceId || "",
+    invoiceIds,
     paymentRef,
     paymentTitle: paymentRef,
     paymentCode: paymentRef,

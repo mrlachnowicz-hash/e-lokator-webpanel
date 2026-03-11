@@ -218,6 +218,74 @@ function getOpenAIClient() {
 }
 
 
+
+async function syncUserDirectoryProfile(uid, inputData = {}) {
+  const userRef = db.doc(`users/${uid}`);
+  const currentSnap = await userRef.get();
+  const current = currentSnap.data() || {};
+  let email = safeString(inputData.email || current.email || current.mail || current.contactEmail);
+  if (!email) {
+    try {
+      const authUser = await admin.auth().getUser(uid);
+      email = safeString(authUser.email);
+    } catch (e) {}
+  }
+  if (!email) return { ok: false, reason: "no-email" };
+
+  const normalizedEmail = email.toLowerCase();
+  let communityId = safeString(inputData.communityId || current.communityId || current.customerId);
+  let flatDoc = null;
+
+  if (communityId) {
+    const flatSnap = await db.collection(`communities/${communityId}/flats`).where("email", "==", normalizedEmail).limit(1).get();
+    if (!flatSnap.empty) flatDoc = flatSnap.docs[0];
+  }
+  if (!flatDoc) {
+    const flatByEmail = await db.collectionGroup("flats").where("email", "==", normalizedEmail).limit(1).get();
+    if (!flatByEmail.empty) {
+      flatDoc = flatByEmail.docs[0];
+      const segments = flatDoc.ref.path.split("/");
+      communityId = segments.length >= 2 ? segments[1] : communityId;
+    }
+  }
+  if (!flatDoc) {
+    const payerByEmail = await db.collectionGroup("payers").where("email", "==", normalizedEmail).limit(1).get();
+    if (!payerByEmail.empty) {
+      const payerDoc = payerByEmail.docs[0];
+      const segments = payerDoc.ref.path.split("/");
+      communityId = segments.length >= 2 ? segments[1] : communityId;
+      const flatId = payerDoc.id;
+      const flatRef = db.doc(`communities/${communityId}/flats/${flatId}`);
+      const flatSnap = await flatRef.get();
+      if (flatSnap.exists) flatDoc = flatSnap;
+    }
+  }
+  if (!flatDoc || !communityId) return { ok: false, reason: "no-match", email: normalizedEmail };
+
+  const flat = flatDoc.data() || {};
+  const flatId = flatDoc.id;
+  const flatLabel = safeString(flat.flatLabel || `${flat.street || ""} ${flat.buildingNo || ""}/${flat.apartmentNo || flat.flatNumber || ""}`.trim());
+  const patch = {
+    communityId,
+    customerId: communityId,
+    flatId,
+    flatLabel,
+    street: safeString(flat.street || flat.streetName),
+    buildingNo: safeString(flat.buildingNo || flat.buildingId),
+    apartmentNo: safeString(flat.apartmentNo || flat.flatNumber),
+    displayName: safeString(current.displayName || flat.displayName || flat.residentName || `${flat.name || ""} ${flat.surname || ""}`.trim()),
+    firstName: safeString(current.firstName || flat.name || flat.firstName),
+    lastName: safeString(current.lastName || flat.surname || flat.lastName),
+    email: normalizedEmail,
+    phone: safeString(current.phone || flat.phone),
+    updatedAtMs: nowMs(),
+  };
+  await userRef.set(patch, { merge: true });
+  await flatDoc.ref.set({ residentUid: uid, userId: uid, email: normalizedEmail, updatedAtMs: nowMs() }, { merge: true });
+  await db.doc(`communities/${communityId}/payers/${flatId}`).set({ residentUid: uid, userId: uid, email: normalizedEmail, updatedAtMs: nowMs(), mailOnly: false }, { merge: true });
+  return { ok: true, communityId, flatId, email: normalizedEmail };
+}
+
 function settlementDocId(flatId, period) {
   return `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
 }
@@ -2342,4 +2410,30 @@ exports.aiExplainReview = onCall(async (request) => {
   }, { merge: true });
 
   return { ok: true, explanation };
+});
+
+
+exports.syncMyProfileFromDirectory = onCall(async (request) => {
+  if (!request.auth?.uid) throw new HttpsError("unauthenticated", "Zaloguj się.");
+  const res = await syncUserDirectoryProfile(request.auth.uid, request.data || {});
+  if (!res.ok) throw new HttpsError("not-found", "Nie znaleziono danych użytkownika do spięcia po emailu.");
+  return res;
+});
+
+exports.onUserProfileCreated = onDocumentCreated("users/{uid}", async (event) => {
+  const data = event.data?.data() || {};
+  const role = safeString(data.role).toUpperCase();
+  if (["MASTER", "ACCOUNTANT"].includes(role)) return;
+  try { await syncUserDirectoryProfile(String(event.params.uid || ""), data); } catch (e) { console.error("onUserProfileCreated sync error", e); }
+});
+
+exports.onUserProfileUpdated = onDocumentUpdated("users/{uid}", async (event) => {
+  const after = event.data?.after?.data() || {};
+  const before = event.data?.before?.data() || {};
+  const role = safeString(after.role || before.role).toUpperCase();
+  if (["MASTER", "ACCOUNTANT"].includes(role)) return;
+  const afterFlat = safeString(after.flatId);
+  const afterCommunity = safeString(after.communityId || after.customerId);
+  if (afterFlat && afterCommunity) return;
+  try { await syncUserDirectoryProfile(String(event.params.uid || ""), after); } catch (e) { console.error("onUserProfileUpdated sync error", e); }
 });
