@@ -21,7 +21,7 @@ export async function suggestInvoice(payload: Record<string, any>) {
         role: "system",
         content: [{ type: "input_text", text:
           "Jesteś asystentem księgowym dla wspólnot mieszkaniowych. Zwracaj wyłącznie JSON bez markdown. " +
-          "Schema: {category:string, allocationType:'COMMON'|'BUILDING'|'STAIRCASE'|'COMMUNITY'|'FLAT'|'UNKNOWN', suggestedBuildingId?:string, suggestedFlatId?:string, suggestedStreetId?:string, suggestedStreetName?:string, suggestedApartmentNo?:string, suggestedStaircaseId?:string, confidence:number, needsReview:boolean, reason:string}. " +
+          "Schema: {category:string, allocationType:'COMMON'|'BUILDING'|'FLAT', suggestedBuildingId?:string, suggestedFlatId?:string, confidence:number, needsReview:boolean, reason:string}. " +
           "Jeżeli nie ma pewności, ustaw needsReview=true. Nie wymyślaj identyfikatorów jeśli nie ma ich w danych wejściowych."
         }]
       },
