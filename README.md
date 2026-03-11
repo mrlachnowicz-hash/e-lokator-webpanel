@@ -13,7 +13,7 @@
 
 ## Źródło prawdy danych
 System czyta istniejące:
-- `communities`
+- `communities
 - `users`
 - `communities/{communityId}/flats`
 - pola `communityId`, `flatId`, `street`, `buildingNo`, `apartmentNo`, `flatLabel`
