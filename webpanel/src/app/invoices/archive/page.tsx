@@ -34,7 +34,7 @@ export default function InvoiceArchivePage() {
   const { profile } = useAuth();
   const communityId = profile?.communityId || "";
   const [invoices, setInvoices] = useState<InvoiceItem[]>([]);
-  const [selectedMonth, setSelectedMonth] = useState<string>("");
+  const [openMonth, setOpenMonth] = useState<string>("");
   const [message, setMessage] = useState<string | null>(null);
   const [busyMonth, setBusyMonth] = useState<string>("");
 
@@ -76,11 +76,11 @@ export default function InvoiceArchivePage() {
 
   useEffect(() => {
     if (!orderedMonths.length) {
-      if (selectedMonth) setSelectedMonth("");
+      setOpenMonth("");
       return;
     }
-    if (!selectedMonth || !groups[selectedMonth]) setSelectedMonth(orderedMonths[0]);
-  }, [groups, orderedMonths, selectedMonth]);
+    if (openMonth && !groups[openMonth]) setOpenMonth("");
+  }, [groups, orderedMonths, openMonth]);
 
   const clearMonth = async (month: string) => {
     if (!communityId) return;
@@ -106,9 +106,8 @@ export default function InvoiceArchivePage() {
       }
       if (ops > 0) await batch.commit();
       setMessage(`Usunięto z archiwum ${deleted} faktur za ${monthLabel(month)}.`);
-      if (selectedMonth === month) {
-        const remaining = orderedMonths.filter((value) => value !== month);
-        setSelectedMonth(remaining[0] || "");
+      if (openMonth === month) {
+        setOpenMonth("");
       }
     } catch (error: any) {
       setMessage(error?.message || "Błąd usuwania archiwum miesiąca.");
@@ -134,41 +133,47 @@ export default function InvoiceArchivePage() {
         {orderedMonths.length === 0 ? <div className="card">Brak archiwum faktur.</div> : (
           <>
             <div className="card" style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-              {orderedMonths.map((month) => (
-                <button
-                  key={month}
-                  type="button"
-                  className={selectedMonth === month ? "btn" : "btnGhost"}
-                  onClick={() => setSelectedMonth(month)}
-                >
-                  {monthLabel(month)} ({groups[month]?.length || 0})
-                </button>
-              ))}
+              {orderedMonths.map((month) => {
+                const isOpen = openMonth === month;
+                return (
+                  <button
+                    key={month}
+                    type="button"
+                    className={isOpen ? "btn" : "btnGhost"}
+                    onClick={() => setOpenMonth(isOpen ? "" : month)}
+                  >
+                    {isOpen ? "▾" : "▸"} {monthLabel(month)} ({groups[month]?.length || 0})
+                  </button>
+                );
+              })}
             </div>
 
-            {selectedMonth && groups[selectedMonth] ? (
-              <div className="card" style={{ display: "grid", gap: 12 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-                  <strong>{monthLabel(selectedMonth)}</strong>
-                  <button className="btnGhost" onClick={() => clearMonth(selectedMonth)} disabled={busyMonth === selectedMonth}>
-                    {busyMonth === selectedMonth ? "Czyszczenie..." : "Wyczyść miesiąc"}
-                  </button>
-                </div>
-                <div style={{ display: "grid", gap: 10 }}>
-                  {groups[selectedMonth].map((item) => (
-                    <div key={`${item.sourceCollection}_${item.id}`} style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", borderTop: "1px solid rgba(255,255,255,.08)", paddingTop: 10 }}>
-                      <div style={{ display: "grid", gap: 4 }}>
-                        <strong>{String(item.supplierName || item.vendorName || item.parsed?.sellerName || item.filename || item.id)}</strong>
-                        <div style={{ opacity: 0.78 }}>Kategoria: {String(item.category || item.parsed?.category || "INNE")} · Zakres: {String(item.assigned?.scope || item.scope || item.parsed?.scope || item.parsed?.allocationType || "—")}</div>
-                        <div style={{ opacity: 0.78 }}>Okres: {String(item.lastDraftPeriod || item.period || item.parsed?.period || "—")} · Szkice: {Number(item.settlementDraftCount || 0)}</div>
-                        <div style={{ opacity: 0.7 }}>Źródło: {item.sourceCollection === "ksefInvoices" ? "KSeF" : "Faktury"} · ID: {item.id}</div>
+            {orderedMonths.map((month) => {
+              if (openMonth !== month) return null;
+              return (
+                <div key={`panel_${month}`} className="card" style={{ display: "grid", gap: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                    <strong>{monthLabel(month)}</strong>
+                    <button className="btnGhost" onClick={() => clearMonth(month)} disabled={busyMonth === month}>
+                      {busyMonth === month ? "Czyszczenie..." : "Wyczyść miesiąc"}
+                    </button>
+                  </div>
+                  <div style={{ display: "grid", gap: 10 }}>
+                    {groups[month].map((item) => (
+                      <div key={`${item.sourceCollection}_${item.id}`} style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", borderTop: "1px solid rgba(255,255,255,.08)", paddingTop: 10 }}>
+                        <div style={{ display: "grid", gap: 4 }}>
+                          <strong>{String(item.supplierName || item.vendorName || item.parsed?.sellerName || item.filename || item.id)}</strong>
+                          <div style={{ opacity: 0.78 }}>Kategoria: {String(item.category || item.parsed?.category || "INNE")} · Zakres: {String(item.assigned?.scope || item.scope || item.parsed?.scope || item.parsed?.allocationType || "—")}</div>
+                          <div style={{ opacity: 0.78 }}>Okres: {String(item.lastDraftPeriod || item.period || item.parsed?.period || "—")} · Szkice: {Number(item.settlementDraftCount || 0)}</div>
+                          <div style={{ opacity: 0.7 }}>Źródło: {item.sourceCollection === "ksefInvoices" ? "KSeF" : "Faktury"} · ID: {item.id}</div>
+                        </div>
+                        <div style={{ fontWeight: 700 }}>{amountLabel(item)}</div>
                       </div>
-                      <div style={{ fontWeight: 700 }}>{amountLabel(item)}</div>
-                    </div>
-                  ))}
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ) : null}
+              );
+            })}
           </>
         )}
       </div>

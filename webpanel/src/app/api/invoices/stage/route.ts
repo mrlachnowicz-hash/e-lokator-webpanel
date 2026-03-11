@@ -20,10 +20,11 @@ function normalizeScope(value: any) {
   const raw = safe(value).toUpperCase();
   if (["LOCAL", "LOKAL"].includes(raw)) return "FLAT";
   if (["BUDYNEK"].includes(raw)) return "BUILDING";
+  if (["ULICA"].includes(raw)) return "STREET";
   if (["KLATKA", "ENTRANCE"].includes(raw)) return "STAIRCASE";
   if (["WSPOLNOTA"].includes(raw)) return "COMMUNITY";
   if (["WSPOLNE", "CZESCI_WSPOLNE"].includes(raw)) return "COMMON";
-  return ["FLAT", "BUILDING", "STAIRCASE", "COMMON", "COMMUNITY"].includes(raw) ? raw : "COMMON";
+  return ["FLAT", "BUILDING", "STREET", "STAIRCASE", "COMMON", "COMMUNITY"].includes(raw) ? raw : "COMMON";
 }
 function settlementDocId(flatId: string, period: string) {
   return `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
@@ -79,10 +80,14 @@ function matchFlats(flats: Flat[], assignment: any, parsed: any, scope: string) 
       const directBuilding = norm(direct.buildingNo || direct.buildingId);
       const directStair = norm(direct.staircaseId || direct.staircase || direct.entranceId || direct.entrance || direct.klatka);
       if (scope === "BUILDING" || scope === "COMMON") return flats.filter((flat) => normId(flat.streetId || flat.street || flat.streetName) === directStreet && norm(flat.buildingNo || flat.buildingId) === directBuilding);
+      if (scope === "STREET") return flats.filter((flat) => normId(flat.streetId || flat.street || flat.streetName) === directStreet);
       if (scope === "STAIRCASE") return flats.filter((flat) => normId(flat.streetId || flat.street || flat.streetName) === directStreet && norm(flat.buildingNo || flat.buildingId) === directBuilding && norm(flat.staircaseId || flat.staircase || flat.entranceId || flat.entrance || flat.klatka) === directStair);
     }
   }
   if (scope === "FLAT") return matches.slice(0, 1);
+  if (scope === "STREET" && wantedStreetId) {
+    return flats.filter((flat) => normId(flat.streetId || flat.street || flat.streetName) === wantedStreetId);
+  }
   if (matches.length) return matches;
   if (wantedStreetId || wantedBuilding || wantedStaircase) {
     return flats.filter((flat) => {

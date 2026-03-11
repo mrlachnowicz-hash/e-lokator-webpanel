@@ -11,7 +11,10 @@ export function mergeSettlementsForView(drafts: any[], published: any[]) {
     map.set(String(item.id), { ...item, __collection: SETTLEMENT_DRAFTS_COLLECTION, isPublished: false });
   });
   published.forEach((item) => {
-    map.set(String(item.id), { ...item, __collection: SETTLEMENTS_COLLECTION, isPublished: true });
+    const id = String(item.id);
+    if (!map.has(id)) {
+      map.set(id, { ...item, __collection: SETTLEMENTS_COLLECTION, isPublished: true });
+    }
   });
   return Array.from(map.values()).sort((a, b) => Number(b.updatedAtMs || b.createdAtMs || 0) - Number(a.updatedAtMs || a.createdAtMs || 0));
 }

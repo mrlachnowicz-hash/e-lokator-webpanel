@@ -23,7 +23,7 @@ export default function ChargesArchivePage() {
   const { profile } = useAuth();
   const communityId = profile?.communityId || "";
   const [items, setItems] = useState<Settlement[]>([]);
-  const [selectedMonth, setSelectedMonth] = useState("");
+  const [openMonth, setOpenMonth] = useState<string>("");
   const [busyMonth, setBusyMonth] = useState("");
   const [message, setMessage] = useState<string | null>(null);
 
@@ -44,11 +44,11 @@ export default function ChargesArchivePage() {
 
   useEffect(() => {
     if (!orderedMonths.length) {
-      setSelectedMonth("");
+      setOpenMonth("");
       return;
     }
-    if (!selectedMonth || !groups[selectedMonth]) setSelectedMonth(orderedMonths[0]);
-  }, [orderedMonths, groups, selectedMonth]);
+    if (openMonth && !groups[openMonth]) setOpenMonth("");
+  }, [orderedMonths, groups, openMonth]);
 
   const clearMonth = async (month: string) => {
     if (!communityId) return;
@@ -97,38 +97,44 @@ export default function ChargesArchivePage() {
         {orderedMonths.length === 0 ? <div className="card">Brak archiwum rozliczeń.</div> : (
           <>
             <div className="card" style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-              {orderedMonths.map((month) => (
-                <button key={month} type="button" className={selectedMonth === month ? "btn" : "btnGhost"} onClick={() => setSelectedMonth(month)}>
-                  {monthLabel(month)} ({groups[month]?.length || 0})
-                </button>
-              ))}
+              {orderedMonths.map((month) => {
+                const isOpen = openMonth === month;
+                return (
+                  <button key={month} type="button" className={isOpen ? "btn" : "btnGhost"} onClick={() => setOpenMonth(isOpen ? "" : month)}>
+                    {isOpen ? "▾" : "▸"} {monthLabel(month)} ({groups[month]?.length || 0})
+                  </button>
+                );
+              })}
             </div>
 
-            {selectedMonth && groups[selectedMonth] ? (
-              <div className="card" style={{ display: "grid", gap: 12 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-                  <strong>{monthLabel(selectedMonth)}</strong>
-                  <button className="btnGhost" onClick={() => clearMonth(selectedMonth)} disabled={busyMonth === selectedMonth}>
-                    {busyMonth === selectedMonth ? "Czyszczenie..." : "Wyczyść miesiąc"}
-                  </button>
-                </div>
-                <div style={{ display: "grid", gap: 10 }}>
-                  {groups[selectedMonth].map((s) => (
-                    <div key={s.id} className="card" style={{ display: "grid", gap: 10 }}>
-                      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-                        <b>{s.flatLabel || s.addressLabel || s.flatId}</b>
-                        <span style={{ opacity: 0.75 }}>{s.period}</span>
-                        <span style={{ opacity: 0.75 }}>Status: WYSŁANE</span>
-                        <span style={{ opacity: 0.75 }}>Saldo: {moneyCents(s.balanceCents)}</span>
-                        <span style={{ opacity: 0.75 }}>Opłaty: {moneyCents(s.chargesCents ?? s.totalChargesCents ?? s.totalCents)}</span>
-                        <span style={{ opacity: 0.75 }}>Wpłaty: {moneyCents(s.paymentsCents ?? s.totalPaymentsCents)}</span>
+            {orderedMonths.map((month) => {
+              if (openMonth !== month) return null;
+              return (
+                <div key={`panel_${month}`} className="card" style={{ display: "grid", gap: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                    <strong>{monthLabel(month)}</strong>
+                    <button className="btnGhost" onClick={() => clearMonth(month)} disabled={busyMonth === month}>
+                      {busyMonth === month ? "Czyszczenie..." : "Wyczyść miesiąc"}
+                    </button>
+                  </div>
+                  <div style={{ display: "grid", gap: 10 }}>
+                    {groups[month].map((s) => (
+                      <div key={s.id} className="card" style={{ display: "grid", gap: 10 }}>
+                        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                          <b>{s.flatLabel || s.addressLabel || s.flatId}</b>
+                          <span style={{ opacity: 0.75 }}>{s.period}</span>
+                          <span style={{ opacity: 0.75 }}>Status: WYSŁANE</span>
+                          <span style={{ opacity: 0.75 }}>Saldo: {moneyCents(s.balanceCents)}</span>
+                          <span style={{ opacity: 0.75 }}>Opłaty: {moneyCents(s.chargesCents ?? s.totalChargesCents ?? s.totalCents)}</span>
+                          <span style={{ opacity: 0.75 }}>Wpłaty: {moneyCents(s.paymentsCents ?? s.totalPaymentsCents)}</span>
+                        </div>
+                        <div style={{ opacity: 0.8 }}>Termin płatności: {s.dueDate || "—"}</div>
                       </div>
-                      <div style={{ opacity: 0.8 }}>Termin płatności: {s.dueDate || "—"}</div>
-                    </div>
-                  ))}
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ) : null}
+              );
+            })}
           </>
         )}
       </div>
