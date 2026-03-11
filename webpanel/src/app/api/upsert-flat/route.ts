@@ -4,52 +4,6 @@ import { buildFlatKey } from '../../../lib/flatMapping';
 import { canCreateFlat, getSeatState, getSeatUsed } from '../../../lib/server/seatLimits';
 import { ensureStreet } from '../../../lib/server/streetRegistry';
 
-
-
-async function syncExistingAuthUserByEmail(params: {
-  adminApp: any;
-  db: any;
-  communityId: string;
-  flatId: string;
-  flatLabel: string;
-  street: string;
-  buildingNo: string;
-  apartmentNo: string;
-  firstName: string;
-  lastName: string;
-  displayName: string;
-  email: string;
-  phone: string;
-}) {
-  const email = String(params.email || '').trim().toLowerCase();
-  if (!email) return null;
-  try {
-    const authUser = await params.adminApp.auth().getUserByEmail(email);
-    const now = Date.now();
-    const profilePatch = {
-      communityId: params.communityId,
-      customerId: params.communityId,
-      flatId: params.flatId,
-      flatLabel: params.flatLabel,
-      street: params.street,
-      buildingNo: params.buildingNo,
-      apartmentNo: params.apartmentNo,
-      firstName: params.firstName || '',
-      lastName: params.lastName || '',
-      displayName: params.displayName || [params.firstName, params.lastName].filter(Boolean).join(' '),
-      email,
-      phone: params.phone || '',
-      updatedAtMs: now,
-    };
-    await params.db.collection('users').doc(authUser.uid).set(profilePatch, { merge: true });
-    await params.db.collection('communities').doc(params.communityId).collection('flats').doc(params.flatId).set({ residentUid: authUser.uid, userId: authUser.uid, email, phone: params.phone || '', updatedAtMs: now }, { merge: true });
-    await params.db.collection('communities').doc(params.communityId).collection('payers').doc(params.flatId).set({ residentUid: authUser.uid, userId: authUser.uid, email, phone: params.phone || '', updatedAtMs: now, mailOnly: false }, { merge: true });
-    return authUser.uid;
-  } catch {
-    return null;
-  }
-}
-
 function splitDisplayName(displayName: string) {
   const parts = String(displayName || '').trim().split(/\s+/).filter(Boolean);
   if (parts.length <= 1) return { firstName: parts[0] || '', lastName: '' };
@@ -76,7 +30,7 @@ export async function POST(req: NextRequest) {
     let firstName = String(body?.name || body?.firstName || '').trim();
     let lastName = String(body?.surname || body?.lastName || '').trim();
     const displayNameRaw = String(body?.displayName || '').trim();
-    const email = String(body?.email || '').trim().toLowerCase();
+    const email = String(body?.email || '').trim();
     const phone = String(body?.phone || '').trim();
 
     if (!communityId || !street || !buildingNo || !apartmentNo) {
@@ -133,8 +87,6 @@ export async function POST(req: NextRequest) {
     const mergedDisplayName = displayNameRaw || [firstName, lastName].filter(Boolean).join(' ');
     await ensureStreet(db as any, communityId, street, uid);
 
-    const linkedUid = await syncExistingAuthUserByEmail({ adminApp, db, communityId, flatId: ref.id, flatLabel, street, buildingNo, apartmentNo, firstName, lastName, displayName: mergedDisplayName || existingData.displayName || '', email, phone });
-
     await ref.set({
       communityId,
       street,
@@ -149,8 +101,6 @@ export async function POST(req: NextRequest) {
       displayName: mergedDisplayName || existingData.displayName || '',
       email: email || existingData.email || '',
       phone: phone || existingData.phone || '',
-      residentUid: linkedUid || existingData.residentUid || null,
-      userId: linkedUid || existingData.userId || null,
       createdAtMs: Number(existingData.createdAtMs || now),
       updatedAtMs: now,
     }, { merge: true });
@@ -168,9 +118,7 @@ export async function POST(req: NextRequest) {
       displayName: mergedDisplayName || existingData.displayName || '',
       email: email || existingData.email || '',
       phone: phone || existingData.phone || '',
-      mailOnly: !linkedUid && !existingData.residentUid && !!(email || existingData.email),
-      residentUid: linkedUid || existingData.residentUid || null,
-      userId: linkedUid || existingData.userId || null,
+      mailOnly: !existingData.residentUid && !!(email || existingData.email),
       createdAtMs: Number(existingData.createdAtMs || now),
       updatedAtMs: now,
     }, { merge: true });

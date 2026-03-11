@@ -6,12 +6,9 @@ export function isPublishedSettlement(value: any) {
 }
 
 export function mergeSettlementsForView(drafts: any[], published: any[]) {
-  const map = new Map<string, any>();
-  published.forEach((item) => {
-    map.set(String(item.id), { ...item, __collection: SETTLEMENTS_COLLECTION, isPublished: true });
-  });
-  drafts.forEach((item) => {
-    map.set(String(item.id), { ...item, __collection: SETTLEMENT_DRAFTS_COLLECTION, isPublished: false });
-  });
-  return Array.from(map.values()).sort((a, b) => Number(b.updatedAtMs || b.createdAtMs || 0) - Number(a.updatedAtMs || a.createdAtMs || 0));
+  const items = [
+    ...drafts.map((item) => ({ ...item, __collection: SETTLEMENT_DRAFTS_COLLECTION, isPublished: false })),
+    ...published.map((item) => ({ ...item, __collection: SETTLEMENTS_COLLECTION, isPublished: true })),
+  ];
+  return items.sort((a, b) => Number(b.updatedAtMs || b.createdAtMs || 0) - Number(a.updatedAtMs || a.createdAtMs || 0));
 }

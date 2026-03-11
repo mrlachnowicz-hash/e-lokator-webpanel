@@ -34,32 +34,12 @@ const fetchKsefCallable = httpsCallable<any, any>(getFunctions(undefined, "europ
 function normalizeScope(value: any) {
   const raw = String(value || "").trim().toUpperCase();
   if (["LOCAL", "LOKAL"].includes(raw)) return "FLAT";
-  if (["ULICA", "STREET"].includes(raw)) return "STREET";
   if (["BUDYNEK"].includes(raw)) return "BUILDING";
   if (["KLATKA", "ENTRANCE"].includes(raw)) return "STAIRCASE";
+  if (["ULICA", "STREET"].includes(raw)) return "STREET";
   if (["WSPOLNOTA"].includes(raw)) return "COMMUNITY";
   if (["WSPOLNE", "CZESCI_WSPOLNE"].includes(raw)) return "COMMON";
-  return ["FLAT", "STREET", "BUILDING", "STAIRCASE", "COMMON", "COMMUNITY"].includes(raw) ? raw : "COMMON";
-}
-
-
-function normalizeLookup(value: any) {
-  return String(value || "")
-    .trim()
-    .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "");
-}
-
-function buildInvoiceSignature(item: any) {
-  return normalizeLookup([
-    item?.invoiceNumber || item?.parsed?.invoiceNumber || item?.ksefNumber || "",
-    item?.supplierName || item?.vendorName || item?.parsed?.sellerName || "",
-    String(Number(item?.parsed?.totalGrossCents || item?.parsed?.amountCents || item?.totalGrossCents || item?.amountCents || 0)),
-    item?.period || item?.parsed?.period || item?.archiveMonth || "",
-    inferScope(item),
-  ].join("|"));
+  return ["FLAT", "BUILDING", "STAIRCASE", "STREET", "COMMON", "COMMUNITY"].includes(raw) ? raw : "COMMON";
 }
 
 function monthLabel(period: string) {
@@ -67,6 +47,17 @@ function monthLabel(period: string) {
   const m = String(period || "").match(/^(\d{4})-(\d{2})/);
   if (!m) return period || "—";
   return `${names[Number(m[2]) - 1] || m[2]} ${m[1]}`;
+}
+
+
+function duplicateInvoiceSignature(input: any) {
+  const normalized = (value: any) => String(value || "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
+  const invoiceNumber = normalized(input?.invoiceNumber || input?.parsed?.invoiceNumber);
+  const supplierName = normalized(input?.supplierName || input?.vendorName || input?.parsed?.sellerName);
+  const issueDate = normalized(input?.issueDate || input?.parsed?.issueDate);
+  const amount = String(Number(input?.totalGrossCents || input?.amountCents || input?.parsed?.totalGrossCents || input?.parsed?.amountCents || 0));
+  if (!invoiceNumber && !supplierName && !issueDate && amount === "0") return "";
+  return [invoiceNumber, supplierName, issueDate, amount].join("|");
 }
 
 function moneyFromInvoice(item: InvoiceItem) {
@@ -130,12 +121,6 @@ export default function InvoicesPage() {
   const [ksefDebug, setKsefDebug] = useState<{ created: number; duplicates: number; totalVisible: number }>({ created: 0, duplicates: 0, totalVisible: 0 });
   const [ksefRecent, setKsefRecent] = useState<InvoiceItem[]>([]);
   const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
-
-  const hasDuplicateInvoice = (candidate: any) => {
-    const signature = buildInvoiceSignature(candidate);
-    if (!signature) return false;
-    return invoices.some((row) => buildInvoiceSignature(row) === signature);
-  };
 
   useEffect(() => {
     if (!communityId) return;
@@ -222,16 +207,24 @@ export default function InvoicesPage() {
       const totalGrossCents = Math.round(grossAmount * 100);
       const period = String((data.issueDate || "").slice(0, 7) || "").trim();
       const scope = normalizeScope(data.allocationType || "COMMON");
-      const candidate = {
-        invoiceNumber: String(data.invoiceNumber || ""),
+      const nextInvoice = {
+        source: "WEBPANEL_OCR",
+        status: data.needsReview ? "NOWA" : "READY_TO_STAGE",
+        filename: String(data.filename || file.name || "invoice"),
         supplierName: String(data.supplierName || ""),
-        totalGrossCents,
+        vendorName: String(data.supplierName || ""),
+        invoiceNumber: String(data.invoiceNumber || ""),
+        issueDate: String(data.issueDate || ""),
+        dueDate: String(data.dueDate || ""),
+        currency: String(data.currency || "PLN"),
         amountCents: totalGrossCents,
+        totalGrossCents,
         period,
-        scope,
-        parsed: { invoiceNumber: String(data.invoiceNumber || ""), sellerName: String(data.supplierName || ""), totalGrossCents, amountCents: totalGrossCents, period, scope },
       };
-      if (hasDuplicateInvoice(candidate)) throw new Error("Nie dodano DUPLIKAT");
+      const nextSignature = duplicateInvoiceSignature(nextInvoice);
+      if (nextSignature && invoices.some((item) => duplicateInvoiceSignature(item) === nextSignature)) {
+        throw new Error("Nie dodano DUPLIKAT");
+      }
       const now = Date.now();
       await addDoc(collection(db, "communities", communityId, "invoices"), {
         createdAtMs: now,
@@ -376,7 +369,7 @@ export default function InvoicesPage() {
       });
       const data: any = await res.json();
       if (!res.ok) throw new Error(data.error || "Błąd przenoszenia faktury do szkicu.");
-      setMessage(`Przeniesiono do szkicu: ${data.chargesCreated || 0} naliczeń i ${data.draftCount || 0} szkiców, zakres ${data.scope || normalizeScope(assignment.scope)}.`);
+      setMessage(`Przeniesiono do szkicu: ${data.chargesCreated || 0} naliczeń, zakres ${data.scope || normalizeScope(assignment.scope)}.`);
     } catch (error: any) {
       setMessage(error?.message || error?.details || "Błąd przenoszenia faktury do szkicu.");
     } finally {
@@ -564,7 +557,6 @@ export default function InvoicesPage() {
                 <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
                   <select className="select" value={assignment.scope} onChange={(e) => updateAssignment(item.id, { scope: e.target.value, flatId: e.target.value === "FLAT" ? assignment.flatId : "", staircaseId: e.target.value === "STAIRCASE" || e.target.value === "COMMON" ? assignment.staircaseId : "" })}>
                     <option value="FLAT">FLAT · lokal</option>
-                    <option value="STREET">STREET · ulica</option>
                     <option value="BUILDING">BUILDING · budynek</option>
                     <option value="STAIRCASE">STAIRCASE · klatka</option>
                     <option value="COMMON">COMMON · części wspólne</option>
