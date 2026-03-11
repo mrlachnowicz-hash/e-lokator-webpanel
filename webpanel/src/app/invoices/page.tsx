@@ -6,6 +6,7 @@ import { addDoc, collection, deleteDoc, doc, getDocs, onSnapshot } from "firebas
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/authContext";
 import { normalizeStreetId } from "@/lib/streetUtils";
+import { getFunctions, httpsCallable } from "firebase/functions";
 import { Nav } from "@/components/Nav";
 import { RequireAuth } from "@/components/RequireAuth";
 
@@ -28,7 +29,7 @@ type StreetOption = { id: string; name: string };
 type FlatItem = any & { id: string };
 type UploadQueueItem = { id: string; name: string; status: "waiting" | "processing" | "done" | "error"; message?: string };
 
-const fetchKsefCallable = callable<any, any>("ksefFetchInvoices");
+const fetchKsefCallable = httpsCallable<any, any>(getFunctions(undefined, "europe-west1"), "ksefFetchInvoices");
 
 function normalizeScope(value: any) {
   const raw = String(value || "").trim().toUpperCase();
