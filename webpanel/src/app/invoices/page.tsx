@@ -462,10 +462,18 @@ export default function InvoicesPage() {
 
         <div className="card" style={{ display: "grid", gap: 12 }}>
           <h3>Dodaj fakturę OCR</h3>
-          <input type="file" multiple accept=".pdf,.jpg,.jpeg,.png,.webp" onChange={async (e) => {
-            await handleUploadQueue(Array.from(e.target.files || []));
-            e.currentTarget.value = "";
-          }} />
+          <input
+  type="file"
+  multiple
+  accept=".pdf,.jpg,.jpeg,.png,.webp"
+  onChange={async (e) => {
+    const input = e.currentTarget;
+    const files = Array.from(input.files || []);
+    if (!files.length) return;
+    await handleUploadQueue(files);
+    input.value = "";
+  }}
+/>
           <div style={{ opacity: 0.78 }}>Obsługa: PDF, JPG, JPEG, PNG, WEBP. Możesz dodać kilka faktur naraz — pliki zostaną przetworzone po kolei i zakolejkowane.</div>
         </div>
 
