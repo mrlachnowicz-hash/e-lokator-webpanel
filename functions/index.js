@@ -1,17 +1,7 @@
 const admin = require("firebase-admin");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
-const { onDocumentCreated, onDocumentUpdated, onDocumentWritten } = require("firebase-functions/v2/firestore");
-const { onSchedule } = require("firebase-functions/v2/scheduler");
-const { XMLParser } = require("fast-xml-parser");
-const PDFDocument = require("pdfkit");
-const nodemailer = require("nodemailer");
-const crypto = require("crypto");
-
-let OpenAI = null;
-let pdfParse = null;
-try { OpenAI = require("openai").default; } catch (e) {}
-try { pdfParse = require("pdf-parse"); } catch (e) {}
+const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
 
 setGlobalOptions({ region: "europe-west1" });
 
@@ -22,2799 +12,44 @@ try {
 }
 
 const db = admin.firestore();
-const RUNTIME_FIX_VERSION = "2026-03-10-r8";
-const SETTLEMENTS_COLLECTION = "settlements";
-const SETTLEMENT_DRAFTS_COLLECTION = "settlementDrafts";
+const bucket = admin.storage().bucket();
+const { FieldValue } = admin.firestore;
 
-// =========================================================
-// BASIC HELPERS
-// =========================================================
+const OWNER_UIDS = ["C4NPiqCNCChdDZ0s54di5g8Mt5l2"];
+const OWNER_EMAILS = ["mrlachnowicz@gmail.com"];
 
 function nowMs() {
   return Date.now();
 }
 
-function safeString(v) {
-  return String(v || "").trim();
-}
-
-function normalizeStreetName(name) {
-  return safeString(name)
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-function randomCode(len = 10) {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let out = "";
-  for (let i = 0; i < len; i++) out += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  return out;
-}
-
-function randomToken(len = 48) {
-  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  let out = "";
-  for (let i = 0; i < len; i++) out += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-  return out;
-}
-
-function toCents(value) {
-  if (value == null) return 0;
-  const n = Number(String(value).replace(/\s/g, "").replace(",", "."));
-  if (!Number.isFinite(n)) return 0;
-  return Math.round(n * 100);
-}
-
-function fromCents(cents) {
-  return Number(cents || 0) / 100;
-}
-
-function monthFromDateStr(yyyyMmDd) {
-  const s = safeString(yyyyMmDd);
-  return s.length >= 7 ? s.slice(0, 7) : "";
-}
-
-function formatMoney(cents) {
-  const val = Number(cents || 0);
-  const sign = val < 0 ? "-" : "";
-  const abs = Math.abs(val);
-  const z = Math.floor(abs / 100);
-  const g = String(abs % 100).padStart(2, "0");
-  return `${sign}${z},${g} PLN`;
-}
-
-function valueOr(a, b) {
-  return safeString(a) || safeString(b);
-}
-
-function paymentCodeForFlat(flat) {
-  return safeString(flat.paymentCode || flat.flatLabel || `${flat.street || ""}-${flat.buildingNo || ""}-${flat.apartmentNo || ""}`)
-    .replace(/\s+/g, "-")
-    .replace(/[^\w\-\/]/g, "")
-    .toUpperCase()
-    .slice(0, 18);
-}
-
-function shortHash(input) {
-  return crypto.createHash("sha256").update(safeString(input || "X"), "utf8").digest("hex").toUpperCase().slice(0, 6);
-}
-
-function simpleHash(input) {
-  let hash = 2166136261;
-  const text = safeString(input || "");
-  for (let i = 0; i < text.length; i += 1) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
-}
-
-function tripletFromSeed(seed, salt) {
-  return String(simpleHash(`${salt}|${seed}`) % 1000).padStart(3, "0");
-}
-
-function normalizePlain(value) {
-  return safeString(value)
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "");
-}
-
-const PAYMENT_REF_REGEX = /\b([A-Z]{2}-\d{3}-\d{3}-\d{3}-20\d{2}-\d{2})\b/i;
-
-function normalizePaymentRef(value) {
-  const input = safeString(value).toUpperCase().replace(/[–—]/g, "-");
-  const direct = input.match(PAYMENT_REF_REGEX);
-  if (direct?.[1]) return direct[1];
-  const relaxed = input.replace(/[^A-Z0-9]/g, " ").replace(/\s+/g, " ").trim().match(/\b([A-Z]{2})\s*(\d{3})\s*(\d{3})\s*(\d{3})\s*(20\d{2})\s*(\d{2})\b/);
-  return relaxed ? `${relaxed[1]}-${relaxed[2]}-${relaxed[3]}-${relaxed[4]}-${relaxed[5]}-${relaxed[6]}` : "";
-}
-
-function extractPaymentRef(value) {
-  return normalizePaymentRef(value);
-}
-
-function buildStablePaymentRef(flat = {}, period = "") {
-  const periodMatch = safeString(period || nowMs()).match(/^(20\d{2})-(\d{2})/);
-  const year = periodMatch?.[1] || new Date().toISOString().slice(0, 4);
-  const month = periodMatch?.[2] || new Date().toISOString().slice(5, 7);
-  const seed = [
-    flat.communityId || "",
-    flat.id || flat.flatId || "",
-    flat.street || flat.streetName || "",
-    flat.buildingNo || flat.buildingId || "",
-    flat.apartmentNo || flat.flatNumber || "",
-    flat.flatLabel || "",
-    `${year}-${month}`,
-  ].join("|");
-  const aptDigits = normalizePlain(flat.apartmentNo || flat.flatNumber || flat.flatId || flat.id || flat.flatLabel || "").replace(/[^0-9]/g, "");
-  const part1 = aptDigits ? aptDigits.slice(-3).padStart(3, "0") : tripletFromSeed(seed, "APT");
-  const part2 = tripletFromSeed(seed, "B");
-  const part3 = tripletFromSeed(seed, "C");
-  return `EL-${part1}-${part2}-${part3}-${year}-${month}`;
-}
-
-function ensurePaymentRef(existingValue, flat = {}, period = "") {
-  return normalizePaymentRef(existingValue) || buildStablePaymentRef(flat, period);
-}
-
-function normalizeLookup(value) {
-  return safeString(value)
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/\bul\.?\b/g, " ")
-    .replace(/\bal\.?\b/g, " ")
-    .replace(/\bos\.?\b/g, " ")
-    .replace(/[^a-z0-9/ -]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeBuildingNo(value) {
-  return normalizeLookup(value).replace(/\s+/g, "");
-}
-
-function parseAddressHints(text) {
-  const raw = safeString(text);
-  const normalized = normalizeLookup(raw);
-  const out = { streetName: "", buildingNo: "", apartmentNo: "", staircaseId: "" };
-  const streetMatch = raw.match(/(?:ul(?:ica)?|al(?:eja)?|os(?:iedle)?)\.?\s+([A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż .-]{3,})/i);
-  if (streetMatch?.[1]) out.streetName = safeString(streetMatch[1]).split(/\s+(?:nr|bud|budynku|lok|lokalu|kl|klatka)\b/i)[0];
-  const addressMatch = normalized.match(/([a-ząćęłńóśźż .-]{3,})\s+(\d+[a-z]?)(?:\/(\d+[a-z]?))?/i);
-  if (!out.streetName && addressMatch?.[1]) out.streetName = safeString(addressMatch[1]);
-  if (addressMatch?.[2]) out.buildingNo = safeString(addressMatch[2]);
-  if (addressMatch?.[3]) out.apartmentNo = safeString(addressMatch[3]);
-  const buildingMatch = raw.match(/(?:bud(?:ynek|ynku)?|nr\s+budynku|adres\s+obiektu|adres\s+dostawy|punkt\s+poboru)\s*[:#-]?\s*(\d+[A-Za-z]?)/i);
-  if (buildingMatch?.[1] && !out.buildingNo) out.buildingNo = safeString(buildingMatch[1]);
-  const apartmentMatch = raw.match(/(?:lokal(?:u)?|mieszkanie|nr\s+lokalu|lok\.)\s*[:#-]?\s*(\d+[A-Za-z]?)/i);
-  if (apartmentMatch?.[1]) out.apartmentNo = safeString(apartmentMatch[1]);
-  const stairMatch = raw.match(/(?:klatka|kl\.|staircase|entrance|pion)\s*[:#-]?\s*([A-Za-z0-9-]+)/i);
-  if (stairMatch?.[1]) out.staircaseId = safeString(stairMatch[1]);
-  return out;
-}
-
-function readCommunityPaymentDefaults(community) {
-  return {
-    accountNumber: safeString(community?.defaultAccountNumber || community?.accountNumber || community?.bankAccount || community?.paymentSettings?.accountNumber || community?.paymentDefaults?.accountNumber),
-    recipientName: safeString(community?.recipientName || community?.receiverName || community?.transferName || community?.paymentSettings?.recipientName || community?.paymentDefaults?.recipientName || community?.name),
-    recipientAddress: safeString(community?.recipientAddress || community?.receiverAddress || community?.transferAddress || community?.paymentSettings?.recipientAddress || community?.paymentDefaults?.recipientAddress),
-  };
-}
-
-async function buildPaymentTitle(flat, period, existingValue = "") {
-  return ensurePaymentRef(existingValue, flat, period);
-}
-
-function getOpenAIClient() {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key || !OpenAI) return null;
-  return new OpenAI({ apiKey: key });
-}
-
-
-function settlementDocId(flatId, period) {
-  return `${flatId}_${period}`.replace(/[^\w\-]/g, "_");
-}
-
-async function getSettlementRefs(communityId, settlementId) {
-  return {
-    publishedRef: db.doc(`communities/${communityId}/${SETTLEMENTS_COLLECTION}/${settlementId}`),
-    draftRef: db.doc(`communities/${communityId}/${SETTLEMENT_DRAFTS_COLLECTION}/${settlementId}`),
-  };
-}
-
-async function getSettlementState(communityId, settlementId) {
-  const { publishedRef, draftRef } = await getSettlementRefs(communityId, settlementId);
-  const [publishedSnap, draftSnap] = await Promise.all([publishedRef.get(), draftRef.get()]);
-  return {
-    publishedRef,
-    draftRef,
-    publishedSnap,
-    draftSnap,
-    published: publishedSnap.exists ? publishedSnap.data() : null,
-    draft: draftSnap.exists ? draftSnap.data() : null,
-  };
-}
-
-async function getPreferredSettlement(communityId, settlementId) {
-  const state = await getSettlementState(communityId, settlementId);
-  if (state.published) return { ref: state.publishedRef, data: state.published, collection: SETTLEMENTS_COLLECTION };
-  if (state.draft) return { ref: state.draftRef, data: state.draft, collection: SETTLEMENT_DRAFTS_COLLECTION };
-  return { ref: state.publishedRef, data: null, collection: SETTLEMENTS_COLLECTION };
-}
-
-async function listSettlementCandidates(communityId, publishedOnly = false) {
-  const [publishedSnap, draftSnap] = await Promise.all([
-    db.collection(`communities/${communityId}/${SETTLEMENTS_COLLECTION}`).get(),
-    publishedOnly ? Promise.resolve({ docs: [] }) : db.collection(`communities/${communityId}/${SETTLEMENT_DRAFTS_COLLECTION}`).get(),
-  ]);
-  const map = new Map();
-  if (!publishedOnly) {
-    draftSnap.docs.forEach((doc) => map.set(doc.id, { id: doc.id, ...doc.data(), __collection: SETTLEMENT_DRAFTS_COLLECTION }));
-  }
-  publishedSnap.docs.forEach((doc) => map.set(doc.id, { id: doc.id, ...doc.data(), __collection: SETTLEMENTS_COLLECTION, isPublished: true }));
-  return Array.from(map.values());
-}
-
-// =========================================================
-// AUTH / ROLE HELPERS
-// =========================================================
-
-async function getMe(uid) {
-  if (!uid) return null;
-  const snap = await db.doc(`users/${uid}`).get();
-  return snap.exists ? snap.data() : null;
-}
-
-async function assertSignedIn(request) {
-  if (!request.auth || !request.auth.uid) {
-    throw new HttpsError("unauthenticated", "Zaloguj się.");
-  }
-  const me = await getMe(request.auth.uid);
-  if (!me) throw new HttpsError("failed-precondition", "Brak profilu użytkownika.");
-  if (me.appBlocked === true) throw new HttpsError("permission-denied", "Konto zablokowane.");
-
-  const communityId = safeString(me.communityId || me.customerId);
-  if (communityId) {
-    const communitySnap = await db.doc(`communities/${communityId}`).get();
-    if (communitySnap.exists && communitySnap.data()?.blocked === true) {
-      throw new HttpsError("permission-denied", "Wspólnota jest zablokowana.");
-    }
-  }
-
-  return me;
-}
-
-function hasRole(me, roles) {
-  return me && roles.includes(String(me.role || "RESIDENT"));
-}
-
-async function assertStaff(request) {
-  const me = await assertSignedIn(request);
-  if (!hasRole(me, ["MASTER", "ADMIN", "ACCOUNTANT"])) {
-    throw new HttpsError("permission-denied", "Brak uprawnień.");
-  }
-  return me;
-}
-
-async function assertAdminOrMaster(request) {
-  const me = await assertSignedIn(request);
-  if (!hasRole(me, ["MASTER", "ADMIN"])) {
-    throw new HttpsError("permission-denied", "Brak uprawnień.");
-  }
-  return me;
-}
-
-async function assertMaster(request) {
-  const me = await assertSignedIn(request);
-  if (!hasRole(me, ["MASTER"])) {
-    throw new HttpsError("permission-denied", "Brak uprawnień.");
-  }
-  return me;
-}
-
-async function assertSameCommunity(me, communityId) {
-  if (!communityId || communityId !== me.communityId) {
-    throw new HttpsError("permission-denied", "Inna wspólnota.");
-  }
-}
-
-const OWNER_UIDS = ["C4NPiqCNCChdDZ0s54di5g8Mt5l2"];
-const OWNER_EMAILS = ["mrlachnowicz@gmail.com"];
-
-function assertOwner(request) {
-  if (!request.auth || !request.auth.uid) throw new HttpsError("unauthenticated", "Zaloguj się.");
-  const token = request.auth.token || {};
-  const email = String(request.auth.token.email || "");
-  const ok = token.owner === true || OWNER_UIDS.includes(request.auth.uid) || OWNER_EMAILS.includes(email);
-  if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień Ownera.");
-}
-
-// =========================================================
-// COMMUNITY / FLATS / USERS HELPERS
-// =========================================================
-
-async function getCommunity(communityId) {
-  const snap = await db.doc(`communities/${communityId}`).get();
-  return snap.exists ? snap.data() : null;
-}
-
-async function getFlat(communityId, flatId) {
-  const snap = await db.doc(`communities/${communityId}/flats/${flatId}`).get();
-  return snap.exists ? { id: snap.id, ...snap.data() } : null;
-}
-
-async function listFlats(communityId, buildingId = null, streetId = null) {
-  const snap = await db.collection(`communities/${communityId}/flats`).get();
-  let rows = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  if (streetId) {
-    rows = rows.filter((x) => safeString(x.streetId) === safeString(streetId));
-  }
-  if (buildingId) {
-    rows = rows.filter((x) => {
-      const a = safeString(x.buildingId);
-      const b = safeString(x.buildingNo);
-      const c = safeString(buildingId);
-      return a === c || b === c;
-    });
-  }
-  return rows;
-}
-
-async function getFlatResidents(communityId, flatId) {
-  const snap = await db.collection("users")
-    .where("communityId", "==", communityId)
-    .where("flatId", "==", flatId)
-    .where("role", "==", "RESIDENT")
-    .get();
-  return snap.docs.map(d => ({ uid: d.id, ...d.data() }));
-}
-
-async function registerStreet(communityId, streetName, createdByUid = "") {
-  const name = safeString(streetName);
-  if (!name) return null;
-  const slug = normalizeStreetName(name);
-  if (!slug) return null;
-  const ref = db.doc(`communities/${communityId}/streets/${slug}`);
-  await ref.set({
-    id: slug,
-    communityId,
-    name,
-    normalizedName: slug,
-    isActive: true,
-    updatedAtMs: nowMs(),
-    createdAtMs: nowMs(),
-    createdByUid
-  }, { merge: true });
-  return slug;
-}
-
-async function decrementSeatsUsed(communityId) {
-  await db.doc(`communities/${communityId}`).set({
-    seatsUsed: admin.firestore.FieldValue.increment(-1),
-    updatedAtMs: nowMs()
-  }, { merge: true });
-}
-
-async function incrementSeatsUsed(communityId) {
-  await db.doc(`communities/${communityId}`).set({
-    seatsUsed: admin.firestore.FieldValue.increment(1),
-    updatedAtMs: nowMs()
-  }, { merge: true });
-}
-
-async function ensureSeatAvailable(communityId) {
-  const community = await getCommunity(communityId);
-  const total = Number(community?.seatsTotal || 0);
-  const used = Number(community?.seatsUsed || 0);
-  if (total > 0 && used >= total) {
-    throw new HttpsError("resource-exhausted", "Wykorzystano limit seats.");
-  }
-}
-
-
-function shadowUserId(communityId, flatId) {
-  return `payer_${safeString(communityId)}_${safeString(flatId)}`;
-}
-
-function legacyShadowUserId(communityId, flatId) {
-  return `shadow_${safeString(communityId)}_${safeString(flatId)}`;
-}
-
-async function syncPayerShadowUser(communityId, flatId) {
-  const payerRef = db.doc(`communities/${communityId}/payers/${flatId}`);
-  const payerSnap = await payerRef.get();
-  const shadowRef = db.doc(`users/${shadowUserId(communityId, flatId)}`);
-  const legacyRef = db.doc(`users/${legacyShadowUserId(communityId, flatId)}`);
-  if (!payerSnap.exists) {
-    const existing = await shadowRef.get();
-    if (existing.exists && (existing.data()?.placeholderResident === true || existing.data()?.isShadow === true)) {
-      await shadowRef.delete().catch(() => null);
-    }
-    const legacyExisting = await legacyRef.get();
-    if (legacyExisting.exists) await legacyRef.delete().catch(() => null);
-    return;
-  }
-  const payer = payerSnap.data() || {};
-  const residentUid = safeString(payer.residentUid || payer.userId);
-  if (residentUid) {
-    const existing = await shadowRef.get();
-    if (existing.exists && (existing.data()?.placeholderResident === true || existing.data()?.isShadow === true)) {
-      await shadowRef.delete().catch(() => null);
-    }
-    const legacyExisting = await legacyRef.get();
-    if (legacyExisting.exists) await legacyRef.delete().catch(() => null);
-    return;
-  }
-  const placeholderUid = shadowUserId(communityId, flatId);
-  await Promise.all([
-    shadowRef.set({
-      uid: placeholderUid,
-      communityId,
-      customerId: communityId,
-      flatId,
-      role: 'RESIDENT',
-      displayName: safeString(payer.displayName || `${payer.name || ''} ${payer.surname || ''}`),
-      firstName: safeString(payer.name),
-      lastName: safeString(payer.surname),
-      name: safeString(payer.name),
-      surname: safeString(payer.surname),
-      email: safeString(payer.email),
-      emailLower: safeString(payer.email).toLowerCase(),
-      phone: safeString(payer.phone),
-      street: safeString(payer.street),
-      streetId: safeString(payer.streetId),
-      buildingNo: safeString(payer.buildingNo),
-      apartmentNo: safeString(payer.apartmentNo || payer.flatNumber),
-      flatLabel: safeString(payer.flatLabel),
-      flatKey: safeString(payer.flatKey),
-      mailOnly: false,
-      placeholderResident: false,
-      isShadow: false,
-      authLinked: false,
-      appVisible: true,
-      active: true,
-      source: 'WEBPANEL_PAYER',
-      createdAtMs: Number(payer.createdAtMs || nowMs()),
-      updatedAtMs: nowMs(),
-    }, { merge: true }),
-    db.doc(`communities/${communityId}/payers/${flatId}`).set({ residentUid: placeholderUid, userId: placeholderUid, appVisible: true, updatedAtMs: nowMs() }, { merge: true }),
-    db.doc(`communities/${communityId}/flats/${flatId}`).set({ residentUid: placeholderUid, userId: placeholderUid, appVisible: true, updatedAtMs: nowMs() }, { merge: true }),
-  ]);
-  const legacyExisting = await legacyRef.get();
-  if (legacyExisting.exists) await legacyRef.delete().catch(() => null);
-}
-
-async function linkRealUserByEmail(uid) {
-  const userSnap = await db.doc(`users/${uid}`).get();
-  if (!userSnap.exists) return;
-  const user = userSnap.data() || {};
-  if (user.isShadow === true) return;
-  const communityId = safeString(user.communityId || user.customerId);
-  const email = safeString(user.email).toLowerCase();
-  if (!communityId || !email) return;
-  const payersSnap = await db.collection(`communities/${communityId}/payers`).where('email', '==', email).limit(1).get();
-  if (payersSnap.empty) return;
-  const payerDoc = payersSnap.docs[0];
-  const payer = payerDoc.data() || {};
-  const flatId = safeString(payer.flatId || payerDoc.id);
-  const flatPatch = {
-    residentUid: uid,
-    userId: uid,
-    email: safeString(user.email || payer.email),
-    phone: safeString(user.phone || payer.phone),
-    displayName: safeString(user.displayName || `${user.firstName || user.name || payer.name || ''} ${user.lastName || user.surname || payer.surname || ''}`),
-    name: safeString(user.firstName || user.name || payer.name),
-    surname: safeString(user.lastName || user.surname || payer.surname),
-    updatedAtMs: nowMs(),
-  };
-  await Promise.all([
-    db.doc(`communities/${communityId}/flats/${flatId}`).set(flatPatch, { merge: true }),
-    db.doc(`communities/${communityId}/payers/${flatId}`).set({ ...flatPatch, mailOnly: false, residentUid: uid, userId: uid }, { merge: true }),
-    db.doc(`users/${uid}`).set({
-      communityId,
-      flatId,
-      role: safeString(user.role || 'RESIDENT') || 'RESIDENT',
-      street: safeString(user.street || payer.street),
-      streetId: safeString(user.streetId || payer.streetId),
-      buildingNo: safeString(user.buildingNo || payer.buildingNo),
-      apartmentNo: safeString(user.apartmentNo || payer.apartmentNo || payer.flatNumber),
-      flatLabel: safeString(user.flatLabel || payer.flatLabel),
-      updatedAtMs: nowMs(),
-    }, { merge: true }),
-  ]);
-  const shadowRef = db.doc(`users/${shadowUserId(communityId, flatId)}`);
-  const shadowSnap = await shadowRef.get();
-  if (shadowSnap.exists && (shadowSnap.data()?.placeholderResident === true || shadowSnap.data()?.isShadow === true)) {
-    await shadowRef.delete().catch(() => null);
-  }
-  const legacyShadowRef = db.doc(`users/${legacyShadowUserId(communityId, flatId)}`);
-  const legacyShadowSnap = await legacyShadowRef.get();
-  if (legacyShadowSnap.exists) {
-    await legacyShadowRef.delete().catch(() => null);
-  }
-}
-
-// =========================================================
-// FCM HELPERS
-// =========================================================
-
-async function syncAllPayerShadowUsers(communityId) {
-  const payersSnap = await db.collection(`communities/${communityId}/payers`).get();
-  let count = 0;
-  for (const payerDoc of payersSnap.docs) {
-    count += 1;
-    await syncPayerShadowUser(communityId, payerDoc.id);
-  }
-  return count;
-}
-
-async function syncCommunitySeats(communityId) {
-  const payerCount = await syncAllPayerShadowUsers(communityId);
-  const residentsSnap = await db.collection('users').where('communityId', '==', communityId).where('role', '==', 'RESIDENT').get();
-  const residentCount = residentsSnap.size;
-  const seatsUsed = Math.max(payerCount, residentCount);
-  await db.doc(`communities/${communityId}`).set({
-    seatsUsed,
-    panelSeatsUsed: payerCount,
-    appSeatsUsed: residentCount,
-    residentCount,
-    usersCount: residentCount,
-    occupiedSeats: seatsUsed,
-    updatedAtMs: nowMs(),
-  }, { merge: true });
-  return seatsUsed;
-}
-
-async function syncCommunityStreetRegistry(communityId) {
-  const [streetsSnap, assignmentsSnap] = await Promise.all([
-    db.collection(`communities/${communityId}/streets`).get(),
-    db.collection(`communities/${communityId}/streetAssignments`).get(),
-  ]);
-  const activeMap = new Map();
-  const pushStreet = (id, name) => {
-    const sid = safeString(id || normalizeStreetName(name));
-    const sname = safeString(name || id);
-    if (!sid || !sname) return;
-    if (!activeMap.has(sid)) activeMap.set(sid, { id: sid, name: sname });
-  };
-  streetsSnap.docs.forEach((doc) => {
-    const data = doc.data() || {};
-    if (data.isActive === false || data.deletedAtMs) return;
-    pushStreet(doc.id || data.id, data.name || data.street || doc.id);
-  });
-  assignmentsSnap.docs.forEach((doc) => {
-    const data = doc.data() || {};
-    if (data.isActive === false || data.deletedAtMs) return;
-    pushStreet(data.id || doc.id, data.name || data.street || doc.id);
-  });
-  const items = Array.from(activeMap.values());
-  for (const item of items) {
-    const streetRef = db.doc(`communities/${communityId}/streets/${item.id}`);
-    const assignRef = db.doc(`communities/${communityId}/streetAssignments/${item.id}`);
-    const [streetSnap, assignSnap] = await Promise.all([streetRef.get(), assignRef.get()]);
-    const streetData = streetSnap.data() || {};
-    const assignData = assignSnap.data() || {};
-    if (!streetSnap.exists || safeString(streetData.name || streetData.street || streetSnap.id) !== item.name || streetData.isActive === false) {
-      await streetRef.set({ id: item.id, communityId, name: item.name, normalizedName: item.id, isActive: true, updatedAtMs: nowMs() }, { merge: true });
-    }
-    if (!assignSnap.exists || safeString(assignData.name || assignData.street || assignSnap.id) !== item.name || assignData.isActive === false) {
-      await assignRef.set({ id: item.id, communityId, name: item.name, street: item.name, isActive: true, updatedAtMs: nowMs() }, { merge: true });
-    }
-  }
-  await db.doc(`communities/${communityId}`).set({
-    streetIds: items.map((item) => safeString(item.id)).filter(Boolean),
-    streetNames: items.map((item) => safeString(item.name)).filter(Boolean),
-    streetsList: items.map((item) => ({ id: safeString(item.id), name: safeString(item.name) })),
-    updatedAtMs: nowMs(),
-  }, { merge: true });
-  return items.length;
-}
-
-async function getUserToken(uid) {
-  if (!uid) return null;
-  const snap = await db.doc(`users/${uid}`).get();
-  return snap.exists ? snap.data().fcmToken : null;
-}
-
-async function getCommunityAdmins(communityId) {
-  const snap = await db.collection("users")
-    .where("communityId", "==", communityId)
-    .where("role", "in", ["ADMIN", "MASTER"])
-    .get();
-  return snap.docs.map(d => d.data().fcmToken).filter(Boolean);
-}
-
-async function sendToToken(token, type, title, body, extraData = {}) {
-  if (!token) return;
-  const message = {
-    token,
-    data: {
-      type: String(type || ""),
-      title: String(title || ""),
-      body: String(body || ""),
-      ...Object.fromEntries(Object.entries(extraData).map(([k, v]) => [k, String(v ?? "")]))
-    },
-    android: { priority: "high" }
-  };
-  try {
-    await admin.messaging().send(message);
-  } catch (e) {
-    console.error("FCM Error:", e);
-  }
-}
-
-async function sendToTokens(tokens, type, title, body, extraData = {}) {
-  if (!tokens || tokens.length === 0) return;
-  const message = {
-    tokens,
-    data: {
-      type: String(type || ""),
-      title: String(title || ""),
-      body: String(body || ""),
-      ...Object.fromEntries(Object.entries(extraData).map(([k, v]) => [k, String(v ?? "")]))
-    }
-  };
-  try {
-    await admin.messaging().sendEachForMulticast(message);
-  } catch (e) {
-    console.error("FCM Multicast Error:", e);
-  }
-}
-
-async function sendToTopic(topic, type, title, body, extraData = {}) {
-  const message = {
-    topic,
-    data: {
-      type: String(type || ""),
-      title: String(title || ""),
-      body: String(body || ""),
-      ...Object.fromEntries(Object.entries(extraData).map(([k, v]) => [k, String(v ?? "")]))
-    }
-  };
-  try {
-    await admin.messaging().send(message);
-  } catch (e) {
-    console.error("FCM Topic Error:", e);
-  }
-}
-
-// =========================================================
-// FIRESTORE TRIGGERS
-// =========================================================
-
-exports.onFlatSeatSync = onDocumentWritten("communities/{communityId}/flats/{flatId}", async (event) => {
-  const communityId = event.params.communityId;
-  await syncCommunitySeats(communityId);
-});
-
-exports.onStreetRegistrySync = onDocumentWritten("communities/{communityId}/streets/{streetId}", async (event) => {
-  const communityId = event.params.communityId;
-  await syncCommunityStreetRegistry(communityId);
-});
-
-exports.onStreetAssignmentsSync = onDocumentWritten("communities/{communityId}/streetAssignments/{streetId}", async (event) => {
-  const communityId = event.params.communityId;
-  await syncCommunityStreetRegistry(communityId);
-});
-
-exports.onPayerShadowSync = onDocumentWritten("communities/{communityId}/payers/{flatId}", async (event) => {
-  const communityId = event.params.communityId;
-  const flatId = event.params.flatId;
-  await syncPayerShadowUser(communityId, flatId);
-  await syncCommunitySeats(communityId);
-});
-
-exports.onUserEmailLinkSync = onDocumentWritten("users/{uid}", async (event) => {
-  const uid = event.params.uid;
-  await linkRealUserByEmail(uid);
-});
-
-exports.onAnnouncementCreated = onDocumentCreated("communities/{communityId}/announcements/{announcementId}", async (event) => {
-  const data = event.data.data();
-  await sendToTopic(`community_${event.params.communityId}`, "announcement_admin", "Ogłoszenie administracji", data.title, { senderUid: data.createdByUid });
-});
-
-exports.onResidentAnnouncementCreated = onDocumentCreated("communities/{communityId}/residentAnnouncements/{announcementId}", async (event) => {
-  const data = event.data.data();
-  await sendToTopic(`community_${event.params.communityId}`, "announcement_new", "Nowe ogłoszenie lokatorskie", data.title, { senderUid: data.createdByUid });
-});
-
-exports.onChatMessageCreated = onDocumentCreated("communities/{communityId}/chatMessages/{messageId}", async (event) => {
-  const data = event.data.data();
-  await sendToTopic(`community_${event.params.communityId}`, "community_chat", data.senderName, data.text, { senderUid: data.senderUid });
-});
-
-exports.onTicketCreated = onDocumentCreated("communities/{communityId}/tickets/{ticketId}", async (event) => {
-  const data = event.data.data();
-  const adminTokens = await getCommunityAdmins(event.params.communityId);
-  await sendToTokens(adminTokens, "ticket_new", "Nowa usterka", `${data.flatLabel || data.flatId || ""}: ${data.title}`, { senderUid: data.createdByUid });
-});
-
-exports.onTicketUpdated = onDocumentUpdated("communities/{communityId}/tickets/{ticketId}", async (event) => {
-  const newData = event.data.after.data();
-  const oldData = event.data.before.data();
-  if (newData.status !== oldData.status) {
-    const token = await getUserToken(newData.createdByUid);
-    await sendToToken(token, "ticket_status", "Zmiana statusu usterki", `${newData.title}: ${newData.status}`, { senderUid: newData.updatedByUid });
-  }
-});
-
-exports.onVoteCreated = onDocumentCreated("communities/{communityId}/votes/{voteId}", async (event) => {
-  const data = event.data.data();
-  await sendToTopic(`community_${event.params.communityId}`, "vote_new", "Nowe głosowanie", data.title, { senderUid: data.createdByUid });
-});
-
-exports.onCorrespondenceMessageCreated = onDocumentCreated("communities/{communityId}/correspondence/{resUid}/messages/{msgId}", async (event) => {
-  const data = event.data.data();
-  const resUid = event.params.resUid;
-  if (data.senderUid === resUid) {
-    const adminTokens = await getCommunityAdmins(event.params.communityId);
-    await sendToTokens(adminTokens, "correspondence", "Wiadomość od lokatora", data.text, { senderUid: data.senderUid });
-  } else {
-    const token = await getUserToken(resUid);
-    await sendToToken(token, "correspondence", "Wiadomość od administracji", data.text, { senderUid: data.senderUid });
-  }
-});
-
-exports.onDueCreated = onDocumentCreated("communities/{communityId}/dues/{dueId}", async (event) => {
-  const data = event.data.data();
-  await sendToTopic(`community_${event.params.communityId}`, "due_created", "Nowa płatność", data.title, { senderUid: data.createdByUid });
-});
-
-async function notifySettlementPublished(communityId, settlementId, after, before = null) {
-  const wasPublished = before?.isPublished === true;
-  const isPublished = after?.isPublished === true;
-  const beforeSentAtMs = Number(before?.sentAtMs || 0);
-  const afterSentAtMs = Number(after?.sentAtMs || 0);
-  const justPublishedAndSent = isPublished && !wasPublished && afterSentAtMs > 0;
-  const justSentAfterPublish = isPublished && wasPublished && afterSentAtMs > 0 && afterSentAtMs !== beforeSentAtMs;
-  if (!justPublishedAndSent && !justSentAfterPublish) return;
-
-  const residents = await getFlatResidents(communityId, after.flatId);
-  const tokens = residents.map(r => r.fcmToken).filter(Boolean);
-
-  await sendToTokens(
-    tokens,
-    "settlement_ready",
-    "Nowe rozliczenie",
-    `${after.period || ""} • ${after.flatLabel || after.flatId || ""}`,
-    { settlementId, flatId: after.flatId || "", period: after.period || "" }
-  );
-}
-
-exports.onSettlementPublished = onDocumentUpdated("communities/{communityId}/settlements/{settlementId}", async (event) => {
-  await notifySettlementPublished(event.params.communityId, event.params.settlementId, event.data.after.data(), event.data.before.data());
-});
-
-exports.onSettlementCreated = onDocumentCreated("communities/{communityId}/settlements/{settlementId}", async (event) => {
-  await notifySettlementPublished(event.params.communityId, event.params.settlementId, event.data.data(), null);
-});
-
-// =========================================================
-// BASIC SYSTEM CALLABLES
-// =========================================================
-
-exports.createActivationCode = onCall(async (request) => {
-  assertOwner(request);
-  const data = request.data || {};
-  const name = safeString(data.name || data.orgName);
-  const nip = String(data.nip || "").replace(/\D/g, "");
-  if (!name || nip.length !== 10) {
-    throw new HttpsError("invalid-argument", "Podaj nazwę i poprawny NIP.");
-  }
-
-  for (let i = 0; i < 10; i++) {
-    const code = randomCode(10);
-    const ref = db.doc(`activation_codes/${code}`);
-    try {
-      await ref.create({
-        code,
-        name,
-        nip,
-        used: false,
-        status: "ACTIVE",
-        createdAtMs: nowMs(),
-        createdByUid: request.auth.uid
-      });
-      return { code, docPath: ref.path };
-    } catch (e) {
-      if (e.code !== 6) throw e;
-    }
-  }
-  throw new HttpsError("resource-exhausted", "Błąd generowania kodu.");
-});
-
-exports.activateCommunity = onCall(async (request) => {
-  if (!request.auth?.uid) throw new HttpsError("unauthenticated", "Zaloguj się.");
-  const { code, nip, name } = request.data || {};
-  if (!safeString(code) || !safeString(nip) || !safeString(name)) {
-    throw new HttpsError("invalid-argument", "Brak danych aktywacji.");
-  }
-
-  const communityRef = db.collection("communities").doc();
-
-  return await db.runTransaction(async (tx) => {
-    const codeRef = db.doc(`activation_codes/${code}`);
-    const codeSnap = await tx.get(codeRef);
-    if (!codeSnap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
-    const codeData = codeSnap.data() || {};
-    if (codeData.used === true) throw new HttpsError("failed-precondition", "Kod już użyty.");
-    if (codeData.disabled === true || String(codeData.status || "").toUpperCase() === "DISABLED") {
-      throw new HttpsError("failed-precondition", "Kod aktywacyjny jest wyłączony.");
-    }
-
-    tx.set(communityRef, {
-      id: communityRef.id,
-      name: safeString(name),
-      nip: String(nip).replace(/\D/g, ""),
-      createdAtMs: nowMs(),
-      updatedAtMs: nowMs(),
-      panelAccessEnabled: true,
-      enableExternalPayments: false,
-      paymentsUrl: "",
-      seatsTotal: 2,
-      seatsUsed: 0
-    });
-
-    tx.set(db.doc(`users/${request.auth.uid}`), {
-      role: "MASTER",
-      communityId: communityRef.id,
-      customerId: communityRef.id,
-      updatedAtMs: nowMs()
-    }, { merge: true });
-
-    tx.update(codeRef, {
-      used: true,
-      usedAtMs: nowMs(),
-      communityId: communityRef.id
-    });
-
-    return { ok: true, communityId: communityRef.id };
-  });
-});
-
-exports.createInvite = onCall(async (request) => {
-  const me = await assertSignedIn(request);
-  const data = request.data || {};
-  const invite = {
-    customerId: me.customerId || me.communityId,
-    communityId: me.communityId,
-    role: safeString(data.role || "RESIDENT"),
-    status: "active",
-    createdAtMs: nowMs(),
-    expiresAtMs: Number(data.expiresAtMs || 0)
-  };
-  const ref = await db.collection("invites").add(invite);
-  return { ok: true, inviteId: ref.id };
-});
-
-exports.claimInvite = onCall(async (request) => {
-  if (!request.auth?.uid) throw new HttpsError("unauthenticated", "Zaloguj się.");
-  const inviteId = safeString(request.data?.inviteId);
-  if (!inviteId) throw new HttpsError("invalid-argument", "Brak inviteId.");
-
-  return await db.runTransaction(async (tx) => {
-    const inviteRef = db.doc(`invites/${inviteId}`);
-    const snap = await tx.get(inviteRef);
-    if (!snap.exists) throw new HttpsError("not-found", "Invite nie istnieje.");
-    const inv = snap.data();
-    tx.set(db.doc(`users/${request.auth.uid}`), {
-      role: inv.role,
-      communityId: inv.communityId,
-      customerId: inv.customerId,
-      updatedAtMs: nowMs()
-    }, { merge: true });
-    tx.update(inviteRef, {
-      status: "used",
-      usedByUid: request.auth.uid,
-      usedAtMs: nowMs()
-    });
-    return { ok: true };
-  });
-});
-
-async function ensureCommunityJoinCode(communityId, role) {
-  const code = randomCode(10);
-  const ref = db.doc(`join_codes/${code}`);
-  await ref.create({
-    code,
-    communityId,
-    role,
-    createdAtMs: nowMs(),
-    status: "ACTIVE"
-  });
-  return code;
-}
-
-exports.createJoinCode = onCall(async (request) => {
-  const me = await assertAdminOrMaster(request);
-  const role = safeString(request.data?.role || "ACCOUNTANT").toUpperCase();
-  if (!["ACCOUNTANT", "ADMIN", "RESIDENT"].includes(role)) {
-    throw new HttpsError("invalid-argument", "Nieobsługiwana rola.");
-  }
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  await assertSameCommunity(me, communityId);
-  const code = await ensureCommunityJoinCode(communityId, role);
-  return { ok: true, code, communityId, role };
-});
-
-exports.claimJoinCode = onCall(async (request) => {
-  const me = await assertSignedIn(request);
-  const code = safeString(request.data?.code);
-  if (!code) throw new HttpsError("invalid-argument", "Podaj kod.");
-
-  const ref = db.doc(`join_codes/${code}`);
-  return await db.runTransaction(async (tx) => {
-    const snap = await tx.get(ref);
-    if (!snap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
-    const jc = snap.data();
-    if (jc.status !== "ACTIVE") throw new HttpsError("failed-precondition", "Kod nieważny.");
-
-    tx.update(ref, {
-      status: "USED",
-      usedAtMs: nowMs(),
-      usedByUid: request.auth.uid
-    });
-
-    tx.set(db.doc(`users/${request.auth.uid}`), {
-      role: jc.role,
-      communityId: jc.communityId,
-      customerId: jc.communityId,
-      updatedAtMs: nowMs(),
-      staffSeat: true
-    }, { merge: true });
-
-    return { ok: true, communityId: jc.communityId, role: jc.role };
-  });
-});
-
-exports.createWebSession = onCall(async (request) => {
-  const me = await assertSignedIn(request);
-  const token = randomToken(48);
-  const target = safeString(request.data?.target || "/payments");
-  const expiresAtMs = nowMs() + 2 * 60 * 1000;
-
-  await db.doc(`webSessions/${token}`).set({
-    token,
-    uid: request.auth.uid,
-    communityId: me.communityId || "",
-    createdAtMs: nowMs(),
-    expiresAtMs,
-    used: false,
-    target
-  });
-
-  return { ok: true, token, expiresAtMs, target };
-});
-
-exports.consumeWebSession = onCall(async (request) => {
-  const token = safeString(request.data?.token);
-  if (!token) throw new HttpsError("invalid-argument", "Brak token.");
-
-  return await db.runTransaction(async (tx) => {
-    const ref = db.doc(`webSessions/${token}`);
-    const snap = await tx.get(ref);
-    if (!snap.exists) throw new HttpsError("not-found", "Token nie istnieje.");
-    const s = snap.data();
-    if (s.used) throw new HttpsError("failed-precondition", "Token zużyty.");
-    if (nowMs() > Number(s.expiresAtMs || 0)) throw new HttpsError("failed-precondition", "Token wygasł.");
-    tx.update(ref, { used: true, usedAtMs: nowMs() });
-    const customToken = await admin.auth().createCustomToken(String(s.uid));
-    return { ok: true, customToken, uid: s.uid, target: s.target || "/payments" };
-  });
-});
-
-// =========================================================
-// USER / STREET / SEATS CALLABLES
-// =========================================================
-
-exports.removeUser = onCall(async (request) => {
-  const me = await assertAdminOrMaster(request);
-  const targetUid = safeString(request.data?.targetUid);
-  if (!targetUid) throw new HttpsError("invalid-argument", "Brak targetUid.");
-  if (targetUid === request.auth.uid) throw new HttpsError("failed-precondition", "Nie możesz usunąć samego siebie.");
-
-  const targetRef = db.doc(`users/${targetUid}`);
-  const targetSnap = await targetRef.get();
-  if (!targetSnap.exists) throw new HttpsError("not-found", "Użytkownik nie istnieje.");
-
-  const target = targetSnap.data();
-  if (target.communityId !== me.communityId) throw new HttpsError("permission-denied", "Inna wspólnota.");
-
-  await targetRef.set({
-    role: "REMOVED",
-    appBlocked: true,
-    flatId: admin.firestore.FieldValue.delete(),
-    flatLabel: admin.firestore.FieldValue.delete(),
-    staircaseId: admin.firestore.FieldValue.delete(),
-    street: admin.firestore.FieldValue.delete(),
-    buildingNo: admin.firestore.FieldValue.delete(),
-    apartmentNo: admin.firestore.FieldValue.delete(),
-    removedAtMs: nowMs(),
-    removedByUid: request.auth.uid
-  }, { merge: true });
-
-  return { ok: true };
-});
-
-exports.setUserBlocked = onCall(async (request) => {
-  const me = await assertAdminOrMaster(request);
-  const targetUid = safeString(request.data?.targetUid);
-  const blocked = request.data?.blocked === true;
-  if (!targetUid) throw new HttpsError("invalid-argument", "Brak targetUid.");
-
-  const targetRef = db.doc(`users/${targetUid}`);
-  const targetSnap = await targetRef.get();
-  if (!targetSnap.exists) throw new HttpsError("not-found", "Użytkownik nie istnieje.");
-  const target = targetSnap.data();
-  if (target.communityId !== me.communityId) throw new HttpsError("permission-denied", "Inna wspólnota.");
-
-  await targetRef.set({
-    appBlocked: blocked,
-    updatedAtMs: nowMs(),
-    updatedByUid: request.auth.uid
-  }, { merge: true });
-
-  return { ok: true };
-});
-
-exports.addStreet = onCall(async (request) => {
-  const me = await assertMaster(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const name = safeString(request.data?.name || request.data?.street);
-  await assertSameCommunity(me, communityId);
-  if (!name) throw new HttpsError("invalid-argument", "Brak nazwy ulicy.");
-
-  const streetId = await registerStreet(communityId, name, request.auth.uid);
-  return { ok: true, streetId, name };
-});
-
-exports.removeFlatSafe = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const flatId = safeString(request.data?.flatId);
-  await assertSameCommunity(me, communityId);
-  if (!flatId) throw new HttpsError("invalid-argument", "Brak flatId.");
-
-  const flatRef = db.doc(`communities/${communityId}/flats/${flatId}`);
-  const flatSnap = await flatRef.get();
-  if (!flatSnap.exists) throw new HttpsError("not-found", "Brak lokalu.");
-
-  const residents = await getFlatResidents(communityId, flatId);
-  for (const res of residents) {
-    await db.doc(`users/${res.uid}`).set({
-      role: "REMOVED",
-      appBlocked: true,
-      flatId: admin.firestore.FieldValue.delete(),
-      flatLabel: admin.firestore.FieldValue.delete(),
-      removedAtMs: nowMs(),
-      removedByUid: request.auth.uid
-    }, { merge: true });
-  }
-
-  await flatRef.delete();
-  await decrementSeatsUsed(communityId);
-
-  return { ok: true };
-});
-
-// =========================================================
-// KSeF / XML / OCR HELPERS
-// =========================================================
-
-const xmlParser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: "@_"
-});
-
-function parseInvoiceXmlBasic(xml) {
-  const parsed = xmlParser.parse(xml);
-  const raw = JSON.stringify(parsed);
-  const totalCandidates = raw.match(/(\d+[\.,]\d{2})/g) || [];
-  const total = totalCandidates.length ? totalCandidates[totalCandidates.length - 1] : "0.00";
-  const dateMatch = raw.match(/(20\d{2}-\d{2}-\d{2})/);
-  const issueDate = dateMatch ? dateMatch[1] : "";
-  return {
-    issueDate,
-    period: monthFromDateStr(issueDate),
-    totalGrossCents: toCents(total),
-    currency: "PLN",
-    sellerName: "",
-    buyerName: "",
-    ksefNumber: "",
-    items: []
-  };
-}
-
-async function extractPdfText(base64Pdf) {
-  if (!pdfParse) {
-    throw new HttpsError("failed-precondition", "Brak pdf-parse w functions. Doinstaluj pdf-parse.");
-  }
-  const buffer = Buffer.from(String(base64Pdf || ""), "base64");
-  const parsed = await pdfParse(buffer);
-  return String(parsed?.text || "").replace(/\u0000/g, " ").trim();
-}
-
-// =========================================================
-// AI HELPERS
-// =========================================================
-
-function heuristicCategory(text) {
-  const t = normalizeLookup(text);
-  if (/woda|sciek|kanal|wodociag/.test(t)) return "WODA";
-  if (/gaz/.test(t)) return "GAZ";
-  if (/energia|prad|tauron|enea|energa|pge/.test(t)) return "PRAD";
-  if (/sprzatan|czystosc|utrzymanie porzadku/.test(t)) return "SPRZATANIE";
-  if (/remont|napraw|modern|serwis|hydraul|elektryk/.test(t)) return "REMONT";
-  return "INNE";
-}
-
-function detectInvoiceScope(invoiceText, hintedScope = "") {
-  const direct = safeString(hintedScope).toUpperCase();
-  if (["FLAT", "BUILDING", "STAIRCASE", "COMMON", "COMMUNITY"].includes(direct)) {
-    return { scope: direct, confidence: 0.99, reason: "Zakres wynika z jawnego przypisania." };
-  }
-
-  const text = safeString(invoiceText);
-  const normalized = normalizeLookup(text);
-  const hints = parseAddressHints(text);
-  const explicitFlatNo = !!hints.apartmentNo || /(?:nr\s+lokalu|lokal(?:u)?|mieszkanie|adres\s+lokalu|\/\d+[a-z]?)/i.test(text);
-  const communityScore = /(?:cala?\s+wspolnot|wszystkie\s+budynki|cale\s+osiedle|osiedl|wspolnota\s+mieszkaniow|zarzad\s+wspolnoty)/.test(normalized) ? 1 : 0;
-  const commonScore = /(?:czesc\s+wspoln|czesci\s+wspoln|nieruchomosc\s+wspoln|fundusz\s+remontowy|sprzatanie\s+klatek|oswietlenie\s+klatki|pion\s+wentylacyjny|pion\s+kanal|winda|teren\s+wspoln|garaz\s+wspoln)/.test(normalized) ? 1 : 0;
-  const staircaseScore = /(?:klatka|kl\.|staircase|entrance|pion)/.test(normalized) ? 1 : 0;
-  const buildingScore = /(?:budynek|adres\s+obiektu|adres\s+dostawy|punkt\s+poboru|obiekt)/.test(normalized) ? 1 : 0;
-  const flatScore = /(?:lokal(?:u)?|mieszkanie|nr\s+lokalu|adres\s+lokalu|odbiorca\s+uslugi)/.test(normalized) ? 1 : 0;
-
-  if (communityScore) return { scope: "COMMUNITY", confidence: 0.94, reason: "Tekst wskazuje na koszt całej wspólnoty / osiedla." };
-  if (commonScore && staircaseScore && hints.staircaseId) return { scope: "COMMON", confidence: 0.92, reason: "Tekst wskazuje na część wspólną przypisaną do klatki / pionu." };
-  if (commonScore && (buildingScore || hints.buildingNo)) return { scope: "COMMON", confidence: 0.9, reason: "Tekst wskazuje na część wspólną budynku." };
-  if (commonScore) return { scope: "COMMON", confidence: 0.88, reason: "Tekst wskazuje na koszt części wspólnej." };
-  if (staircaseScore && hints.staircaseId && !explicitFlatNo) return { scope: "STAIRCASE", confidence: 0.86, reason: "Tekst wskazuje na konkretną klatkę / pion." };
-  if (buildingScore && !explicitFlatNo) return { scope: "BUILDING", confidence: 0.82, reason: "Tekst wskazuje na konkretny budynek." };
-  if (flatScore && explicitFlatNo) return { scope: "FLAT", confidence: 0.84, reason: "Tekst zawiera jednoznaczny numer lokalu." };
-  if (explicitFlatNo && !commonScore && !communityScore) return { scope: "FLAT", confidence: 0.8, reason: "Rozpoznano numer lokalu w adresie." };
-  if (hints.buildingNo) return { scope: "BUILDING", confidence: 0.66, reason: "Rozpoznano adres budynku." };
-  return { scope: "COMMON", confidence: 0.5, reason: "Brak jednoznacznych danych — przyjęto koszt wspólny do weryfikacji." };
-}
-
-async function askAiForJson(prompt, model = null, fallback = null) {
-  const client = getOpenAIClient();
-  if (!client) return fallback;
-
-  try {
-    const resp = await client.chat.completions.create({
-      model: model || process.env.OPENAI_MODEL_FAST || "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.1,
-      response_format: { type: "json_object" }
-    });
-
-    const content = resp.choices?.[0]?.message?.content || "";
-    return JSON.parse(content);
-  } catch (e) {
-    console.error("OpenAI error:", e);
-    return fallback;
-  }
-}
-
-async function aiSuggestInvoice(invoiceText) {
-  const scopeHint = detectInvoiceScope(invoiceText);
-  const prompt = [
-    "Jesteś asystentem księgowej wspólnoty mieszkaniowej.",
-    "Zwróć wyłącznie JSON:",
-    "{",
-    '  "category":"PRAD|WODA|GAZ|SPRZATANIE|REMONT|INNE",',
-    '  "scope":"FLAT|BUILDING|STAIRCASE|COMMON|COMMUNITY",',
-    '  "period":"YYYY-MM",',
-    '  "confidence":0.0,',
-    '  "needsReview":true,',
-    '  "reason":"..."',
-    "}",
-    "",
-    `Wstępna heurystyka zakresu: ${scopeHint.scope} (${scopeHint.reason})`,
-    "FAKTURA:",
-    invoiceText
-  ].join("\n");
-
-  return await askAiForJson(prompt, process.env.OPENAI_MODEL_FAST || "gpt-4o-mini", {
-    category: heuristicCategory(invoiceText),
-    scope: scopeHint.scope,
-    period: monthFromDateStr((String(invoiceText || "").match(/20\d{2}-\d{2}-\d{2}/) || [])[0] || ""),
-    confidence: scopeHint.confidence,
-    needsReview: true,
-    reason: scopeHint.reason,
-  });
-}
-
-async function aiExplainReview(input) {
-  const prompt = [
-    "Wyjaśnij księgowej prostym językiem, dlaczego sprawa trafiła do review queue.",
-    "Zwróć wyłącznie JSON:",
-    "{",
-    '  "summary":"...",',
-    '  "reason":"...",',
-    '  "recommendedChecks":["...", "..."]',
-    "}",
-    "",
-    JSON.stringify(input)
-  ].join("\n");
-
-  return await askAiForJson(prompt, process.env.OPENAI_MODEL_SMART || process.env.OPENAI_MODEL_FAST || "gpt-4o-mini", null);
-}
-
-async function aiMatchPayment({ title, amount, candidates }) {
-  const prompt = [
-    "Dopasuj przelew do najlepszego kandydata.",
-    "Zwróć wyłącznie JSON:",
-    "{",
-    '  "suggestedFlatId":"...",',
-    '  "suggestedSettlementId":"...",',
-    '  "confidence":0.0,',
-    '  "needsReview":true,',
-    '  "reason":"..."',
-    "}",
-    "",
-    `Tytuł: ${title}`,
-    `Kwota: ${amount}`,
-    `Kandydaci: ${JSON.stringify(candidates)}`
-  ].join("\n");
-
-  return await askAiForJson(prompt, process.env.OPENAI_MODEL_FAST || "gpt-4o-mini", null);
-}
-
-async function aiAnalyzeMeter({ currentValue, prevValue, meterType, unit, flatLabel }) {
-  const prompt = [
-    "Oceń czy odczyt licznika wygląda podejrzanie.",
-    "Zwróć wyłącznie JSON:",
-    "{",
-    '  "anomaly":true,',
-    '  "confidence":0.0,',
-    '  "needsReview":true,',
-    '  "reason":"..."',
-    "}",
-    "",
-    `Typ licznika: ${meterType}`,
-    `Jednostka: ${unit}`,
-    `Lokal: ${flatLabel}`,
-    `Poprzedni odczyt: ${prevValue}`,
-    `Nowy odczyt: ${currentValue}`
-  ].join("\n");
-
-  return await askAiForJson(prompt, process.env.OPENAI_MODEL_FAST || "gpt-4o-mini", null);
-}
-
-// =========================================================
-// REVIEW QUEUE HELPERS
-// =========================================================
-
-async function createReviewItem(communityId, data) {
-  const ref = await db.collection(`communities/${communityId}/reviewQueue`).add({
-    status: "OPEN",
-    createdAtMs: nowMs(),
-    ...data
-  });
-  return ref.id;
-}
-
-// =========================================================
-// KSeF / OCR / AI FACTURE FLOW
-// =========================================================
-
-function normalizeKsefSignatureParts(parts = []) {
-  return parts.map((part) => normalizeLookup(part)).filter(Boolean).join("|");
-}
-
-function buildKsefDedupeKeys(input = {}) {
-  const sellerName = safeString(input.sellerName || input.parsed?.sellerName || input.vendorName);
-  const sellerNip = safeString(input.sellerNip || input.parsed?.sellerNip || input.nip).replace(/\D/g, "");
-  const issueDate = safeString(input.issueDate || input.parsed?.issueDate);
-  const amount = Number(input.totalGrossCents || input.parsed?.totalGrossCents || input.amountCents || 0);
-  const invoiceNumber = safeString(input.invoiceNumber || input.parsed?.invoiceNumber);
-  const ksefNumber = safeString(input.ksefNumber || input.parsed?.ksefNumber);
-  const period = safeString(input.period || input.parsed?.period);
-  const keys = new Set();
-  const base = normalizeKsefSignatureParts([sellerName, sellerNip, issueDate, amount, invoiceNumber, period]);
-  if (base) keys.add(`BASE:${base}`);
-  const fallback = normalizeKsefSignatureParts([sellerName, issueDate, amount, period]);
-  if (fallback) keys.add(`FALLBACK:${fallback}`);
-  if (invoiceNumber) keys.add(`INV:${normalizeLookup(invoiceNumber)}`);
-  if (ksefNumber) keys.add(`KSEF:${normalizeLookup(ksefNumber)}`);
-  return Array.from(keys);
-}
-
-async function findDuplicateKsefInvoice(communityId, dedupeKeys = []) {
-  for (const key of dedupeKeys) {
-    const snap = await db.collection(`communities/${communityId}/ksefInvoices`).where("dedupeKeys", "array-contains", key).limit(1).get();
-    if (!snap.empty) return snap.docs[0];
-  }
-  return null;
-}
-
-async function saveKsefSyncState(communityId, patch) {
-  await db.doc(`communities/${communityId}/ksef/config`).set({
-    ...patch,
-    updatedAtMs: nowMs(),
-  }, { merge: true });
-}
-
-async function performKsefFetchForCommunity(communityId, options = {}) {
-  const cfgRef = db.doc(`communities/${communityId}/ksef/config`);
-  const cfgSnap = await cfgRef.get();
-  const cfg = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
-  const mode = safeString(options.mode || cfg.environment || cfg.mode || "MOCK").toUpperCase();
-  const count = Math.max(1, Math.min(20, Number(options.count || cfg.autoSyncCount || 5)));
-  const issueDate = safeString(options.issueDate || cfg.issueDate || "2026-03-01");
-  const sellerName = mode === "MOCK" ? "TAURON" : "KSeF import";
-  const created = [];
-  const duplicates = [];
-
-  if (cfg.syncInProgress === true && Number(cfg.lastSyncStartedAtMs || 0) > nowMs() - 30 * 60 * 1000) {
-    return { ok: true, skipped: true, reason: "SYNC_IN_PROGRESS", created, duplicates, mode };
-  }
-
-  await saveKsefSyncState(communityId, {
-    syncInProgress: true,
-    lastSyncStartedAtMs: nowMs(),
-    lastSyncMode: mode,
-  });
-
-  try {
-    for (let i = 0; i < count; i++) {
-      const total = Number((1234.56 + i).toFixed(2));
-      const totalGrossCents = toCents(total);
-      const ksefNumber = `${mode === "MOCK" ? "MOCK" : "KSEF"}-${issueDate}-${i + 1}`;
-      const invoiceNumber = `${mode === "MOCK" ? "FV-MOCK" : "FV-KSEF"}/${issueDate.replace(/-/g, "")}/${i + 1}`;
-      const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Invoice>
-  <KSeFNumber>${ksefNumber}</KSeFNumber>
-  <IssueDate>${issueDate}</IssueDate>
-  <Seller><Name>${sellerName}</Name><NIP>1234567890</NIP></Seller>
-  <Buyer><Name>Wspólnota ${communityId}</Name><NIP>${safeString(cfg?.nip || options.nip || "")}</NIP></Buyer>
-  <InvoiceNumber>${invoiceNumber}</InvoiceNumber>
-  <Total>${total.toFixed(2)}</Total>
-  <Items><Item><Name>Energia elektryczna</Name><Amount>${total.toFixed(2)}</Amount></Item></Items>
-</Invoice>`;
-
-      const parsed = parseInvoiceXmlBasic(xml);
-      parsed.invoiceNumber = safeString(parsed.invoiceNumber || invoiceNumber);
-      parsed.totalGrossCents = Number(parsed.totalGrossCents || totalGrossCents);
-      parsed.period = safeString(parsed.period || monthFromDateStr(issueDate));
-      const dedupeKeys = cfg.dedupeEnabled === false ? [] : buildKsefDedupeKeys({
-        sellerName,
-        sellerNip: "1234567890",
-        issueDate,
-        totalGrossCents: parsed.totalGrossCents,
-        invoiceNumber: parsed.invoiceNumber,
-        ksefNumber,
-        period: parsed.period,
-        parsed,
-      });
-      const duplicateSnap = dedupeKeys.length ? await findDuplicateKsefInvoice(communityId, dedupeKeys) : null;
-      if (duplicateSnap) {
-        await duplicateSnap.ref.set({
-          updatedAtMs: nowMs(),
-          duplicateBlockedAtMs: nowMs(),
-          dedupeKeys,
-          duplicateSource: mode,
-          lastFetchAttemptAtMs: nowMs(),
-        }, { merge: true });
-        duplicates.push({ id: duplicateSnap.id, ksefNumber, invoiceNumber: parsed.invoiceNumber });
-        continue;
-      }
-
-      const ref = await db.collection(`communities/${communityId}/ksefInvoices`).add({
-        createdAtMs: nowMs(),
-        updatedAtMs: nowMs(),
-        status: "NOWA",
-        source: mode === "MOCK" ? "MOCK" : "KSEF",
-        xml,
-        parsed,
-        invoiceNumber: parsed.invoiceNumber,
-        totalGrossCents: parsed.totalGrossCents,
-        ksefNumber,
-        dedupeKeys,
-        assigned: { scope: null },
-        ai: { status: "PENDING" },
-        fetchedFromKsefAtMs: nowMs(),
-        fetchAttempt: Number(cfg.retryAttempts || 0) + 1,
-        ksefConfigSnapshot: {
-          mode,
-          environment: mode,
-          identifier: safeString(cfg?.identifier || ""),
-          nip: safeString(cfg?.nip || ""),
-        }
-      });
-      created.push({
-        id: ref.id,
-        ksefNumber,
-        invoiceNumber: parsed.invoiceNumber,
-        sourceCollection: "ksefInvoices",
-        status: "NOWA",
-        supplierName,
-        totalGrossCents: parsed.totalGrossCents,
-        period: parsed.period,
-        parsed,
-      });
-    }
-
-    await saveKsefSyncState(communityId, {
-      syncInProgress: false,
-      lastSyncAtMs: nowMs(),
-      lastSyncSuccessAtMs: nowMs(),
-      lastSyncError: "",
-      retryAttempts: 0,
-      nextRetryAtMs: null,
-      lastSyncCreated: created.length,
-      lastSyncDuplicates: duplicates.length,
-    });
-
-    return { ok: true, created, duplicates, mode };
-  } catch (error) {
-    const retryEnabled = cfg.retryEnabled !== false;
-    const retryAttempts = Number(cfg.retryAttempts || 0) + 1;
-    const retryMaxAttempts = Math.max(1, Number(cfg.retryMaxAttempts || 3));
-    const retryDelayMinutes = Math.max(5, Number(cfg.retryDelayMinutes || 15));
-    const shouldRetry = retryEnabled && retryAttempts <= retryMaxAttempts;
-    await saveKsefSyncState(communityId, {
-      syncInProgress: false,
-      lastSyncError: safeString(error?.message || error),
-      lastSyncFailedAtMs: nowMs(),
-      retryAttempts,
-      nextRetryAtMs: shouldRetry ? nowMs() + retryDelayMinutes * 60 * 1000 : null,
-    });
-    throw error;
-  }
-}
-
-function shouldRunKsefSyncNow(cfg = {}) {
-  if (cfg.autoSyncEnabled !== true) return false;
-  if (cfg.syncInProgress === true && Number(cfg.lastSyncStartedAtMs || 0) > nowMs() - 30 * 60 * 1000) return false;
-  const now = nowMs();
-  const nextRetryAtMs = Number(cfg.nextRetryAtMs || 0);
-  if (nextRetryAtMs && nextRetryAtMs <= now) return true;
-  const intervalMinutes = Math.max(15, Number(cfg.autoSyncIntervalMinutes || 60));
-  const lastSyncAtMs = Number(cfg.lastSyncAtMs || 0);
-  if (!lastSyncAtMs) return true;
-  return lastSyncAtMs + intervalMinutes * 60 * 1000 <= now;
-}
-
-exports.ksefSetConfig = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  await assertSameCommunity(me, communityId);
-
-  const environment = safeString(request.data?.environment || request.data?.mode || "MOCK").toUpperCase();
-  await db.doc(`communities/${communityId}/ksef/config`).set({
-    mode: environment,
-    environment,
-    identifier: safeString(request.data?.identifier || request.data?.nip || ""),
-    nip: safeString(request.data?.nip || request.data?.identifier || "").replace(/\D/g, ""),
-    token: safeString(request.data?.token || ""),
-    subjectType: safeString(request.data?.subjectType || "Subject2"),
-    syncFrom: safeString(request.data?.syncFrom || ""),
-    syncTo: safeString(request.data?.syncTo || ""),
-    autoSyncEnabled: request.data?.autoSyncEnabled === true,
-    autoSyncIntervalMinutes: Math.max(15, Number(request.data?.autoSyncIntervalMinutes || 60)),
-    autoSyncCount: Math.max(1, Math.min(20, Number(request.data?.autoSyncCount || 5))),
-    retryEnabled: request.data?.retryEnabled !== false,
-    retryMaxAttempts: Math.max(1, Math.min(10, Number(request.data?.retryMaxAttempts || 3))),
-    retryDelayMinutes: Math.max(5, Math.min(1440, Number(request.data?.retryDelayMinutes || 15))),
-    dedupeEnabled: request.data?.dedupeEnabled !== false,
-    updatedAtMs: nowMs(),
-    updatedByUid: request.auth.uid
-  }, { merge: true });
-
-  return { ok: true };
-});
-
-exports.ksefFetchInvoices = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  await assertSameCommunity(me, communityId);
-
-  return await performKsefFetchForCommunity(communityId, {
-    mode: request.data?.mode,
-    count: request.data?.count,
-    issueDate: request.data?.issueDate,
-    nip: request.data?.nip,
-  });
-});
-
-exports.ksefRunAutoSync = onSchedule({ schedule: "every 15 minutes", timeZone: "Europe/Warsaw", region: "europe-west1" }, async () => {
-  const communitiesSnap = await db.collection("communities").get();
-  let processed = 0;
-  let success = 0;
-  let failed = 0;
-
-  for (const communityDoc of communitiesSnap.docs) {
-    const communityId = communityDoc.id;
-    const cfgSnap = await db.doc(`communities/${communityId}/ksef/config`).get();
-    const cfg = cfgSnap.exists ? (cfgSnap.data() || {}) : {};
-    if (!shouldRunKsefSyncNow(cfg)) continue;
-    processed += 1;
-    try {
-      await performKsefFetchForCommunity(communityId, {
-        mode: cfg.environment || cfg.mode,
-        count: cfg.autoSyncCount,
-      });
-      success += 1;
-    } catch (error) {
-      failed += 1;
-      console.error("ksefRunAutoSync failed", communityId, error?.message || error);
-    }
-  }
-
-  return { processed, success, failed };
-});
-
-
-exports.clearSettlementDrafts = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  await assertSameCommunity(me, communityId);
-
-  const snap = await db.collection(`communities/${communityId}/${SETTLEMENT_DRAFTS_COLLECTION}`).get();
-  if (snap.empty) return { ok: true, deleted: 0 };
-
-  let deleted = 0;
-  let batch = db.batch();
-  let ops = 0;
-  for (const d of snap.docs) {
-    batch.delete(d.ref);
-    deleted += 1;
-    ops += 1;
-    if (ops >= 450) {
-      await batch.commit();
-      batch = db.batch();
-      ops = 0;
-    }
-  }
-  if (ops > 0) await batch.commit();
-  return { ok: true, deleted };
-});
-
-exports.ksefRetryNow = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  await assertSameCommunity(me, communityId);
-  return await performKsefFetchForCommunity(communityId, {
-    mode: request.data?.mode,
-    count: request.data?.count,
-    issueDate: request.data?.issueDate,
-    nip: request.data?.nip,
-  });
-});
-
-exports.ksefParseInvoice = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const invoiceId = safeString(request.data?.invoiceId);
-  await assertSameCommunity(me, communityId);
-  if (!invoiceId) throw new HttpsError("invalid-argument", "Brak invoiceId.");
-
-  const ref = db.doc(`communities/${communityId}/ksefInvoices/${invoiceId}`);
-  const snap = await ref.get();
-  if (!snap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
-
-  const xml = safeString(snap.data().xml);
-  const parsed = parseInvoiceXmlBasic(xml);
-
-  await ref.set({
-    parsed,
-    parsedAtMs: nowMs()
-  }, { merge: true });
-
-  return { ok: true, parsed };
-});
-
-exports.aiParseInvoicePdf = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const fileBase64 = safeString(request.data?.fileBase64);
-  const filename = safeString(request.data?.filename || "invoice.pdf");
-  await assertSameCommunity(me, communityId);
-  if (!fileBase64) throw new HttpsError("invalid-argument", "Brak pliku PDF.");
-
-  const text = await extractPdfText(fileBase64);
-  const scopeHint = detectInvoiceScope(text);
-  const heuristic = {
-    category: heuristicCategory(text),
-    scope: scopeHint.scope,
-    period: monthFromDateStr((text.match(/20\d{2}-\d{2}-\d{2}/) || [])[0] || ""),
-    confidence: Math.max(0.55, Number(scopeHint.confidence || 0)),
-    needsReview: true,
-    reason: scopeHint.reason || "Heurystyka OCR/PDF"
-  };
-
-  const ai = await aiSuggestInvoice(text);
-  const suggestion = ai || heuristic;
-
-  const ref = await db.collection(`communities/${communityId}/ksefInvoices`).add({
-    createdAtMs: nowMs(),
-    status: "NOWA",
-    source: "PDF_OCR",
-    filename,
-    extractedText: text,
-    parsed: {
-      issueDate: "",
-      period: suggestion.period || "",
-      totalGrossCents: 0,
-      currency: "PLN",
-      sellerName: "",
-      buyerName: "",
-      ksefNumber: "",
-      items: []
-    },
-    assigned: { scope: null },
-    ai: {
-      status: "READY",
-      suggestion,
-      suggestedAtMs: nowMs(),
-      by: ai ? "AI" : "HEURISTIC"
-    }
-  });
-
-  if (suggestion.needsReview || Number(suggestion.confidence || 0) < 0.85) {
-    await createReviewItem(communityId, {
-      type: "INVOICE_PDF",
-      invoiceId: ref.id,
-      title: `OCR faktury: ${filename}`,
-      reason: suggestion.reason || "Wymaga sprawdzenia",
-      confidence: Number(suggestion.confidence || 0)
-    });
-  }
-
-  return { ok: true, invoiceId: ref.id, suggestion };
-});
-
-exports.aiSuggestInvoice = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const invoiceId = safeString(request.data?.invoiceId);
-  await assertSameCommunity(me, communityId);
-  if (!invoiceId) throw new HttpsError("invalid-argument", "Brak invoiceId.");
-
-  let ref = db.doc(`communities/${communityId}/invoices/${invoiceId}`);
-  let snap = await ref.get();
-  if (!snap.exists) {
-    ref = db.doc(`communities/${communityId}/ksefInvoices/${invoiceId}`);
-    snap = await ref.get();
-  }
-  if (!snap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
-
-  const inv = snap.data();
-  const invoiceStatus = safeString(inv.status).toUpperCase();
-  if (invoiceStatus === "PRZENIESIONA_DO_SZKICU" || invoiceStatus === "ARCHIVED") {
-    throw new HttpsError("already-exists", "Ta faktura została już wcześniej przeniesiona do szkicu rozliczeń.");
-  }
-  const parsed = inv.parsed || {};
-  const invoiceText = [
-    inv.ksefNumber || "",
-    parsed.sellerName || "",
-    parsed.buyerName || "",
-    JSON.stringify(parsed.items || []),
-    inv.extractedText || ""
-  ].join(" ");
-
-  let suggestion = await aiSuggestInvoice(invoiceText);
-  if (!suggestion) {
-    suggestion = {
-      category: heuristicCategory(invoiceText),
-      scope: "COMMON",
-      period: parsed.period || "",
-      confidence: 0.55,
-      needsReview: true,
-      reason: "Heurystyka słownikowa"
-    };
-  }
-
-  await ref.set({
-    ai: {
-      status: "READY",
-      suggestion,
-      suggestedAtMs: nowMs(),
-      by: suggestion.reason === "Heurystyka słownikowa" ? "HEURISTIC" : "AI"
-    }
-  }, { merge: true });
-
-  if (suggestion.needsReview || Number(suggestion.confidence || 0) < 0.85) {
-    await createReviewItem(communityId, {
-      type: "INVOICE_ASSIGNMENT",
-      invoiceId,
-      title: `Weryfikacja faktury ${invoiceId}`,
-      reason: suggestion.reason || "Wymaga sprawdzenia",
-      confidence: Number(suggestion.confidence || 0)
-    });
-  }
-
-  return { ok: true, suggestion };
-});
-
-// =========================================================
-// APPROVAL / CHARGES / SETTLEMENTS
-// =========================================================
-
-async function recalcSettlement(communityId, flatId, period) {
-  const flat = await getFlat(communityId, flatId);
-  if (!flat) throw new HttpsError("not-found", "Brak lokalu.");
-
-  const chargesSnap = await db.collection(`communities/${communityId}/charges`)
-    .where("flatId", "==", flatId)
-    .where("period", "==", period)
-    .get();
-
-  const paymentsSnap = await db.collection(`communities/${communityId}/payments`)
-    .where("flatId", "==", flatId)
-    .where("period", "==", period)
-    .get();
-
-  const charges = chargesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-  const payments = paymentsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-  const totalChargesCents = charges.reduce((s, x) => s + Number(x.amountCents || 0), 0);
-  const totalPaymentsCents = payments.reduce((s, x) => s + Number(x.amountCents || 0), 0);
-  const balanceCents = totalChargesCents - totalPaymentsCents;
-
-  const community = await getCommunity(communityId);
-  const defaults = readCommunityPaymentDefaults(community);
-  const settlementId = settlementDocId(flatId, period);
-  const state = await getSettlementState(communityId, settlementId);
-  const existing = state.draft || state.published || {};
-  const paymentRef = await buildPaymentTitle({ ...flat, communityId, id: flatId }, period, existing?.paymentRef || existing?.paymentTitle || existing?.transferTitle || "");
-
-  await state.draftRef.set({
-    id: settlementId,
-    communityId,
-    flatId,
-    flatLabel: valueOr(flat.flatLabel, `${flat.street || ""} ${flat.buildingNo || ""}/${flat.apartmentNo || ""}`.trim()),
-    street: flat.street || "",
-    buildingNo: flat.buildingNo || "",
-    apartmentNo: flat.apartmentNo || "",
-    period,
-    paymentRef,
-    paymentTitle: paymentRef,
-    paymentCode: paymentRef,
-    transferTitle: paymentRef,
-    totalChargesCents,
-    chargesCents: totalChargesCents,
-    totalPaymentsCents,
-    paymentsCents: totalPaymentsCents,
-    balanceCents,
-    totalDueCents: balanceCents,
-    dueDate: `${period}-15`,
-    transferName: valueOr(existing?.transferName, valueOr(flat.recipientName, defaults.recipientName)),
-    receiverName: valueOr(existing?.receiverName, valueOr(flat.receiverName, valueOr(flat.recipientName, defaults.recipientName))),
-    transferAddress: valueOr(existing?.transferAddress, valueOr(flat.recipientAddress, defaults.recipientAddress)),
-    receiverAddress: valueOr(existing?.receiverAddress, valueOr(flat.receiverAddress, valueOr(flat.recipientAddress, defaults.recipientAddress))),
-    accountNumber: valueOr(existing?.accountNumber, valueOr(flat.accountNumber, defaults.accountNumber)),
-    bankAccount: valueOr(existing?.bankAccount, valueOr(existing?.accountNumber, valueOr(flat.bankAccount, valueOr(flat.accountNumber, defaults.accountNumber)))),
-    residentName: valueOr(existing?.residentName, valueOr(flat.displayName, valueOr(flat.name, flat.payerName))),
-    residentEmail: valueOr(existing?.residentEmail, valueOr(flat.email, flat.payerEmail)),
-    status: "DRAFT",
-    isPublished: false,
-    updatedAtMs: nowMs(),
-    createdAtMs: Number(existing?.createdAtMs || nowMs()),
-    runtimeFixVersion: RUNTIME_FIX_VERSION
-  }, { merge: true });
-
-  return { settlementId, paymentRef, totalChargesCents, totalPaymentsCents, balanceCents };
-}
-
-function normalizeInvoiceScope(scope, assignment = {}, parsed = {}, invoice = {}) {
-  const raw = safeString(scope || assignment.scope || parsed.scope || parsed.allocationType || invoice.ai?.suggestion?.scope || invoice.ai?.suggestion?.allocationType).toUpperCase();
-  if (["FLAT", "LOCAL", "LOKAL"].includes(raw)) return "FLAT";
-  if (["BUILDING", "BUDYNEK"].includes(raw)) return "BUILDING";
-  if (["STAIRCASE", "KLATKA", "ENTRANCE"].includes(raw)) return "STAIRCASE";
-  if (["COMMUNITY", "WSPOLNOTA"].includes(raw)) return "COMMUNITY";
-  if (["COMMON", "WSPOLNE", "CZESCI_WSPOLNE", "CZESCI_WSPOLNE"].includes(raw)) return "COMMON";
-
-  const hintText = [
-    assignment.reason,
-    parsed.reason,
-    parsed.ocrText,
-    parsed.extractedText,
-    parsed.description,
-    parsed.streetName,
-    parsed.street,
-    parsed.buildingNo,
-    parsed.apartmentNo,
-    parsed.address,
-    invoice.filename,
-    invoice.extractedText,
-    JSON.stringify(invoice.parsed?.items || []),
-  ].map(safeString).filter(Boolean).join("\n");
-
-  return detectInvoiceScope(hintText).scope;
-}
-
-async function resolveFlatsForScope(communityId, scope, assignment = {}, parsed = {}) {
-  const allFlats = await listFlats(communityId);
-  const directStreetId = safeString(assignment.streetId || parsed.streetId || parsed.suggestedStreetId);
-  const directBuildingId = safeString(assignment.buildingId || parsed.buildingId || parsed.suggestedBuildingId || parsed.buildingNo);
-  const directStaircaseId = safeString(assignment.staircaseId || parsed.staircaseId || assignment.entranceId || parsed.entranceId || parsed.suggestedStaircaseId);
-  const directFlatId = safeString(assignment.flatId || parsed.flatId || parsed.suggestedFlatId);
-  const hintText = [
-    assignment.reason,
-    parsed.reason,
-    parsed.ocrText,
-    parsed.extractedText,
-    parsed.streetName,
-    parsed.suggestedStreetName,
-    parsed.street,
-    parsed.buildingNo,
-    parsed.apartmentNo,
-    parsed.suggestedApartmentNo,
-    parsed.address,
-    parsed.description,
-  ].map(safeString).filter(Boolean).join("\n");
-  const hints = parseAddressHints(hintText);
-
-  const normalizedStreetId = normalizeStreetName(directStreetId || "");
-  const normalizedStreetName = normalizeLookup(assignment.streetName || parsed.streetName || parsed.suggestedStreetName || parsed.street || hints.streetName);
-  const normalizedBuilding = normalizeBuildingNo(directBuildingId || hints.buildingNo);
-  const normalizedApartment = normalizeBuildingNo(directFlatId ? "" : (assignment.apartmentNo || parsed.apartmentNo || parsed.suggestedApartmentNo || hints.apartmentNo));
-  const normalizedStaircase = normalizeLookup(directStaircaseId || hints.staircaseId);
-  const scopeHint = detectInvoiceScope(hintText, scope);
-  const directFlat = directFlatId ? allFlats.find((f) => safeString(f.id) === directFlatId) : null;
-
-  const matchesStreet = (flat) => {
-    if (!normalizedStreetId && !normalizedStreetName) return true;
-    const flatStreetId = normalizeStreetName(flat.streetId || "");
-    const flatStreetName = normalizeLookup(flat.street || flat.streetName || "");
-    return (!!normalizedStreetId && flatStreetId === normalizedStreetId) || (!!normalizedStreetName && flatStreetName.includes(normalizedStreetName));
-  };
-
-  const matchesBuilding = (flat) => {
-    if (!normalizedBuilding) return true;
-    return normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizedBuilding;
-  };
-
-  const matchesApartment = (flat) => {
-    if (!normalizedApartment) return true;
-    return normalizeBuildingNo(flat.apartmentNo || flat.flatNumber || "") === normalizedApartment;
-  };
-
-  const matchesStaircase = (flat) => {
-    if (!normalizedStaircase) return true;
-    return normalizeLookup(flat.staircaseId || flat.staircase || flat.entranceId || flat.entrance || flat.klatka) === normalizedStaircase;
-  };
-
-  const byAddress = allFlats.filter((flat) => matchesStreet(flat) && matchesBuilding(flat) && matchesApartment(flat));
-  const byBuilding = allFlats.filter((flat) => matchesStreet(flat) && matchesBuilding(flat));
-  const byStaircase = allFlats.filter((flat) => matchesStreet(flat) && matchesBuilding(flat) && matchesStaircase(flat));
-  const byStreet = allFlats.filter((flat) => matchesStreet(flat));
-
-  let flats = [];
-
-  if (scope === "FLAT") {
-    if (directFlat) return [directFlat];
-    return byAddress.slice(0, 1);
-  }
-
-  if (scope === "BUILDING") {
-    if (directFlat) {
-      return allFlats.filter((flat) => {
-        const sameStreet = normalizeLookup(flat.street || flat.streetName || "") === normalizeLookup(directFlat.street || directFlat.streetName || "") || safeString(flat.streetId) === safeString(directFlat.streetId || "");
-        const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId || "");
-        return sameStreet && sameBuilding;
-      });
-    }
-    flats = byBuilding.length ? byBuilding : byStreet;
-    return Array.from(new Map(flats.map((x) => [x.id, x])).values());
-  }
-
-  if (scope === "STAIRCASE") {
-    if (directFlat) {
-      flats = allFlats.filter((flat) => {
-        const sameStreet = normalizeLookup(flat.street || flat.streetName || "") === normalizeLookup(directFlat.street || directFlat.streetName || "") || safeString(flat.streetId) === safeString(directFlat.streetId || "");
-        const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId || "");
-        const sameStair = normalizeLookup(flat.staircaseId || flat.staircase || flat.entranceId || flat.entrance || flat.klatka) === normalizeLookup(directFlat.staircaseId || directFlat.staircase || directFlat.entranceId || directFlat.entrance || directFlat.klatka);
-        return sameStreet && sameBuilding && sameStair;
-      });
-    }
-    if (!flats.length) flats = byStaircase;
-    if (!flats.length && normalizedStaircase) flats = byBuilding.filter(matchesStaircase);
-    return Array.from(new Map(flats.map((x) => [x.id, x])).values());
-  }
-
-  if (scope === "COMMUNITY") {
-    return Array.from(new Map(allFlats.map((x) => [x.id, x])).values());
-  }
-
-  if (directFlat) {
-    flats = allFlats.filter((flat) => {
-      const sameStreet = normalizeLookup(flat.street || flat.streetName || "") === normalizeLookup(directFlat.street || directFlat.streetName || "") || safeString(flat.streetId) === safeString(directFlat.streetId || "");
-      const sameBuilding = normalizeBuildingNo(flat.buildingNo || flat.buildingId || "") === normalizeBuildingNo(directFlat.buildingNo || directFlat.buildingId || "");
-      const directStair = normalizeLookup(directFlat.staircaseId || directFlat.staircase || directFlat.entranceId || directFlat.entrance || directFlat.klatka);
-      return sameStreet && sameBuilding && (!normalizedStaircase || !directStair || matchesStaircase(flat));
-    });
-  }
-
-  if (!flats.length && normalizedStaircase) flats = byStaircase;
-  if (!flats.length && normalizedBuilding) flats = byBuilding;
-  if (!flats.length && scopeHint.scope === "COMMUNITY") flats = allFlats;
-  if (!flats.length && byStreet.length && (scopeHint.scope === "COMMON" || scopeHint.scope === "BUILDING")) flats = byStreet;
-  if (!flats.length && byAddress.length && normalizedApartment && scopeHint.scope !== "FLAT") {
-    flats = byBuilding.length ? byBuilding : byStreet;
-  }
-  if (!flats.length) flats = allFlats;
-
-  return Array.from(new Map(flats.map((x) => [x.id, x])).values());
-}
-
-async function replaceInvoiceCharges(communityId, invoiceId, nextCharges) {
-  const previous = await db.collection(`communities/${communityId}/charges`).where("invoiceId", "==", invoiceId).get();
-  const affected = new Set();
-  const batch = db.batch();
-  previous.docs.forEach((doc) => {
-    affected.add(safeString(doc.data().flatId));
-    batch.delete(doc.ref);
-  });
-  nextCharges.forEach((charge) => {
-    const ref = db.collection(`communities/${communityId}/charges`).doc();
-    batch.set(ref, charge);
-    affected.add(safeString(charge.flatId));
-  });
-  await batch.commit();
-  return Array.from(affected).filter(Boolean);
-}
-
-async function recalcAllSettlementsForPeriod(communityId, period) {
-  const flats = await listFlats(communityId);
-  const out = [];
-  for (const flat of flats) {
-    out.push(await recalcSettlement(communityId, flat.id, period));
-  }
-  return out;
-}
-
-exports.approveInvoice = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const invoiceId = safeString(request.data?.invoiceId);
-  const assignment = request.data?.assignment || {};
-  await assertSameCommunity(me, communityId);
-  if (!invoiceId) throw new HttpsError("invalid-argument", "Brak invoiceId.");
-
-  let ref = db.doc(`communities/${communityId}/invoices/${invoiceId}`);
-  let snap = await ref.get();
-  if (!snap.exists) {
-    ref = db.doc(`communities/${communityId}/ksefInvoices/${invoiceId}`);
-    snap = await ref.get();
-  }
-  if (!snap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
-
-  const inv = snap.data();
-  const invoiceStatus = safeString(inv.status).toUpperCase();
-  if (invoiceStatus === "PRZENIESIONA_DO_SZKICU" || invoiceStatus === "ARCHIVED") {
-    throw new HttpsError("already-exists", "Ta faktura została już wcześniej przeniesiona do szkicu rozliczeń.");
-  }
-  const parsed = inv.parsed || {};
-  const totalCents = Number(parsed.totalGrossCents || parsed.amountCents || inv.totalGrossCents || inv.amountCents || 0);
-  const period = safeString(assignment.period || parsed.period || inv.period || inv.ai?.suggestion?.period);
-  const category = safeString(assignment.category || parsed.category || inv.category || inv.ai?.suggestion?.category || "INNE");
-  const scope = normalizeInvoiceScope(assignment.scope, assignment, parsed, inv);
-  const buildingId = safeString(assignment.buildingId || parsed.buildingId || parsed.suggestedBuildingId || inv.ai?.suggestion?.buildingId);
-  const streetId = safeString(assignment.streetId || parsed.streetId || parsed.suggestedStreetId || inv.ai?.suggestion?.streetId);
-  const staircaseId = safeString(assignment.staircaseId || parsed.staircaseId || parsed.suggestedStaircaseId || inv.ai?.suggestion?.staircaseId);
-  const flatId = safeString(assignment.flatId || parsed.flatId || parsed.suggestedFlatId || inv.ai?.suggestion?.flatId);
-  const archiveMonth = safeString(period || monthFromDateStr(parsed.issueDate || inv.issueDate));
-
-  if (!period) throw new HttpsError("invalid-argument", "Brak okresu.");
-  if (totalCents <= 0) throw new HttpsError("failed-precondition", "Brak kwoty na fakturze.");
-
-  const targetFlats = await resolveFlatsForScope(communityId, scope, {
-    scope,
-    streetId,
-    buildingId,
-    staircaseId,
-    flatId,
-    apartmentNo: assignment.apartmentNo,
-    streetName: assignment.streetName,
-  }, parsed);
-
-  if (targetFlats.length === 0) {
-    throw new HttpsError("failed-precondition", `Brak lokali do naliczenia dla typu kosztu ${scope}. streetId=${streetId || "-"} buildingId=${buildingId || "-"} staircaseId=${staircaseId || "-"} flatId=${flatId || "-"}`);
-  }
-
-  const duplicateSignature = normalizeLookup([
-    safeString(inv.invoiceNumber || parsed.invoiceNumber),
-    safeString(inv.supplierName || inv.vendorName || parsed.sellerName),
-    String(totalCents),
-    period,
-    scope,
-  ].join("|"));
-  if (duplicateSignature) {
-    const existingChargesSnap = await db.collection(`communities/${communityId}/charges`).where("period", "==", period).get();
-    const duplicateForFlat = new Set(existingChargesSnap.docs
-      .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
-      .filter((charge) => normalizeLookup([
-        safeString(charge.invoiceNumber),
-        safeString(charge.supplierName || charge.vendorName || charge.sellerName),
-        String(Number(charge.invoiceTotalCents || charge.totalGrossCents || 0)),
-        safeString(charge.period),
-        safeString(charge.scope),
-      ].join("|")) === duplicateSignature)
-      .map((charge) => safeString(charge.flatId))
-      .filter(Boolean));
-    const duplicatedTarget = targetFlats.find((flat) => duplicateForFlat.has(safeString(flat.id)));
-    if (duplicatedTarget) {
-      throw new HttpsError("already-exists", `W szkicach istnieje już naliczenie tej faktury dla lokalu ${duplicatedTarget.flatLabel || duplicatedTarget.id}.`);
-    }
-  }
-
-  const useArea = targetFlats.some((f) => Number(f.areaM2 || 0) > 0) && scope !== "FLAT";
-  const totalWeight = useArea
-    ? targetFlats.reduce((sum, flat) => sum + Math.max(0, Number(flat.areaM2 || 0)), 0)
-    : targetFlats.length;
-
-  const createdCharges = [];
-  let allocated = 0;
-  for (let i = 0; i < targetFlats.length; i += 1) {
-    const flat = targetFlats[i];
-    const weight = scope === "FLAT" ? 1 : (useArea ? Math.max(0, Number(flat.areaM2 || 0)) : 1);
-    let part = scope === "FLAT" ? totalCents : Math.floor((totalCents * weight) / Math.max(1, totalWeight));
-    if (i === targetFlats.length - 1) part = totalCents - allocated;
-    allocated += part;
-
-    createdCharges.push({
-      createdAtMs: nowMs(),
-      updatedAtMs: nowMs(),
-      source: inv.source || "OCR",
-      invoiceId,
-      flatId: flat.id,
-      buildingId: flat.buildingId || flat.buildingNo || buildingId || null,
-      streetId: flat.streetId || streetId || null,
-      staircaseId: flat.staircaseId || flat.staircase || flat.entranceId || staircaseId || null,
-      category,
-      period,
-      amountCents: part,
-      currency: "PLN",
-      status: "OPEN",
-      scope,
-      costTarget: scope === "FLAT"
-        ? "flat"
-        : scope === "BUILDING"
-          ? "building"
-          : scope === "STAIRCASE"
-            ? "staircase"
-            : scope === "COMMUNITY"
-              ? "community"
-              : "buildingCharges",
-      allocationMethod: scope === "FLAT" ? "DIRECT" : (useArea ? "AREA" : "EQUAL"),
-      invoiceNumber: safeString(inv.invoiceNumber || parsed.invoiceNumber),
-      supplierName: safeString(inv.supplierName || inv.vendorName || parsed.sellerName),
-      totalGrossCents,
-      invoiceTotalCents: totalCents,
-      runtimeFixVersion: RUNTIME_FIX_VERSION,
-    });
-  }
-
-  const affectedFlatIds = await replaceInvoiceCharges(communityId, invoiceId, createdCharges);
-  for (const affectedFlatId of affectedFlatIds) {
-    await recalcSettlement(communityId, affectedFlatId, period);
-  }
-
-  await ref.set({
-    status: "PRZENIESIONA_DO_SZKICU",
-    approvedAtMs: nowMs(),
-    approvedByUid: request.auth.uid,
-    archivedAtMs: nowMs(),
-    archivedByUid: request.auth.uid,
-    archiveMonth: archiveMonth || period,
-    isArchived: true,
-    movedToDraftAtMs: nowMs(),
-    settlementDraftCount: createdCharges.length,
-    lastDraftPeriod: period,
-    assigned: {
-      scope,
-      streetId: streetId || null,
-      buildingId: buildingId || null,
-      staircaseId: staircaseId || null,
-      flatId: flatId || null,
-      category,
-      period,
-      affectedFlatIds,
-    },
-    runtimeFixVersion: RUNTIME_FIX_VERSION,
-  }, { merge: true });
-
-  return {
-    ok: true,
-    chargesCreated: createdCharges.length,
-    affectedFlatIds,
-    scope,
-    archived: true,
-    archiveMonth: archiveMonth || period,
-    runtimeFixVersion: RUNTIME_FIX_VERSION,
-  };
-});
-
-exports.rebuildSettlementsForPeriod = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const period = safeString(request.data?.period);
-  await assertSameCommunity(me, communityId);
-  if (!period) throw new HttpsError("invalid-argument", "Brak period.");
-
-  const out = await recalcAllSettlementsForPeriod(communityId, period);
-  return { ok: true, count: out.length };
-});
-
-// =========================================================
-// PDF / EMAIL / PUBLISH FLOW
-// =========================================================
-
-async function buildSettlementPdfBuffer({ communityId, flatId, period, charges, settlement }) {
-  const doc = new PDFDocument({ size: "A4", margin: 40 });
-  const chunks = [];
-  doc.on("data", d => chunks.push(d));
-  const done = new Promise(resolve => doc.on("end", resolve));
-
-  doc.fontSize(16).text("e-Lokator – Rozliczenie", { align: "center" });
-  doc.moveDown();
-  doc.fontSize(12).text(`Wspólnota: ${communityId}`);
-  doc.text(`Lokal: ${settlement?.flatLabel || flatId}`);
-  doc.text(`Okres: ${period}`);
-  doc.text(`Termin płatności: ${settlement?.dueDate || `${period}-15`}`);
-  doc.text(`Rachunek: ${settlement?.accountNumber || ""}`);
-  doc.text(`Tytuł przelewu: ${settlement?.paymentTitle || ""}`);
-  if (settlement?.transferName) doc.text(`Odbiorca: ${settlement.transferName}`);
-  if (settlement?.transferAddress) doc.text(`Adres odbiorcy: ${settlement.transferAddress}`);
-  doc.moveDown();
-
-  const totalCharges = charges.reduce((s, c) => s + Number(c.amountCents || 0), 0);
-  doc.text(`Suma naliczeń: ${formatMoney(totalCharges)}`);
-  doc.text(`Saldo: ${formatMoney(settlement?.balanceCents || totalCharges)}`);
-  doc.moveDown();
-  doc.text("Pozycje:");
-  charges.forEach(c => doc.text(`- ${c.category || "INNE"}: ${formatMoney(Number(c.amountCents || 0))}`));
-
-  doc.end();
-  await done;
-  return Buffer.concat(chunks);
-}
-
-async function sendSettlementEmailInternal({ communityId, flatId, period }) {
-  const settlementId = settlementDocId(flatId, period);
-  const chosen = await getPreferredSettlement(communityId, settlementId);
-  if (!chosen.data) throw new HttpsError("not-found", "Brak rozliczenia.");
-
-  const settlement = chosen.data;
-  const email = safeString(settlement.residentEmail || settlement.email);
-  if (!email) {
-    await db.collection(`communities/${communityId}/mailLogs`).add({
-      createdAtMs: nowMs(),
-      mode: "SKIPPED",
-      reason: "Brak email",
-      flatId,
-      period
-    });
-    return { ok: true, mode: "SKIPPED" };
-  }
-
-  const chargesSnap = await db.collection(`communities/${communityId}/charges`)
-    .where("flatId", "==", flatId)
-    .where("period", "==", period)
-    .get();
-  const charges = chargesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-  const pdf = await buildSettlementPdfBuffer({ communityId, flatId, period, charges, settlement });
-
-  const smtpHost = process.env.SMTP_HOST;
-  const smtpUser = process.env.SMTP_USER;
-  const smtpPass = process.env.SMTP_PASS;
-  const from = process.env.MAIL_FROM || "no-reply@e-lokator.org";
-
-  if (!smtpHost || !smtpUser || !smtpPass) {
-    await db.collection(`communities/${communityId}/mailLogs`).add({
-      createdAtMs: nowMs(),
-      mode: "MOCK",
-      to: email,
-      subject: `Rozliczenie ${period}`,
-      flatId,
-      period
-    });
-    return { ok: true, mode: "MOCK" };
-  }
-
-  const transporter = nodemailer.createTransport({
-    host: smtpHost,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: false,
-    auth: { user: smtpUser, pass: smtpPass }
-  });
-
-  await transporter.sendMail({
-    from,
-    to: email,
-    subject: `Rozliczenie ${period}`,
-    text: `W załączniku rozliczenie za okres ${period}.`,
-    attachments: [{ filename: `rozliczenie_${period}.pdf`, content: pdf }]
-  });
-
-  return { ok: true, mode: "SMTP" };
-}
-
-exports.generateSettlementPdf = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const flatId = safeString(request.data?.flatId);
-  const period = safeString(request.data?.period);
-  await assertSameCommunity(me, communityId);
-  if (!flatId || !period) throw new HttpsError("invalid-argument", "Brak flatId/period.");
-
-  const settlementId = settlementDocId(flatId, period);
-  const chosen = await getPreferredSettlement(communityId, settlementId);
-  const settlement = chosen.data || null;
-
-  const chargesSnap = await db.collection(`communities/${communityId}/charges`)
-    .where("flatId", "==", flatId)
-    .where("period", "==", period)
-    .get();
-  const charges = chargesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-  const pdf = await buildSettlementPdfBuffer({ communityId, flatId, period, charges, settlement });
-  return { ok: true, base64: pdf.toString("base64"), mime: "application/pdf" };
-});
-
-exports.sendSettlementEmail = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const flatId = safeString(request.data?.flatId);
-  const period = safeString(request.data?.period);
-  await assertSameCommunity(me, communityId);
-  if (!flatId || !period) throw new HttpsError("invalid-argument", "Brak flatId/period.");
-  return await sendSettlementEmailInternal({ communityId, flatId, period });
-});
-
-exports.publishSettlement = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const settlementId = safeString(request.data?.settlementId);
-  const sendEmail = request.data?.sendEmail === true;
-  await assertSameCommunity(me, communityId);
-  if (!settlementId) throw new HttpsError("invalid-argument", "Brak settlementId.");
-
-  const state = await getSettlementState(communityId, settlementId);
-  const source = state.draft || state.published;
-  if (!source) throw new HttpsError("not-found", "Rozliczenie nie istnieje.");
-
-  const patch = {
-    ...source,
-    status: "PUBLISHED",
-    isPublished: true,
-    publishedAtMs: nowMs(),
-    publishedByUid: request.auth.uid,
-    archiveMonth: safeString(source.period || source.archiveMonth),
-    updatedAtMs: nowMs(),
-    runtimeFixVersion: RUNTIME_FIX_VERSION,
-  };
-  if (sendEmail) patch.sentAtMs = nowMs();
-  await state.publishedRef.set(patch, { merge: true });
-  if (state.draftSnap.exists) await state.draftRef.delete();
-
-  if (sendEmail && source.flatId && source.period) {
-    await sendSettlementEmailInternal({ communityId, flatId: source.flatId, period: source.period });
-  }
-
-  return { ok: true, settlementId, published: true };
-});
-
-exports.publishAllDraftSettlements = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const period = safeString(request.data?.period);
-  const sendEmail = request.data?.sendEmail === true;
-  await assertSameCommunity(me, communityId);
-
-  const allSnap = await db.collection(`communities/${communityId}/${SETTLEMENT_DRAFTS_COLLECTION}`).get();
-  const docs = allSnap.docs.filter((doc) => {
-    const data = doc.data() || {};
-    const samePeriod = !period || safeString(data.period) === period;
-    return samePeriod;
-  });
-
-  if (!docs.length) return { ok: true, publishedCount: 0, settlementIds: [] };
-
-  const ids = [];
-  for (const doc of docs) {
-    const s = doc.data();
-    const targetRef = db.doc(`communities/${communityId}/${SETTLEMENTS_COLLECTION}/${doc.id}`);
-    const patch = {
-      ...s,
-      status: "PUBLISHED",
-      isPublished: true,
-      publishedAtMs: nowMs(),
-      publishedByUid: request.auth.uid,
-      archiveMonth: safeString(s.period || s.archiveMonth),
-      updatedAtMs: nowMs(),
-      runtimeFixVersion: RUNTIME_FIX_VERSION,
-    };
-    if (sendEmail) patch.sentAtMs = nowMs();
-    await targetRef.set(patch, { merge: true });
-    await doc.ref.delete();
-
-    if (sendEmail && s.flatId && s.period) {
-      await sendSettlementEmailInternal({ communityId, flatId: s.flatId, period: s.period });
-    }
-    ids.push(doc.id);
-  }
-
-  return { ok: true, publishedCount: ids.length, settlementIds: ids };
-});
-
-// =========================================================
-// PAYMENTS + AI MATCH FLOW
-// =========================================================
-
-exports.aiMatchPayment = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const title = safeString(request.data?.title);
-  const amount = Number(request.data?.amount || 0);
-  await assertSameCommunity(me, communityId);
-  if (!title) throw new HttpsError("invalid-argument", "Brak tytułu.");
-
-  const candidatesRaw = await listSettlementCandidates(communityId, false);
-
-  const candidates = candidatesRaw.slice(0, 200).map(x => {
-    return {
-      settlementId: x.id,
-      flatId: x.flatId || "",
-      flatLabel: x.flatLabel || "",
-      period: x.period || "",
-      totalDueCents: x.totalDueCents || 0,
-      paymentTitle: x.paymentTitle || ""
-    };
-  });
-
-  let result = await aiMatchPayment({ title, amount, candidates });
-
-  if (!result) {
-    const lower = title.toLowerCase();
-    const match = candidates.find(c =>
-      lower.includes(String(c.paymentTitle || "").toLowerCase()) ||
-      lower.includes(String(c.flatLabel || "").toLowerCase())
-    );
-
-    result = match ? {
-      suggestedFlatId: match.flatId,
-      suggestedSettlementId: match.settlementId,
-      confidence: 0.72,
-      needsReview: false,
-      reason: "Dopasowanie heurystyczne po tytule"
-    } : {
-      suggestedFlatId: "",
-      suggestedSettlementId: "",
-      confidence: 0.2,
-      needsReview: true,
-      reason: "Brak pewnego dopasowania"
-    };
-  }
-
-  if (result.needsReview || Number(result.confidence || 0) < 0.85) {
-    await createReviewItem(communityId, {
-      type: "PAYMENT_MATCH",
-      title: "Weryfikacja dopasowania przelewu",
-      reason: result.reason || "AI nie ma wysokiej pewności",
-      paymentTitle: title,
-      amountCents: toCents(amount),
-      confidence: Number(result.confidence || 0),
-      suggestedFlatId: result.suggestedFlatId || "",
-      suggestedSettlementId: result.suggestedSettlementId || ""
-    });
-  }
-
-  return { ok: true, result };
-});
-
-exports.autoMatchImportedPayment = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const paymentId = safeString(request.data?.paymentId);
-  await assertSameCommunity(me, communityId);
-  if (!paymentId) throw new HttpsError("invalid-argument", "Brak paymentId.");
-
-  const paymentRef = db.doc(`communities/${communityId}/payments/${paymentId}`);
-  const paymentSnap = await paymentRef.get();
-  if (!paymentSnap.exists) throw new HttpsError("not-found", "Przelew nie istnieje.");
-
-  const payment = paymentSnap.data();
-  const title = safeString(payment.title || payment.transferTitle || payment.description);
-  const amount = fromCents(payment.amountCents || 0);
-
-  const ai = await exports.aiMatchPayment.run({
-    auth: request.auth,
-    data: { communityId, title, amount }
-  });
-
-  const result = ai.data?.result || ai.result || ai;
-  if (result?.suggestedFlatId) {
-    const settlementId = safeString(result.suggestedSettlementId);
-    await paymentRef.set({
-      flatId: result.suggestedFlatId,
-      settlementId,
-      matchedBy: Number(result.confidence || 0) >= 0.85 ? "AI" : "REVIEW",
-      matchedAtMs: nowMs()
-    }, { merge: true });
-
-    const period = settlementId.split("_").slice(1).join("_").replace(/_/g, "-");
-    if (result.suggestedFlatId && period) {
-      try { await recalcSettlement(communityId, result.suggestedFlatId, period); } catch (e) {}
-    }
-  }
-
-  return { ok: true, result };
-});
-
-// =========================================================
-// METERS + AI ANOMALY FLOW
-// =========================================================
-
-exports.aiMeterAnomaly = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  await assertSameCommunity(me, communityId);
-
-  const currentValue = Number(request.data?.currentValue || 0);
-  const prevValue = Number(request.data?.prevValue || 0);
-  const meterType = safeString(request.data?.meterType);
-  const unit = safeString(request.data?.unit);
-  const flatLabel = safeString(request.data?.flatLabel);
-
-  if (currentValue < prevValue) {
-    const result = {
-      anomaly: true,
-      confidence: 0.99,
-      needsReview: true,
-      reason: "Nowy odczyt jest mniejszy od poprzedniego."
-    };
-    await createReviewItem(communityId, {
-      type: "METER_ANOMALY",
-      title: `Podejrzany odczyt licznika ${flatLabel}`,
-      reason: result.reason,
-      confidence: result.confidence
-    });
-    return { ok: true, result };
-  }
-
-  let result = await aiAnalyzeMeter({ currentValue, prevValue, meterType, unit, flatLabel });
-  if (!result) {
-    const diff = currentValue - prevValue;
-    result = {
-      anomaly: diff > Math.max(prevValue * 0.5, 500),
-      confidence: diff > Math.max(prevValue * 0.5, 500) ? 0.78 : 0.45,
-      needsReview: diff > Math.max(prevValue * 0.5, 500),
-      reason: "Reguła progowa"
-    };
-  }
-
-  if (result.anomaly || result.needsReview || Number(result.confidence || 0) < 0.85) {
-    await createReviewItem(communityId, {
-      type: "METER_ANOMALY",
-      title: `Podejrzany odczyt licznika ${flatLabel}`,
-      reason: result.reason || "Wymaga sprawdzenia",
-      confidence: Number(result.confidence || 0),
-      meterType,
-      unit,
-      currentValue,
-      prevValue
-    });
-  }
-
-  return { ok: true, result };
-});
-
-exports.reviewImportedMeterReading = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const meterId = safeString(request.data?.meterId);
-  const readingId = safeString(request.data?.readingId);
-  await assertSameCommunity(me, communityId);
-  if (!meterId || !readingId) throw new HttpsError("invalid-argument", "Brak meterId/readingId.");
-
-  const meterSnap = await db.doc(`communities/${communityId}/meters/${meterId}`).get();
-  const readingSnap = await db.doc(`communities/${communityId}/meterReadings/${readingId}`).get();
-  if (!meterSnap.exists || !readingSnap.exists) throw new HttpsError("not-found", "Brak licznika lub odczytu.");
-
-  const meter = meterSnap.data();
-  const reading = readingSnap.data();
-
-  const prevSnap = await db.collection(`communities/${communityId}/meterReadings`)
-    .where("meterId", "==", meterId)
-    .where("date", "<", reading.date)
-    .orderBy("date", "desc")
-    .limit(1)
-    .get();
-
-  const prevValue = prevSnap.empty ? 0 : Number(prevSnap.docs[0].data().value || 0);
-  const currentValue = Number(reading.value || 0);
-
-  return await exports.aiMeterAnomaly.run({
-    auth: request.auth,
-    data: {
-      communityId,
-      currentValue,
-      prevValue,
-      meterType: meter.type || "",
-      unit: meter.unit || "",
-      flatLabel: meter.flatLabel || ""
-    }
-  });
-});
-
-// =========================================================
-// REVIEW EXPLAIN
-// =========================================================
-
-exports.aiExplainReview = onCall(async (request) => {
-  const me = await assertStaff(request);
-  const communityId = safeString(request.data?.communityId || me.communityId);
-  const reviewId = safeString(request.data?.reviewId);
-  await assertSameCommunity(me, communityId);
-  if (!reviewId) throw new HttpsError("invalid-argument", "Brak reviewId.");
-
-  const snap = await db.doc(`communities/${communityId}/reviewQueue/${reviewId}`).get();
-  if (!snap.exists) throw new HttpsError("not-found", "Review item nie istnieje.");
-
-  const item = snap.data();
-  const explanation = await aiExplainReview(item) || {
-    summary: "Sprawa wymaga weryfikacji ręcznej.",
-    reason: item.reason || "Brak wysokiej pewności systemu.",
-    recommendedChecks: ["Sprawdź dane źródłowe", "Porównaj z lokalem i kwotą"]
-  };
-
-  await snap.ref.set({
-    aiExplanation: explanation,
-    aiExplainedAtMs: nowMs()
-  }, { merge: true });
-
-  return { ok: true, explanation };
-});
-
-
-// =========================================================
-// OWNER PANEL CALLABLES
-// =========================================================
-
-exports.disableActivationCode = onCall(async (request) => {
-  assertOwner(request);
-  const code = safeString(request.data?.code).toUpperCase();
-  if (!code) throw new HttpsError("invalid-argument", "Brak kodu.");
-
-  const ref = db.doc(`activation_codes/${code}`);
-  const snap = await ref.get();
-  if (!snap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
-
-  await ref.set({
-    disabled: true,
-    status: "DISABLED",
-    updatedAtMs: nowMs(),
-    disabledAtMs: nowMs(),
-    disabledByUid: request.auth.uid,
-  }, { merge: true });
-
-  return { ok: true };
-});
-
-exports.setCommunityBlocked = onCall(async (request) => {
-  assertOwner(request);
-  const communityId = safeString(request.data?.communityId);
-  const blocked = request.data?.blocked === true;
-  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
-
-  const ref = db.doc(`communities/${communityId}`);
-  const snap = await ref.get();
-  if (!snap.exists) throw new HttpsError("not-found", "Wspólnota nie istnieje.");
-
-  await ref.set({
-    blocked,
-    updatedAtMs: nowMs(),
-    blockedAtMs: blocked ? nowMs() : admin.firestore.FieldValue.delete(),
-    blockedByUid: blocked ? request.auth.uid : admin.firestore.FieldValue.delete(),
-  }, { merge: true });
-
-  return { ok: true, communityId, blocked };
-});
-
-exports.setCommunityPanelAccess = onCall(async (request) => {
-  assertOwner(request);
-  const communityId = safeString(request.data?.communityId);
-  const enabled = request.data?.enabled === true;
-  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
-
-  const ref = db.doc(`communities/${communityId}`);
-  const snap = await ref.get();
-  if (!snap.exists) throw new HttpsError("not-found", "Wspólnota nie istnieje.");
-
-  await ref.set({
-    panelAccessEnabled: enabled,
-    updatedAtMs: nowMs(),
-  }, { merge: true });
-
-  return { ok: true, communityId, enabled };
-});
-
-exports.approveSeatRequest = onCall(async (request) => {
-  assertOwner(request);
-  const requestId = safeString(request.data?.requestId);
-  const communityId = safeString(request.data?.communityId);
-  const deltaSeats = Number(request.data?.deltaSeats || 0);
-  if (!requestId || !communityId) throw new HttpsError("invalid-argument", "Brak requestId lub communityId.");
-  if (!Number.isFinite(deltaSeats) || deltaSeats === 0) {
-    throw new HttpsError("invalid-argument", "deltaSeats musi być różne od 0.");
-  }
-
-  const reqRef = db.doc(`seat_requests/${requestId}`);
-  const commRef = db.doc(`communities/${communityId}`);
-  const now = nowMs();
-
-  return await db.runTransaction(async (tx) => {
-    const [reqSnap, commSnap] = await Promise.all([tx.get(reqRef), tx.get(commRef)]);
-    if (!reqSnap.exists) throw new HttpsError("not-found", "Wniosek nie istnieje.");
-    if (!commSnap.exists) throw new HttpsError("not-found", "Wspólnota nie istnieje.");
-
-    const req = reqSnap.data() || {};
-    const reqCommunityId = safeString(req.communityId);
-    if (reqCommunityId && reqCommunityId !== communityId) {
-      throw new HttpsError("failed-precondition", "Wniosek dotyczy innej wspólnoty.");
-    }
-    const status = String(req.status || "PENDING").toUpperCase();
-    if (status !== "PENDING") {
-      throw new HttpsError("failed-precondition", "Wniosek został już przetworzony.");
-    }
-
-    const current = Number(commSnap.data()?.seatsTotal || 0);
-    const updated = Math.max(0, current + deltaSeats);
-    tx.set(commRef, {
-      seatsTotal: updated,
-      updatedAtMs: now,
-    }, { merge: true });
-
-    if (deltaSeats > 0) {
-      const purchaseRef = commRef.collection("seat_purchases").doc();
-      tx.set(purchaseRef, {
-        seats: deltaSeats,
-        purchasedAtMs: now,
-        validUntilMs: now + 365 * 24 * 60 * 60 * 1000,
-        blocked: false,
-        createdAtMs: now,
-        updatedAtMs: now,
-        createdByUid: request.auth.uid,
-        source: "OWNER_APPROVAL",
-        sourceRequestId: requestId,
-      });
-    }
-
-    tx.set(reqRef, {
-      status: "APPROVED",
-      processedAtMs: now,
-      processedByUid: request.auth.uid,
-      approvedDeltaSeats: deltaSeats,
-      updatedAtMs: now,
-    }, { merge: true });
-
-    return { ok: true, communityId, requestId, seatsTotal: updated };
-  });
-});
-
-exports.rejectSeatRequest = onCall(async (request) => {
-  assertOwner(request);
-  const requestId = safeString(request.data?.requestId);
-  if (!requestId) throw new HttpsError("invalid-argument", "Brak requestId.");
-
-  const reqRef = db.doc(`seat_requests/${requestId}`);
-  const snap = await reqRef.get();
-  if (!snap.exists) throw new HttpsError("not-found", "Wniosek nie istnieje.");
-  const status = String(snap.data()?.status || "PENDING").toUpperCase();
-  if (status !== "PENDING") {
-    throw new HttpsError("failed-precondition", "Wniosek został już przetworzony.");
-  }
-
-  await reqRef.set({
-    status: "REJECTED",
-    processedAtMs: nowMs(),
-    processedByUid: request.auth.uid,
-    updatedAtMs: nowMs(),
-  }, { merge: true });
-
-  return { ok: true, requestId };
-});
-
-exports.deleteCommunity = onCall(async (request) => {
-  assertOwner(request);
-  const communityId = safeString(request.data?.communityId);
-  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
-
-  const ref = db.doc(`communities/${communityId}`);
-  const snap = await ref.get();
-  if (!snap.exists) throw new HttpsError("not-found", "Wspólnota nie istnieje.");
-
-  await ref.delete();
-  return { ok: true, communityId };
-});
-
-exports.extendPurchaseByYear = onCall(async (request) => {
-  assertOwner(request);
-  const communityId = safeString(request.data?.communityId);
-  const purchaseId = safeString(request.data?.purchaseId);
-  if (!communityId || !purchaseId) throw new HttpsError("invalid-argument", "Brak communityId lub purchaseId.");
-
-  const ref = db.doc(`communities/${communityId}/seat_purchases/${purchaseId}`);
-  const now = nowMs();
-  return await db.runTransaction(async (tx) => {
-    const snap = await tx.get(ref);
-    if (!snap.exists) throw new HttpsError("not-found", "Zakup nie istnieje.");
-    const current = Number(snap.data()?.validUntilMs || 0);
-    const base = Math.max(current, now);
-    const validUntilMs = base + 365 * 24 * 60 * 60 * 1000;
-    tx.set(ref, { validUntilMs, updatedAtMs: now }, { merge: true });
-    return { ok: true, communityId, purchaseId, validUntilMs };
-  });
-});
-
-exports.setPurchaseBlocked = onCall(async (request) => {
-  assertOwner(request);
-  const communityId = safeString(request.data?.communityId);
-  const purchaseId = safeString(request.data?.purchaseId);
-  const blocked = request.data?.blocked === true;
-  if (!communityId || !purchaseId) throw new HttpsError("invalid-argument", "Brak communityId lub purchaseId.");
-
-  const ref = db.doc(`communities/${communityId}/seat_purchases/${purchaseId}`);
-  const snap = await ref.get();
-  if (!snap.exists) throw new HttpsError("not-found", "Zakup nie istnieje.");
-
-  await ref.set({ blocked, updatedAtMs: nowMs() }, { merge: true });
-  return { ok: true, communityId, purchaseId, blocked };
-});
-// =========================================================
-// APP / WEBPANEL / OWNER COMPATIBILITY LAYER
-// Overrides selected callables with a superset implementation so
-// owner_generator can be deployed without breaking E-Lokator app
-// and webpanel flows that share the same Firebase project.
-// =========================================================
-
-function compatSafeText(v, fallback = "") {
-  return String(v == null ? fallback : v).trim();
-}
-
-function compatRequireAuth(request) {
+function requireAuth(request) {
   if (!request.auth || !request.auth.uid) {
     throw new HttpsError("unauthenticated", "Zaloguj się.");
   }
   return request.auth.uid;
 }
 
-async function compatGetMyProfile(uid) {
-  return await getMe(uid);
+async function getMyProfile(uid) {
+  const snap = await db.doc(`users/${uid}`).get();
+  return snap.exists ? snap.data() : null;
 }
 
-async function compatRequireCommunityStaff(request, communityId) {
-  const profile = await assertSignedIn(request);
-  const uid = compatRequireAuth(request);
+async function requireCommunityStaff(request, communityId) {
+  const uid = requireAuth(request);
+  const profile = await getMyProfile(uid);
   const role = String(profile?.role || "");
   const ok = ["MASTER", "ADMIN", "ACCOUNTANT"].includes(role) && String(profile?.communityId || "") === String(communityId || "");
   if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień do tej wspólnoty.");
-  return { uid, profile, role };
+  return { uid, profile };
 }
 
-async function compatRequireCommunityRole(request, communityId, allowedRoles) {
-  const profile = await assertSignedIn(request);
-  const uid = compatRequireAuth(request);
-  const role = String(profile?.role || "");
-  const ok = Array.isArray(allowedRoles) && allowedRoles.includes(role) && String(profile?.communityId || "") === String(communityId || "");
-  if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień do tej operacji.");
-  return { uid, profile, role };
+async function getCommunity(communityId) {
+  if (!safeText(communityId)) return null;
+  const snap = await db.doc(`communities/${communityId}`).get();
+  return snap.exists ? snap.data() : null;
 }
 
-async function compatAssertPanelAccessEnabled(communityId) {
+async function assertPanelAccessEnabled(communityId) {
   const community = await getCommunity(communityId);
   if (!community || community.panelAccessEnabled !== true) {
     throw new HttpsError("permission-denied", "Panel nie jest aktywny dla tej wspólnoty.");
@@ -2822,77 +57,27 @@ async function compatAssertPanelAccessEnabled(communityId) {
   return community;
 }
 
-function compatSanitizeEmail(email) {
-  const e = compatSafeText(email).toLowerCase();
-  return e.includes("@") ? e : "";
+
+async function requireCommunityRole(request, communityId, allowedRoles) {
+  const uid = requireAuth(request);
+  const profile = await getMyProfile(uid);
+  const role = String(profile?.role || "");
+  const ok = Array.isArray(allowedRoles) && allowedRoles.includes(role) && String(profile?.communityId || "") === String(communityId || "");
+  if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień do tej operacji.");
+  return { uid, profile, role };
 }
 
-function compatNormalizeFlatPart(value) {
-  return compatSafeText(value)
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, "")
-    .replace(/[^a-z0-9_-]/g, "");
-}
-
-function compatBuildFlatKey(communityId, street, buildingNo, apartmentNo) {
-  const parts = [communityId, street, buildingNo, apartmentNo].map(compatNormalizeFlatPart).filter(Boolean);
-  return parts.join("|");
-}
-
-function compatMakeFlatLabel(street, buildingNo, apartmentNo) {
-  const base = [compatSafeText(street), compatSafeText(buildingNo)].filter(Boolean).join(" ");
-  const apt = compatSafeText(apartmentNo);
-  return apt ? `${base}/${apt}`.trim() : base;
-}
-
-async function compatGetResidentTokensForFlat(communityId, flatId) {
-  if (!communityId || !flatId) return [];
-  const snap = await db.collection("users")
-    .where("communityId", "==", communityId)
-    .where("flatId", "==", flatId)
-    .where("role", "==", "RESIDENT")
-    .get();
-  return snap.docs.map((d) => d.data().fcmToken).filter(Boolean);
-}
-
-async function compatFindFlatByKeyOrAddress(communityId, { flatId = "", flatKey = "", street = "", buildingNo = "", apartmentNo = "" } = {}) {
+async function upsertFlatWithSeat({ communityId, flatId = "", staircaseId = "", streetId = "", street = "", buildingNo = "", apartmentNo = "", flatLabel = "", flatKey = "", residentUid = null, extra = {}, payer = null }) {
+  if (!safeText(communityId)) throw new HttpsError("invalid-argument", "Brak communityId.");
+  if (!safeText(apartmentNo)) throw new HttpsError("invalid-argument", "Brak numeru lokalu.");
   const flatsCol = db.collection("communities").doc(communityId).collection("flats");
-  if (compatSafeText(flatId)) {
-    const snap = await flatsCol.doc(compatSafeText(flatId)).get();
-    if (snap.exists) return snap;
-  }
-  const normalizedKey = compatSafeText(flatKey) || compatBuildFlatKey(communityId, street, buildingNo, apartmentNo);
-  if (normalizedKey) {
-    const byKey = await flatsCol.where("flatKey", "==", normalizedKey).limit(1).get();
-    if (!byKey.empty) return byKey.docs[0];
-  }
-  if (compatSafeText(street) && compatSafeText(buildingNo) && compatSafeText(apartmentNo)) {
-    const byAddress = await flatsCol
-      .where("street", "==", compatSafeText(street))
-      .where("buildingNo", "==", compatSafeText(buildingNo))
-      .where("apartmentNo", "==", compatSafeText(apartmentNo))
-      .limit(1)
-      .get();
-    if (!byAddress.empty) return byAddress.docs[0];
-  }
-  return null;
-}
-
-async function compatUpsertFlatWithSeat({ communityId, flatId = "", staircaseId = "", streetId = "", street = "", buildingNo = "", apartmentNo = "", flatLabel = "", flatKey = "", residentUid = null, extra = {}, payer = null }) {
-  if (!compatSafeText(communityId)) throw new HttpsError("invalid-argument", "Brak communityId.");
-  if (!compatSafeText(apartmentNo)) throw new HttpsError("invalid-argument", "Brak numeru lokalu.");
-
-  const flatsCol = db.collection("communities").doc(communityId).collection("flats");
-  const normalizedStreet = compatSafeText(street);
-  const normalizedBuilding = compatSafeText(buildingNo);
-  const normalizedApartment = compatSafeText(apartmentNo);
-  const computedKey = compatSafeText(flatKey) || compatBuildFlatKey(communityId, normalizedStreet, normalizedBuilding, normalizedApartment);
-
+  const normalizedStreet = safeText(street);
+  const normalizedBuilding = safeText(buildingNo);
+  const normalizedApartment = safeText(apartmentNo);
+  const computedKey = safeText(flatKey) || buildFlatKey(communityId, normalizedStreet, normalizedBuilding, normalizedApartment);
   let existing = null;
-  if (compatSafeText(flatId)) {
-    const byId = await flatsCol.doc(compatSafeText(flatId)).get();
+  if (safeText(flatId)) {
+    const byId = await flatsCol.doc(safeText(flatId)).get();
     if (byId.exists) existing = byId;
   }
   if (!existing && computedKey) {
@@ -2909,89 +94,64 @@ async function compatUpsertFlatWithSeat({ communityId, flatId = "", staircaseId 
     if (!byAddress.empty) existing = byAddress.docs[0];
   }
 
-  const targetRef = existing ? existing.ref : (compatSafeText(flatId) ? flatsCol.doc(compatSafeText(flatId)) : flatsCol.doc());
-  const payerRef = db.doc(`communities/${communityId}/payers/${targetRef.id}`);
-  const communityRef = db.doc(`communities/${communityId}`);
+  const targetRef = existing ? existing.ref : (safeText(flatId) ? flatsCol.doc(safeText(flatId)) : flatsCol.doc());
   const now = nowMs();
+  const communityRef = db.doc(`communities/${communityId}`);
+  const payerRef = db.doc(`communities/${communityId}/payers/${targetRef.id}`);
 
-  return await db.runTransaction(async (tx) => {
+  return db.runTransaction(async (tx) => {
     const communitySnap = await tx.get(communityRef);
     if (!communitySnap.exists) throw new HttpsError("not-found", "Wspólnota nie istnieje.");
-
     const targetSnap = await tx.get(targetRef);
     const exists = targetSnap.exists;
-    const current = exists ? (targetSnap.data() || {}) : {};
+    const current = exists ? targetSnap.data() : {};
     const payerSnap = payer ? await tx.get(payerRef) : null;
-
     if (!exists) {
       const seatsTotal = Number(communitySnap.get("seatsTotal") || 0);
       const seatsUsed = Number(communitySnap.get("seatsUsed") || 0);
-      if (seatsTotal > 0 && seatsUsed >= seatsTotal) {
+      if (seatsUsed >= seatsTotal) {
         throw new HttpsError("failed-precondition", "Brak wolnych seats. Dokup i zatwierdź seats w generatorze ownera.");
       }
       tx.set(communityRef, { seatsUsed: seatsUsed + 1, updatedAtMs: now }, { merge: true });
     }
 
-    const mergedStreet = compatSafeText(normalizedStreet || current.street);
-    const mergedBuilding = compatSafeText(normalizedBuilding || current.buildingNo);
-    const mergedApartment = compatSafeText(normalizedApartment || current.apartmentNo || current.flatNumber);
-    const finalKey = compatSafeText(computedKey || current.flatKey || compatBuildFlatKey(communityId, mergedStreet, mergedBuilding, mergedApartment));
-    const finalLabel = compatSafeText(flatLabel || current.flatLabel || compatMakeFlatLabel(mergedStreet, mergedBuilding, mergedApartment) || mergedApartment);
-    const finalStreetId = compatSafeText(streetId || payer?.streetId || current.streetId || (mergedStreet ? normalizeStreetName(mergedStreet) : ""));
+    const mergedStreet = safeText(normalizedStreet || current.street);
+    const mergedBuilding = safeText(normalizedBuilding || current.buildingNo);
+    const mergedApartment = safeText(normalizedApartment || current.apartmentNo || current.flatNumber);
+    const finalKey = safeText(computedKey || current.flatKey || buildFlatKey(communityId, mergedStreet, mergedBuilding, mergedApartment));
+    const finalLabel = safeText(flatLabel || current.flatLabel || makeFlatLabel(mergedStreet, mergedBuilding, mergedApartment) || mergedApartment);
 
-    tx.set(targetRef, {
+    const payload = {
       communityId,
-      staircaseId: compatSafeText(staircaseId || current.staircaseId),
-      streetId: finalStreetId,
+      staircaseId: safeText(staircaseId || current.staircaseId),
+      streetId: safeText(streetId || current.streetId),
       street: mergedStreet,
       buildingNo: mergedBuilding,
       apartmentNo: mergedApartment,
-      flatNumber: compatSafeText(extra.flatNumber || mergedApartment || current.flatNumber),
+      flatNumber: safeText(extra.flatNumber || mergedApartment || current.flatNumber),
       flatLabel: finalLabel,
       flatKey: finalKey,
       residentUid: residentUid === null ? (current.residentUid || null) : residentUid,
       updatedAtMs: now,
       createdAtMs: Number(current.createdAtMs || now),
       ...extra,
-    }, { merge: true });
-
-    if (mergedStreet) {
-      const streetRef = db.doc(`communities/${communityId}/streets/${finalStreetId || normalizeStreetName(mergedStreet)}`);
-      const assignmentRef = db.doc(`communities/${communityId}/streetAssignments/${finalStreetId || normalizeStreetName(mergedStreet)}`);
-      tx.set(streetRef, {
-        id: finalStreetId || normalizeStreetName(mergedStreet),
-        communityId,
-        name: mergedStreet,
-        normalizedName: normalizeStreetName(mergedStreet),
-        isActive: true,
-        updatedAtMs: now,
-        createdAtMs: Number(current.createdAtMs || now),
-      }, { merge: true });
-      tx.set(assignmentRef, {
-        id: finalStreetId || normalizeStreetName(mergedStreet),
-        communityId,
-        name: mergedStreet,
-        street: mergedStreet,
-        isActive: true,
-        updatedAtMs: now,
-      }, { merge: true });
-    }
+    };
+    tx.set(targetRef, payload, { merge: true });
 
     if (payer) {
       tx.set(payerRef, {
         flatId: targetRef.id,
         communityId,
-        streetId: finalStreetId,
+        streetId: safeText(streetId || payer.streetId || current.streetId),
         street: mergedStreet,
         buildingNo: mergedBuilding,
         apartmentNo: mergedApartment,
         flatLabel: finalLabel,
         flatKey: finalKey,
-        name: compatSafeText(payer.name),
-        surname: compatSafeText(payer.surname),
-        displayName: [compatSafeText(payer.name), compatSafeText(payer.surname)].filter(Boolean).join(" "),
-        email: compatSafeText(payer.email),
-        phone: compatSafeText(payer.phone),
+        name: safeText(payer.name),
+        surname: safeText(payer.surname),
+        email: safeText(payer.email),
+        phone: safeText(payer.phone),
         mailOnly: !!payer.mailOnly,
         updatedAtMs: now,
         createdAtMs: Number(payerSnap?.data()?.createdAtMs || now),
@@ -3007,8 +167,108 @@ async function compatUpsertFlatWithSeat({ communityId, flatId = "", staircaseId 
   });
 }
 
-async function compatClaimOrCreateFlatForResident({ communityId, uid, flatId = "", flatKey = "", street = "", buildingNo = "", apartmentNo = "", flatLabel = "", staircaseId = "" }) {
-  const result = await compatUpsertFlatWithSeat({
+function assertOwner(request) {
+  const uid = requireAuth(request);
+  const token = request.auth.token || {};
+  const email = String(token.email || "");
+  const ok = token.owner === true || OWNER_UIDS.includes(uid) || OWNER_EMAILS.includes(email);
+  if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień Ownera.");
+}
+
+function randomCode(len = 10) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) out += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
+  return out;
+}
+
+function safeText(v, fallback = "") {
+  return String(v == null ? fallback : v).trim();
+}
+
+function parsePeriod(input) {
+  const raw = safeText(input);
+  if (/^\d{4}-\d{2}$/.test(raw)) return raw;
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function periodToDueDateMs(period) {
+  if (!/^\d{4}-\d{2}$/.test(period)) return 0;
+  const [year, month] = period.split("-").map(Number);
+  return Date.UTC(year, month - 1, 15, 12, 0, 0, 0);
+}
+
+function monthTitle(period) {
+  const names = ["Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec", "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"];
+  if (!/^\d{4}-\d{2}$/.test(period)) return period || "Rozliczenie";
+  const [y, m] = period.split("-");
+  return `${names[Number(m) - 1] || period} ${y}`;
+}
+
+function parseAmountToCents(value) {
+  if (typeof value === "number") return Math.round(value * 100);
+  const txt = safeText(value).replace(/\s/g, "").replace(/,/g, ".").replace(/[^0-9.-]/g, "");
+  const num = Number(txt);
+  return Number.isFinite(num) ? Math.round(num * 100) : 0;
+}
+
+function paymentCodeFromText(text) {
+  const m = safeText(text).match(/EL-(\d+)/i);
+  return m ? m[1] : null;
+}
+
+function sanitizeEmail(email) {
+  const e = safeText(email).toLowerCase();
+  return e.includes("@") ? e : "";
+}
+
+
+function normalizeFlatPart(value) {
+  return safeText(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9_-]/g, "");
+}
+
+function buildFlatKey(communityId, street, buildingNo, apartmentNo) {
+  const parts = [communityId, street, buildingNo, apartmentNo].map(normalizeFlatPart).filter(Boolean);
+  return parts.join("|");
+}
+
+function makeFlatLabel(street, buildingNo, apartmentNo) {
+  const base = [safeText(street), safeText(buildingNo)].filter(Boolean).join(" ");
+  const apt = safeText(apartmentNo);
+  return apt ? `${base}/${apt}`.trim() : base;
+}
+
+async function findFlatByKeyOrAddress(communityId, { flatId = "", flatKey = "", street = "", buildingNo = "", apartmentNo = "" } = {}) {
+  const flatsCol = db.collection("communities").doc(communityId).collection("flats");
+  if (safeText(flatId)) {
+    const snap = await flatsCol.doc(safeText(flatId)).get();
+    if (snap.exists) return snap;
+  }
+  const normalizedKey = safeText(flatKey) || buildFlatKey(communityId, street, buildingNo, apartmentNo);
+  if (normalizedKey) {
+    const byKey = await flatsCol.where("flatKey", "==", normalizedKey).limit(1).get();
+    if (!byKey.empty) return byKey.docs[0];
+  }
+  if (safeText(street) && safeText(buildingNo) && safeText(apartmentNo)) {
+    const byAddress = await flatsCol
+      .where("street", "==", safeText(street))
+      .where("buildingNo", "==", safeText(buildingNo))
+      .where("apartmentNo", "==", safeText(apartmentNo))
+      .limit(1)
+      .get();
+    if (!byAddress.empty) return byAddress.docs[0];
+  }
+  return null;
+}
+
+async function claimOrCreateFlatForResident({ communityId, uid, flatId = "", flatKey = "", street = "", buildingNo = "", apartmentNo = "", flatLabel = "", staircaseId = "" }) {
+  const result = await upsertFlatWithSeat({
     communityId,
     flatId,
     staircaseId,
@@ -3023,65 +283,184 @@ async function compatClaimOrCreateFlatForResident({ communityId, uid, flatId = "
   const snap = await targetRef.get();
   const data = snap.data() || {};
   await targetRef.set({
-    occupantsUids: admin.firestore.FieldValue.arrayUnion(uid),
+    occupantsUids: FieldValue.arrayUnion(uid),
     status: "ACTIVE",
     updatedAtMs: nowMs(),
   }, { merge: true });
   return {
     flatId: targetRef.id,
-    flatLabel: compatSafeText(data.flatLabel),
-    street: compatSafeText(data.street),
-    buildingNo: compatSafeText(data.buildingNo),
-    apartmentNo: compatSafeText(data.apartmentNo),
-    staircaseId: compatSafeText(data.staircaseId),
-    flatKey: compatSafeText(data.flatKey),
+    flatLabel: safeText(data.flatLabel),
+    street: safeText(data.street),
+    buildingNo: safeText(data.buildingNo),
+    apartmentNo: safeText(data.apartmentNo),
+    staircaseId: safeText(data.staircaseId),
+    flatKey: safeText(data.flatKey),
     residentUid: uid,
   };
 }
 
-function compatParsePeriod(input) {
-  const raw = compatSafeText(input);
-  if (/^\d{4}-\d{2}$/.test(raw)) return raw;
-  const d = new Date();
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+function normalizeCategory(input) {
+  const txt = safeText(input).toUpperCase();
+  if (!txt) return "INNE";
+  const map = {
+    ENERGIA: "PRAD",
+    PRĄD: "PRAD",
+    PRAD: "PRAD",
+    WODA: "WODA",
+    GAZ: "GAZ",
+    CIEPLO: "CIEPLO",
+    CIEPŁO: "CIEPLO",
+    REMONT: "REMONT",
+    SPRZATANIE: "SPRZATANIE",
+    SPRZĄTANIE: "SPRZATANIE",
+  };
+  return map[txt] || txt;
 }
 
-function compatPeriodToDueDateMs(period) {
-  if (!/^\d{4}-\d{2}$/.test(period)) return 0;
-  const [year, month] = period.split("-").map(Number);
-  return Date.UTC(year, month - 1, 15, 12, 0, 0, 0);
+async function getInvoiceRules(communityId) {
+  const snap = await db.collection("communities").doc(communityId).collection("invoiceRules").get();
+  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 }
 
-function compatMonthTitle(period) {
-  const names = ["Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec", "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"];
-  if (!/^\d{4}-\d{2}$/.test(period)) return period || "Rozliczenie";
-  const [y, m] = period.split("-");
-  return `${names[Number(m) - 1] || period} ${y}`;
+async function findRuleMatch(communityId, invoice) {
+  const rules = await getInvoiceRules(communityId);
+  const source = `${safeText(invoice?.vendorName)} ${safeText(invoice?.title)} ${safeText(invoice?.description)}`.toUpperCase();
+  return rules.find((r) => {
+    const needle = safeText(r.match || r.vendor || r.keyword).toUpperCase();
+    return needle && source.includes(needle);
+  }) || null;
 }
 
-function compatParseAmountToCents(value) {
-  if (typeof value === "number") return Math.round(value * 100);
-  const txt = compatSafeText(value).replace(/\s/g, "").replace(/,/g, ".").replace(/[^0-9.-]/g, "");
-  const num = Number(txt);
-  return Number.isFinite(num) ? Math.round(num * 100) : 0;
+async function sumCollection(query) {
+  const snap = await query.get();
+  return snap.docs.reduce((acc, d) => acc + Number(d.get("amountCents") || 0), 0);
 }
 
-function compatPaymentCodeFromText(text) {
-  const m = compatSafeText(text).match(/EL-(\d+)/i);
-  return m ? m[1] : null;
+async function getSettlementData(communityId, flatId, period) {
+  const chargesQ = db.collection("communities").doc(communityId).collection("charges").where("flatId", "==", flatId).where("period", "==", period);
+  const paymentsQ = db.collection("communities").doc(communityId).collection("payments").where("flatId", "==", flatId).where("period", "==", period);
+  const [chargesSnap, paymentsSnap] = await Promise.all([chargesQ.get(), paymentsQ.get()]);
+  const charges = chargesSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  const payments = paymentsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  const chargesCents = charges.reduce((a, x) => a + Number(x.amountCents || 0), 0);
+  const paymentsCents = payments.reduce((a, x) => a + Number(x.amountCents || 0), 0);
+  return { charges, payments, chargesCents, paymentsCents, balanceCents: chargesCents - paymentsCents };
 }
 
-function compatNormalizeForMatch(value) {
-  return compatSafeText(value)
+function pdfEscape(text) {
+  return safeText(text).replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+
+function buildSimplePdf(lines) {
+  const contentLines = [];
+  let y = 790;
+  contentLines.push("BT");
+  contentLines.push("/F1 10 Tf");
+  for (const line of lines.slice(0, 55)) {
+    contentLines.push(`1 0 0 1 50 ${y} Tm (${pdfEscape(line).slice(0, 110)}) Tj`);
+    y -= 14;
+  }
+  contentLines.push("ET");
+  const stream = contentLines.join("\n");
+  const objects = [
+    "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
+    "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj",
+    "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj",
+    "4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj",
+    `5 0 obj << /Length ${Buffer.byteLength(stream, "utf8")} >> stream\n${stream}\nendstream endobj`,
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const obj of objects) {
+    offsets.push(Buffer.byteLength(pdf, "utf8"));
+    pdf += `${obj}\n`;
+  }
+  const xrefOffset = Buffer.byteLength(pdf, "utf8");
+  pdf += `xref\n0 ${objects.length + 1}\n`;
+  pdf += "0000000000 65535 f \n";
+  for (let i = 1; i < offsets.length; i++) {
+    pdf += `${String(offsets[i]).padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += `trailer << /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+  return Buffer.from(pdf, "utf8");
+}
+
+async function uploadSettlementPdf(communityId, settlementId, data) {
+  const lines = [
+    "e-Lokator — Rozliczenie",
+    `Okres: ${data.period}`,
+    `Lokal: ${data.flatId}`,
+    `Suma opłat: ${(data.chargesCents / 100).toFixed(2)} PLN`,
+    `Suma wpłat: ${(data.paymentsCents / 100).toFixed(2)} PLN`,
+    `Saldo: ${(data.balanceCents / 100).toFixed(2)} PLN`,
+    `Termin płatności: ${data.dueDate || "-"}`,
+    `Rachunek: ${data.accountNumber || "-"}`,
+    `Tytuł przelewu: ${data.transferTitle || "-"}`,
+    "",
+    "Opłaty:",
+    ...data.charges.map((x) => `- ${safeText(x.label || x.category)}: ${(Number(x.amountCents || 0) / 100).toFixed(2)} PLN`),
+    "",
+    "Wpłaty:",
+    ...data.payments.map((x) => `- ${safeText(x.title || x.source || "Wpłata")}: ${(Number(x.amountCents || 0) / 100).toFixed(2)} PLN`),
+  ];
+  const buffer = buildSimplePdf(lines);
+  const path = `communities/${communityId}/settlements/${settlementId}.pdf`;
+  const file = bucket.file(path);
+  await file.save(buffer, { contentType: "application/pdf", resumable: false, metadata: { cacheControl: "public,max-age=3600" } });
+  const [url] = await file.getSignedUrl({ action: "read", expires: "2100-01-01" });
+  return { path, url };
+}
+
+async function refreshBalanceDoc(communityId, flatId) {
+  const chargesQ = db.collection("communities").doc(communityId).collection("charges").where("flatId", "==", flatId);
+  const paymentsQ = db.collection("communities").doc(communityId).collection("payments").where("flatId", "==", flatId);
+  const [chargesCents, paymentsCents] = await Promise.all([sumCollection(chargesQ), sumCollection(paymentsQ)]);
+  const balanceCents = chargesCents - paymentsCents;
+  await db.collection("communities").doc(communityId).collection("balances").doc(flatId).set({
+    flatId,
+    chargesCents,
+    paymentsCents,
+    balanceCents,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  return { chargesCents, paymentsCents, balanceCents };
+}
+
+async function getCommunityAdmins(communityId) {
+  const snap = await db.collection("users")
+    .where("communityId", "==", communityId)
+    .where("role", "in", ["ADMIN", "MASTER"])
+    .get();
+  return snap.docs.map((d) => d.data().fcmToken).filter(Boolean);
+}
+
+async function getUserToken(uid) {
+  if (!uid) return null;
+  const snap = await db.doc(`users/${uid}`).get();
+  return snap.exists ? snap.data().fcmToken : null;
+}
+
+async function getResidentTokensForFlat(communityId, flatId) {
+  if (!communityId || !flatId) return [];
+  const snap = await db.collection("users")
+    .where("communityId", "==", communityId)
+    .where("flatId", "==", flatId)
+    .where("role", "==", "RESIDENT")
+    .get();
+  return snap.docs.map((d) => d.data().fcmToken).filter(Boolean);
+}
+
+function normalizeForMatch(value) {
+  return safeText(value)
     .toUpperCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^A-Z0-9]+/g, " ")
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Z0-9]+/g, ' ')
     .trim();
 }
 
-function compatExtractFlatHints(text) {
-  const src = compatNormalizeForMatch(text);
+function extractFlatHints(text) {
+  const src = normalizeForMatch(text);
   const hints = new Set();
   if (!src) return [];
   const patterns = [
@@ -3091,19 +470,19 @@ function compatExtractFlatHints(text) {
   patterns.forEach((re) => {
     let m;
     while ((m = re.exec(src)) !== null) {
-      const v = compatSafeText(m[1]).toUpperCase();
+      const v = safeText(m[1]).toUpperCase();
       if (v) hints.add(v);
     }
   });
   return [...hints];
 }
 
-function compatScorePaymentToFlat(rowText, flat, amountCents) {
-  const hay = compatNormalizeForMatch(rowText);
+function scorePaymentToFlat(rowText, flat, amountCents) {
+  const hay = normalizeForMatch(rowText);
   if (!hay) return 0;
   let score = 0;
   const addIfContains = (val, pts) => {
-    const token = compatNormalizeForMatch(val);
+    const token = normalizeForMatch(val);
     if (token && hay.includes(token)) score += pts;
   };
   addIfContains(flat.flatNumber, 70);
@@ -3118,8 +497,8 @@ function compatScorePaymentToFlat(rowText, flat, amountCents) {
   if (Array.isArray(flat.aliases)) {
     flat.aliases.forEach((x) => addIfContains(x, 25));
   }
-  const hints = compatExtractFlatHints(rowText);
-  if (hints.some((x) => [flat.flatNumber, flat.apartmentNo, flat.localNumber].map((v) => compatSafeText(v).toUpperCase()).includes(x))) {
+  const hints = extractFlatHints(rowText);
+  if (hints.some((x) => [flat.flatNumber, flat.apartmentNo, flat.localNumber].map((v) => safeText(v).toUpperCase()).includes(x))) {
     score += 45;
   }
   if (amountCents > 0 && Number(flat.lastKnownBalanceCents || 0) > 0) {
@@ -3129,353 +508,435 @@ function compatScorePaymentToFlat(rowText, flat, amountCents) {
   return score;
 }
 
-async function compatFuzzyFindFlatForPayment(communityId, row) {
-  const title = compatSafeText(row.title || row.description || row.tytul || row.tytuł || row.opis);
-  const source = compatSafeText(row.source || row.bank || row.konto);
-  const code = compatSafeText(row.code);
+async function fuzzyFindFlatForPayment(communityId, row) {
+  const title = safeText(row.title || row.description || row.tytul || row.tytuł || row.opis);
+  const source = safeText(row.source || row.bank || row.konto);
+  const code = safeText(row.code);
   const rowText = `${title} ${source} ${code}`;
-  const amountCents = compatParseAmountToCents(row.amount ?? row.kwota);
-  const flatsSnap = await db.collection("communities").doc(communityId).collection("flats").get();
+  const amountCents = parseAmountToCents(row.amount ?? row.kwota);
+  const flatsSnap = await db.collection('communities').doc(communityId).collection('flats').get();
   let best = null;
   for (const doc of flatsSnap.docs) {
     const data = doc.data() || {};
-    const score = compatScorePaymentToFlat(rowText, data, amountCents);
+    const score = scorePaymentToFlat(rowText, data, amountCents);
     if (!best || score > best.score) best = { doc, score };
   }
   return best && best.score >= 70 ? best.doc : null;
 }
 
-async function compatSumCollection(query) {
-  const snap = await query.get();
-  return snap.docs.reduce((acc, d) => acc + Number(d.get("amountCents") || 0), 0);
+async function sendToToken(token, type, title, body, extraData = {}) {
+  if (!token) return;
+  await admin.messaging().send({ token, data: { type, title, body, ...Object.fromEntries(Object.entries(extraData).map(([k, v]) => [k, String(v)])) }, android: { priority: "high" } }).catch((e) => console.error("FCM error", e));
 }
 
-async function compatRefreshBalanceDoc(communityId, flatId) {
-  const chargesQ = db.collection("communities").doc(communityId).collection("charges").where("flatId", "==", flatId);
-  const paymentsQ = db.collection("communities").doc(communityId).collection("payments").where("flatId", "==", flatId);
-  const [chargesCents, paymentsCents] = await Promise.all([compatSumCollection(chargesQ), compatSumCollection(paymentsQ)]);
-  const balanceCents = chargesCents - paymentsCents;
-  await db.collection("communities").doc(communityId).collection("balances").doc(flatId).set({
-    flatId,
-    chargesCents,
-    paymentsCents,
-    balanceCents,
-    updatedAtMs: nowMs(),
-  }, { merge: true });
-  return { chargesCents, paymentsCents, balanceCents };
+async function sendToTokens(tokens, type, title, body, extraData = {}) {
+  if (!tokens || !tokens.length) return;
+  await admin.messaging().sendEachForMulticast({ tokens, data: { type, title, body, ...Object.fromEntries(Object.entries(extraData).map(([k, v]) => [k, String(v)])) } }).catch((e) => console.error("FCM multicast error", e));
 }
+
+exports.onAnnouncementCreated = onDocumentCreated("communities/{communityId}/announcements/{announcementId}", async (event) => {
+  const data = event.data.data();
+  await admin.messaging().send({ topic: `community_${event.params.communityId}`, data: { type: "announcement_admin", title: "Ogłoszenie administracji", body: safeText(data.title), senderUid: safeText(data.createdByUid) } }).catch(() => null);
+});
+
+exports.onResidentAnnouncementCreated = onDocumentCreated("communities/{communityId}/residentAnnouncements/{announcementId}", async (event) => {
+  const data = event.data.data();
+  await admin.messaging().send({ topic: `community_${event.params.communityId}`, data: { type: "announcement_new", title: "Nowe ogłoszenie lokatorskie", body: safeText(data.title), senderUid: safeText(data.createdByUid) } }).catch(() => null);
+});
+
+exports.onChatMessageCreated = onDocumentCreated("communities/{communityId}/chatMessages/{messageId}", async (event) => {
+  const data = event.data.data();
+  await admin.messaging().send({ topic: `community_${event.params.communityId}`, data: { type: "community_chat", title: safeText(data.senderName, "Wiadomość"), body: safeText(data.text), senderUid: safeText(data.senderUid) } }).catch(() => null);
+});
+
+exports.onTicketCreated = onDocumentCreated("communities/{communityId}/tickets/{ticketId}", async (event) => {
+  const data = event.data.data();
+  const adminTokens = await getCommunityAdmins(event.params.communityId);
+  await sendToTokens(adminTokens, "ticket_new", "Nowa usterka", `${safeText(data.flatLabel)}: ${safeText(data.title)}`, { senderUid: safeText(data.createdByUid) });
+});
+
+exports.onTicketUpdated = onDocumentUpdated("communities/{communityId}/tickets/{ticketId}", async (event) => {
+  const after = event.data.after.data();
+  const before = event.data.before.data();
+  if (safeText(after.status) !== safeText(before.status)) {
+    const token = await getUserToken(after.createdByUid);
+    await sendToToken(token, "ticket_status", "Zmiana statusu usterki", `${safeText(after.title)}: ${safeText(after.status)}`, { senderUid: safeText(after.updatedByUid) });
+  }
+});
+
+exports.onVoteCreated = onDocumentCreated("communities/{communityId}/votes/{voteId}", async (event) => {
+  const data = event.data.data();
+  await admin.messaging().send({ topic: `community_${event.params.communityId}`, data: { type: "vote_new", title: "Nowe głosowanie", body: safeText(data.title), senderUid: safeText(data.createdByUid) } }).catch(() => null);
+});
+
+exports.onCorrespondenceMessageCreated = onDocumentCreated("communities/{communityId}/correspondence/{resUid}/messages/{msgId}", async (event) => {
+  const data = event.data.data();
+  const resUid = event.params.resUid;
+  if (safeText(data.senderUid) === safeText(resUid)) {
+    const adminTokens = await getCommunityAdmins(event.params.communityId);
+    await sendToTokens(adminTokens, "correspondence", "Wiadomość od lokatora", safeText(data.text), { senderUid: safeText(data.senderUid) });
+  } else {
+    const token = await getUserToken(resUid);
+    await sendToToken(token, "correspondence", "Wiadomość od administracji", safeText(data.text), { senderUid: safeText(data.senderUid) });
+  }
+});
+
+exports.onSettlementCreated = onDocumentCreated("communities/{communityId}/settlements/{settlementId}", async (event) => {
+  const data = event.data.data() || {};
+  const flatId = safeText(data.flatId);
+  const tokens = await getResidentTokensForFlat(event.params.communityId, flatId);
+  await sendToTokens(tokens, "due_created", "Nowe rozliczenie", safeText(data.title || `Rozliczenie za ${data.period || ''}`), {
+    settlementId: event.params.settlementId,
+    flatId,
+    period: safeText(data.period),
+  });
+});
+
+exports.onSettlementUpdated = onDocumentUpdated("communities/{communityId}/settlements/{settlementId}", async (event) => {
+  const before = event.data.before.data() || {};
+  const after = event.data.after.data() || {};
+  const changed = Number(before.balanceCents || 0) !== Number(after.balanceCents || 0) ||
+    Number(before.chargesCents || 0) !== Number(after.chargesCents || 0) ||
+    Number(before.paymentsCents || 0) !== Number(after.paymentsCents || 0) ||
+    safeText(before.pdfUrl) !== safeText(after.pdfUrl);
+  if (!changed) return;
+  const flatId = safeText(after.flatId);
+  const tokens = await getResidentTokensForFlat(event.params.communityId, flatId);
+  await sendToTokens(tokens, "due_created", "Aktualizacja rozliczenia", safeText(after.title || `Rozliczenie za ${after.period || ''}`), {
+    settlementId: event.params.settlementId,
+    flatId,
+    period: safeText(after.period),
+  });
+});
 
 exports.createActivationCode = onCall(async (request) => {
   assertOwner(request);
-  const data = request.data || {};
-  const name = compatSafeText(data.name || data.orgName);
-  const nip = compatSafeText(data.nip).replace(/\D/g, "");
-  const initialSeatsRaw = Number(data.initialSeats);
-  const initialSeats = Number.isFinite(initialSeatsRaw) ? Math.max(0, Math.floor(initialSeatsRaw)) : 0;
-
-  if (!name || nip.length !== 10) {
-    throw new HttpsError("invalid-argument", "Podaj nazwę i poprawny NIP.");
-  }
-
+  const name = safeText(request.data?.name || request.data?.orgName);
+  const nip = safeText(request.data?.nip).replace(/\D/g, "");
+  if (!name || nip.length !== 10) throw new HttpsError("invalid-argument", "Podaj nazwę i poprawny NIP.");
   for (let i = 0; i < 10; i++) {
     const code = randomCode(10);
     const ref = db.doc(`activation_codes/${code}`);
     try {
-      await ref.create({
-        code,
-        name,
-        nip,
-        initialSeats,
-        used: false,
-        status: "ACTIVE",
-        createdAtMs: nowMs(),
-        createdByUid: request.auth.uid,
-      });
+      await ref.create({ code, name, nip, used: false, status: "ACTIVE", createdAtMs: nowMs(), createdByUid: request.auth.uid });
       return { code, docPath: ref.path };
     } catch (e) {
       if (e.code !== 6) throw e;
     }
   }
-
   throw new HttpsError("resource-exhausted", "Błąd generowania kodu.");
 });
 
-exports.activateCommunity = onCall(async (request) => {
-  const uid = compatRequireAuth(request);
-  const code = compatSafeText(request.data?.code).toUpperCase();
-  const inputNip = compatSafeText(request.data?.nip).replace(/\D/g, "");
-  const inputName = compatSafeText(request.data?.name);
-  if (!code) throw new HttpsError("invalid-argument", "Brak kodu aktywacyjnego.");
-
-  const communityRef = db.collection("communities").doc();
-
-  return await db.runTransaction(async (tx) => {
-    const codeRef = db.doc(`activation_codes/${code}`);
-    const codeSnap = await tx.get(codeRef);
-    if (!codeSnap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
-
-    const codeData = codeSnap.data() || {};
-    if (codeData.used === true) throw new HttpsError("failed-precondition", "Kod już użyty.");
-    if (codeData.disabled === true || String(codeData.status || "").toUpperCase() === "DISABLED") {
-      throw new HttpsError("failed-precondition", "Kod aktywacyjny jest wyłączony.");
-    }
-
-    const name = inputName || compatSafeText(codeData.name);
-    const nip = inputNip || compatSafeText(codeData.nip).replace(/\D/g, "");
-    const initialSeatsRaw = Number(codeData.initialSeats);
-    const initialSeats = Number.isFinite(initialSeatsRaw) ? Math.max(0, Math.floor(initialSeatsRaw)) : 0;
-    const now = nowMs();
-
-    if (!name || nip.length !== 10) {
-      throw new HttpsError("invalid-argument", "Brak danych aktywacji.");
-    }
-
-    tx.set(communityRef, {
-      id: communityRef.id,
-      name,
-      nip,
-      createdAtMs: now,
-      updatedAtMs: now,
-      panelAccessEnabled: true,
-      enableExternalPayments: false,
-      paymentsUrl: "",
-      seatsTotal: initialSeats,
-      seatsUsed: 0,
-      panelSeatsUsed: 0,
-      appSeatsUsed: 0,
-      residentCount: 0,
-      usersCount: 0,
-      occupiedSeats: 0,
-    });
-
-    tx.set(db.doc(`users/${uid}`), {
-      role: "MASTER",
-      communityId: communityRef.id,
-      customerId: communityRef.id,
-      updatedAtMs: now,
-    }, { merge: true });
-
-    if (initialSeats > 0) {
-      const purchaseRef = communityRef.collection("seat_purchases").doc();
-      tx.set(purchaseRef, {
-        seats: initialSeats,
-        purchasedAtMs: now,
-        validUntilMs: now + 365 * 24 * 60 * 60 * 1000,
-        blocked: false,
-        createdAtMs: now,
-        updatedAtMs: now,
-        createdByUid: request.auth.uid,
-        source: "INITIAL_ACTIVATION",
-        sourceCode: code,
-      });
-    }
-
-    tx.set(codeRef, {
-      used: true,
-      usedAtMs: now,
-      communityId: communityRef.id,
-      activatedByUid: uid,
-      initialSeats,
-    }, { merge: true });
-
-    return { ok: true, communityId: communityRef.id, initialSeats };
-  });
-});
-
 exports.createInvite = onCall(async (request) => {
-  const uid = compatRequireAuth(request);
-  const me = await compatGetMyProfile(uid);
-  const communityId = compatSafeText(request.data?.communityId || me?.communityId);
-  const role = compatSafeText(request.data?.role || "RESIDENT");
+  const uid = requireAuth(request);
+  const me = await getMyProfile(uid);
+  const communityId = safeText(request.data?.communityId || me?.communityId);
+  const role = safeText(request.data?.role || "RESIDENT");
   const invite = {
-    customerId: compatSafeText(request.data?.customerId || me?.customerId || me?.communityId || communityId),
+    customerId: me?.customerId || me?.communityId || communityId,
     communityId,
     role,
     status: "active",
     createdAtMs: nowMs(),
     expiresAtMs: Number(request.data?.expiresAtMs || nowMs() + 7 * 24 * 3600 * 1000),
-    staircaseId: compatSafeText(request.data?.staircaseId),
-    flatId: compatSafeText(request.data?.flatId),
-    flatLabel: compatSafeText(request.data?.flatLabel),
-    street: compatSafeText(request.data?.street),
-    buildingNo: compatSafeText(request.data?.buildingNo),
-    apartmentNo: compatSafeText(request.data?.apartmentNo),
-    flatKey: compatSafeText(request.data?.flatKey) || compatBuildFlatKey(communityId, request.data?.street, request.data?.buildingNo, request.data?.apartmentNo),
-    adminFullName: compatSafeText(request.data?.adminFullName),
-    adminPhone: compatSafeText(request.data?.adminPhone),
-    senderName: compatSafeText(request.data?.senderName),
-    companyName: compatSafeText(request.data?.companyName),
-    nip: compatSafeText(request.data?.nip),
-    industry: compatSafeText(request.data?.industry),
+    staircaseId: safeText(request.data?.staircaseId),
+    flatId: safeText(request.data?.flatId),
+    flatLabel: safeText(request.data?.flatLabel),
+    street: safeText(request.data?.street),
+    buildingNo: safeText(request.data?.buildingNo),
+    apartmentNo: safeText(request.data?.apartmentNo),
+    flatKey: safeText(request.data?.flatKey) || buildFlatKey(communityId, request.data?.street, request.data?.buildingNo, request.data?.apartmentNo),
+    adminFullName: safeText(request.data?.adminFullName),
+    adminPhone: safeText(request.data?.adminPhone),
+    senderName: safeText(request.data?.senderName),
+    companyName: safeText(request.data?.companyName),
+    nip: safeText(request.data?.nip),
+    industry: safeText(request.data?.industry),
   };
   const ref = await db.collection("invites").add(invite);
-  return { ok: true, inviteId: ref.id };
+  return { inviteId: ref.id };
 });
 
 exports.claimInvite = onCall(async (request) => {
-  const uid = compatRequireAuth(request);
-  const inviteId = compatSafeText(request.data?.inviteId);
+  const uid = requireAuth(request);
+  const inviteId = safeText(request.data?.inviteId);
   if (!inviteId) throw new HttpsError("invalid-argument", "Brak inviteId.");
-
-  const requestStreet = compatSafeText(request.data?.street);
-  const requestBuildingNo = compatSafeText(request.data?.buildingNo);
-  const requestApartmentNo = compatSafeText(request.data?.apartmentNo);
-  const senderName = compatSafeText(request.data?.name);
-
+  const requestStreet = safeText(request.data?.street);
+  const requestBuildingNo = safeText(request.data?.buildingNo);
+  const requestApartmentNo = safeText(request.data?.apartmentNo);
+  const senderName = safeText(request.data?.name);
   const inviteRef = db.doc(`invites/${inviteId}`);
   const snap = await inviteRef.get();
   if (!snap.exists) throw new HttpsError("not-found", "Invite nie istnieje.");
-
-  const inv = snap.data() || {};
-  const communityId = compatSafeText(inv.communityId);
-  const role = compatSafeText(inv.role || "RESIDENT");
+  const inv = snap.data();
+  const communityId = safeText(inv.communityId);
+  const role = safeText(inv.role || "RESIDENT");
   let flat = null;
-
   if (role === "RESIDENT" && communityId) {
-    flat = await compatClaimOrCreateFlatForResident({
+    flat = await claimOrCreateFlatForResident({
       communityId,
       uid,
-      flatId: compatSafeText(inv.flatId),
-      flatKey: compatSafeText(inv.flatKey),
-      street: requestStreet || compatSafeText(inv.street),
-      buildingNo: requestBuildingNo || compatSafeText(inv.buildingNo),
-      apartmentNo: requestApartmentNo || compatSafeText(inv.apartmentNo),
-      flatLabel: compatSafeText(inv.flatLabel),
-      staircaseId: compatSafeText(inv.staircaseId),
+      flatId: safeText(inv.flatId),
+      flatKey: safeText(inv.flatKey),
+      street: requestStreet || safeText(inv.street),
+      buildingNo: requestBuildingNo || safeText(inv.buildingNo),
+      apartmentNo: requestApartmentNo || safeText(inv.apartmentNo),
+      flatLabel: safeText(inv.flatLabel),
+      staircaseId: safeText(inv.staircaseId),
     });
   }
-
   await db.doc(`users/${uid}`).set({
     role,
     communityId,
-    customerId: compatSafeText(inv.customerId || communityId),
+    customerId: inv.customerId || communityId,
     displayName: senderName || undefined,
-    street: flat?.street || requestStreet || compatSafeText(inv.street),
-    buildingNo: flat?.buildingNo || requestBuildingNo || compatSafeText(inv.buildingNo),
-    apartmentNo: flat?.apartmentNo || requestApartmentNo || compatSafeText(inv.apartmentNo),
-    flatId: flat?.flatId || compatSafeText(inv.flatId) || undefined,
-    staircaseId: flat?.staircaseId || compatSafeText(inv.staircaseId) || undefined,
-    flatLabel: flat?.flatLabel || compatSafeText(inv.flatLabel) || undefined,
+    street: flat?.street || requestStreet || safeText(inv.street),
+    buildingNo: flat?.buildingNo || requestBuildingNo || safeText(inv.buildingNo),
+    apartmentNo: flat?.apartmentNo || requestApartmentNo || safeText(inv.apartmentNo),
+    flatId: flat?.flatId || safeText(inv.flatId) || undefined,
+    staircaseId: flat?.staircaseId || safeText(inv.staircaseId) || undefined,
+    flatLabel: flat?.flatLabel || safeText(inv.flatLabel) || undefined,
     updatedAtMs: nowMs(),
   }, { merge: true });
-
-  await inviteRef.set({
-    status: "used",
-    usedByUid: uid,
-    usedAtMs: nowMs(),
-  }, { merge: true });
-
+  await inviteRef.set({ status: "used", usedByUid: uid, usedAtMs: nowMs() }, { merge: true });
   return { ok: true, flatId: flat?.flatId || null, flatLabel: flat?.flatLabel || null };
 });
 
+
 exports.upsertFlat = onCall(async (request) => {
-  const communityId = compatSafeText(request.data?.communityId);
-  await compatRequireCommunityRole(request, communityId, ["MASTER", "ACCOUNTANT", "ADMIN"]);
-  const profile = await compatGetMyProfile(compatRequireAuth(request));
+  const communityId = safeText(request.data?.communityId);
+  await requireCommunityRole(request, communityId, ["MASTER", "ACCOUNTANT", "ADMIN"]);
+  const profile = await getMyProfile(requireAuth(request));
   const role = String(profile?.role || "");
   const panelFlow = request.data?.source === "WEBPANEL";
   if (panelFlow) {
-    await compatAssertPanelAccessEnabled(communityId);
+    await assertPanelAccessEnabled(communityId);
     if (!["MASTER", "ACCOUNTANT"].includes(role)) {
       throw new HttpsError("permission-denied", "Administrator nie ma dostępu do webpanelu.");
     }
   }
-
-  return await compatUpsertFlatWithSeat({
+  return await upsertFlatWithSeat({
     communityId,
-    flatId: compatSafeText(request.data?.flatId),
-    staircaseId: compatSafeText(request.data?.staircaseId),
-    streetId: compatSafeText(request.data?.streetId),
-    street: compatSafeText(request.data?.street),
-    buildingNo: compatSafeText(request.data?.buildingNo),
-    apartmentNo: compatSafeText(request.data?.apartmentNo),
-    flatLabel: compatSafeText(request.data?.flatLabel),
-    flatKey: compatSafeText(request.data?.flatKey),
+    flatId: safeText(request.data?.flatId),
+    staircaseId: safeText(request.data?.staircaseId),
+    streetId: safeText(request.data?.streetId),
+    street: safeText(request.data?.street),
+    buildingNo: safeText(request.data?.buildingNo),
+    apartmentNo: safeText(request.data?.apartmentNo),
+    flatLabel: safeText(request.data?.flatLabel),
+    flatKey: safeText(request.data?.flatKey),
     extra: {
-      name: compatSafeText(request.data?.name),
-      surname: compatSafeText(request.data?.surname),
-      email: compatSafeText(request.data?.email),
-      phone: compatSafeText(request.data?.phone),
-      displayName: [compatSafeText(request.data?.name), compatSafeText(request.data?.surname)].filter(Boolean).join(" "),
-      residentName: [compatSafeText(request.data?.name), compatSafeText(request.data?.surname)].filter(Boolean).join(" "),
+      name: safeText(request.data?.name),
+      surname: safeText(request.data?.surname),
+      email: safeText(request.data?.email),
+      phone: safeText(request.data?.phone),
       areaM2: request.data?.areaM2 == null || request.data?.areaM2 === "" ? null : Number(request.data?.areaM2),
-      flatNumber: compatSafeText(request.data?.flatNumber || request.data?.apartmentNo),
+      flatNumber: safeText(request.data?.flatNumber || request.data?.apartmentNo),
     },
     payer: request.data?.withPayer ? {
-      streetId: compatSafeText(request.data?.streetId),
-      name: compatSafeText(request.data?.name),
-      surname: compatSafeText(request.data?.surname),
-      email: compatSafeText(request.data?.email),
-      phone: compatSafeText(request.data?.phone),
-      mailOnly: !!request.data?.email && !compatSafeText(request.data?.phone),
+      streetId: safeText(request.data?.streetId),
+      name: safeText(request.data?.name),
+      surname: safeText(request.data?.surname),
+      email: safeText(request.data?.email),
+      phone: safeText(request.data?.phone),
+      mailOnly: !!request.data?.email && !safeText(request.data?.phone),
     } : null,
   });
 });
 
 exports.importFlats = onCall(async (request) => {
-  const communityId = compatSafeText(request.data?.communityId);
+  const communityId = safeText(request.data?.communityId);
   const rows = Array.isArray(request.data?.rows) ? request.data.rows : [];
-  await compatRequireCommunityRole(request, communityId, ["MASTER", "ACCOUNTANT"]);
-  await compatAssertPanelAccessEnabled(communityId);
-
+  await requireCommunityRole(request, communityId, ["MASTER", "ACCOUNTANT"]);
+  await assertPanelAccessEnabled(communityId);
   let created = 0;
   let updated = 0;
   const results = [];
-
   for (const row of rows) {
-    const apartmentNo = compatSafeText(row.apartmentNo || row.flatNumber);
+    const apartmentNo = safeText(row.apartmentNo || row.flatNumber);
     if (!apartmentNo) continue;
-    const res = await compatUpsertFlatWithSeat({
+    const res = await upsertFlatWithSeat({
       communityId,
-      streetId: compatSafeText(row.streetId),
-      street: compatSafeText(row.street),
-      buildingNo: compatSafeText(row.buildingNo),
+      streetId: safeText(row.streetId),
+      street: safeText(row.street),
+      buildingNo: safeText(row.buildingNo),
       apartmentNo,
-      flatLabel: compatSafeText(row.flatLabel),
-      flatKey: compatSafeText(row.flatKey),
+      flatLabel: safeText(row.flatLabel),
+      flatKey: safeText(row.flatKey),
       extra: {
         flatNumber: apartmentNo,
-        name: compatSafeText(row.name),
-        surname: compatSafeText(row.surname),
-        displayName: [compatSafeText(row.name), compatSafeText(row.surname)].filter(Boolean).join(" "),
-        residentName: [compatSafeText(row.name), compatSafeText(row.surname)].filter(Boolean).join(" "),
-        email: compatSafeText(row.email),
-        phone: compatSafeText(row.phone),
+        name: safeText(row.name),
+        surname: safeText(row.surname),
+        email: safeText(row.email),
+        phone: safeText(row.phone),
         areaM2: row.areaM2 == null || row.areaM2 === "" ? null : Number(row.areaM2),
       },
       payer: {
-        streetId: compatSafeText(row.streetId),
-        name: compatSafeText(row.name),
-        surname: compatSafeText(row.surname),
-        email: compatSafeText(row.email),
-        phone: compatSafeText(row.phone),
-        mailOnly: !!compatSafeText(row.email) && !compatSafeText(row.phone),
+        streetId: safeText(row.streetId),
+        name: safeText(row.name),
+        surname: safeText(row.surname),
+        email: safeText(row.email),
+        phone: safeText(row.phone),
+        mailOnly: !!safeText(row.email) && !safeText(row.phone),
       },
     });
     if (res.created) created += 1; else updated += 1;
     results.push(res);
   }
-
   return { ok: true, created, updated, results };
 });
 
-exports.claimResidentFlat = onCall(async (request) => {
-  const uid = compatRequireAuth(request);
-  const communityId = compatSafeText(request.data?.communityId);
-  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+exports.activateCommunity = onCall(async (request) => {
+  const uid = requireAuth(request);
+  const code = safeText(request.data?.code);
+  const nip = safeText(request.data?.nip);
+  const name = safeText(request.data?.name);
+  if (!code || !nip || !name) throw new HttpsError("invalid-argument", "Brak danych aktywacji.");
+  const communityDoc = db.collection("communities").doc();
+  return db.runTransaction(async (tx) => {
+    tx.set(communityDoc, { id: communityDoc.id, name, nip, createdAtMs: nowMs(), seatsTotal: 2, seatsUsed: 0, panelAccessEnabled: false, updatedAtMs: nowMs() });
+    tx.set(db.doc(`users/${uid}`), { role: "MASTER", communityId: communityDoc.id, customerId: communityDoc.id, updatedAtMs: nowMs() }, { merge: true });
+    tx.set(db.doc(`activation_codes/${code}`), { used: true, communityId: communityDoc.id, usedAtMs: nowMs() }, { merge: true });
+    return { communityId: communityDoc.id };
+  });
+});
 
-  const flat = await compatClaimOrCreateFlatForResident({
+exports.removeUser = onCall(async (request) => {
+  const actorUid = requireAuth(request);
+  const targetUid = safeText(request.data?.targetUid || request.data?.uid);
+  if (!targetUid) throw new HttpsError("invalid-argument", "Brak targetUid.");
+
+  const actor = await getMyProfile(actorUid);
+  const targetRef = db.doc(`users/${targetUid}`);
+  const targetSnap = await targetRef.get();
+  if (!targetSnap.exists) throw new HttpsError("not-found", "Użytkownik nie istnieje.");
+  const target = targetSnap.data() || {};
+
+  const actorRole = safeText(actor?.role);
+  const targetRole = safeText(target?.role);
+  const sameCommunity = safeText(actor?.communityId) && safeText(actor?.communityId) === safeText(target?.communityId);
+  const actorIsOwner = request.auth?.token?.owner === true || OWNER_UIDS.includes(actorUid) || OWNER_EMAILS.includes(safeText(request.auth?.token?.email));
+  const actorCanManage = actorIsOwner || (sameCommunity && ["MASTER", "ADMIN", "ACCOUNTANT"].includes(actorRole));
+  if (!actorCanManage) throw new HttpsError("permission-denied", "Brak uprawnień do usunięcia użytkownika.");
+  if (targetRole === "MASTER" && !actorIsOwner && actorRole !== "MASTER") {
+    throw new HttpsError("permission-denied", "Nie możesz usunąć konta MASTER.");
+  }
+
+  const now = nowMs();
+  const batch = db.batch();
+  batch.set(targetRef, {
+    role: "REMOVED",
+    removedAtMs: now,
+    updatedAtMs: now,
+    appBlocked: true,
+    communityId: null,
+    staircaseId: null,
+    flatId: null,
+    flatLabel: null,
+  }, { merge: true });
+
+  const communityId = safeText(target?.communityId);
+  const flatId = safeText(target?.flatId);
+  if (communityId && flatId) {
+    const flatRef = db.doc(`communities/${communityId}/flats/${flatId}`);
+    batch.set(flatRef, {
+      residentUid: target?.residentUid === targetUid ? null : FieldValue.delete(),
+      occupantsUids: FieldValue.arrayRemove(targetUid),
+      updatedAtMs: now,
+    }, { merge: true });
+  }
+
+  await batch.commit();
+  return { ok: true };
+});
+
+exports.setUserBlocked = onCall(async (request) => {
+  const actorUid = requireAuth(request);
+  const targetUid = safeText(request.data?.targetUid || request.data?.uid);
+  if (!targetUid) throw new HttpsError("invalid-argument", "Brak targetUid.");
+
+  const actor = await getMyProfile(actorUid);
+  const targetRef = db.doc(`users/${targetUid}`);
+  const targetSnap = await targetRef.get();
+  if (!targetSnap.exists) throw new HttpsError("not-found", "Użytkownik nie istnieje.");
+  const target = targetSnap.data() || {};
+
+  const actorRole = safeText(actor?.role);
+  const sameCommunity = safeText(actor?.communityId) && safeText(actor?.communityId) === safeText(target?.communityId);
+  const actorIsOwner = request.auth?.token?.owner === true || OWNER_UIDS.includes(actorUid) || OWNER_EMAILS.includes(safeText(request.auth?.token?.email));
+  const actorCanManage = actorIsOwner || (sameCommunity && ["MASTER", "ADMIN", "ACCOUNTANT"].includes(actorRole));
+  if (!actorCanManage) throw new HttpsError("permission-denied", "Brak uprawnień do blokady użytkownika.");
+
+  await targetRef.set({ appBlocked: !!request.data?.blocked, updatedAtMs: nowMs() }, { merge: true });
+  return { ok: true };
+});
+
+exports.addStreet = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const name = safeText(request.data?.name);
+  if (!communityId || !name) throw new HttpsError("invalid-argument", "Brak communityId lub nazwy ulicy.");
+  await requireCommunityStaff(request, communityId);
+  const ref = db.collection("communities").doc(communityId).collection("streets").doc();
+  await ref.set({ name, createdAtMs: nowMs(), updatedAtMs: nowMs() });
+  return { id: ref.id };
+});
+
+exports.createJoinCode = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const role = "ACCOUNTANT";
+  const { uid } = await requireCommunityRole(request, communityId, ["MASTER"]);
+  await assertPanelAccessEnabled(communityId);
+  for (let i = 0; i < 10; i++) {
+    const code = randomCode(8);
+    const ref = db.doc(`join_codes/${code}`);
+    try {
+      await ref.create({ code, communityId, role, used: false, createdAtMs: nowMs(), createdByUid: uid, expiresAtMs: nowMs() + 30 * 24 * 3600 * 1000 });
+      return { code };
+    } catch (e) {
+      if (e.code !== 6) throw e;
+    }
+  }
+  throw new HttpsError("resource-exhausted", "Nie udało się wygenerować kodu.");
+});
+
+exports.claimJoinCode = onCall(async (request) => {
+  const uid = requireAuth(request);
+  const code = safeText(request.data?.code).toUpperCase();
+  if (!code) throw new HttpsError("invalid-argument", "Brak kodu.");
+  const joinRef = db.doc(`join_codes/${code}`);
+  const joinSnap = await joinRef.get();
+  if (!joinSnap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
+  const joinData = joinSnap.data();
+  await assertPanelAccessEnabled(joinData.communityId);
+  return db.runTransaction(async (tx) => {
+    const ref = db.doc(`join_codes/${code}`);
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
+    const data = snap.data();
+    if (data.used) throw new HttpsError("failed-precondition", "Kod został już wykorzystany.");
+    if (Number(data.expiresAtMs || 0) < nowMs()) throw new HttpsError("deadline-exceeded", "Kod wygasł.");
+    const finalRole = safeText(data.role || "ACCOUNTANT") === "ACCOUNTANT" ? "ACCOUNTANT" : "ACCOUNTANT";
+    tx.set(db.doc(`users/${uid}`), { role: finalRole, communityId: data.communityId, customerId: data.communityId, updatedAtMs: nowMs() }, { merge: true });
+    tx.update(ref, { used: true, usedByUid: uid, usedAtMs: nowMs() });
+    return { ok: true, communityId: data.communityId, role: "ACCOUNTANT" };
+  });
+});
+
+exports.claimResidentFlat = onCall(async (request) => {
+  const uid = requireAuth(request);
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  const flat = await claimOrCreateFlatForResident({
     communityId,
     uid,
-    flatId: compatSafeText(request.data?.flatId),
-    flatKey: compatSafeText(request.data?.flatKey),
-    street: compatSafeText(request.data?.street),
-    buildingNo: compatSafeText(request.data?.buildingNo),
-    apartmentNo: compatSafeText(request.data?.apartmentNo),
-    flatLabel: compatSafeText(request.data?.flatLabel),
-    staircaseId: compatSafeText(request.data?.staircaseId),
+    flatId: safeText(request.data?.flatId),
+    flatKey: safeText(request.data?.flatKey),
+    street: safeText(request.data?.street),
+    buildingNo: safeText(request.data?.buildingNo),
+    apartmentNo: safeText(request.data?.apartmentNo),
+    flatLabel: safeText(request.data?.flatLabel),
+    staircaseId: safeText(request.data?.staircaseId),
   });
-
   await db.doc(`users/${uid}`).set({
     communityId,
     street: flat.street,
@@ -3486,26 +947,220 @@ exports.claimResidentFlat = onCall(async (request) => {
     flatLabel: flat.flatLabel,
     updatedAtMs: nowMs(),
   }, { merge: true });
-
   return { ok: true, ...flat };
 });
 
-exports.importPayments = onCall(async (request) => {
-  const communityId = compatSafeText(request.data?.communityId);
-  const rows = Array.isArray(request.data?.rows) ? request.data.rows : [];
-  await compatRequireCommunityStaff(request, communityId);
-  await compatAssertPanelAccessEnabled(communityId);
+exports.createWebSession = onCall(async (request) => {
+  const uid = requireAuth(request);
+  const profile = await getMyProfile(uid);
+  const communityId = safeText(profile?.communityId);
+  const role = safeText(profile?.role);
+  if (!["MASTER", "ACCOUNTANT"].includes(role)) throw new HttpsError("permission-denied", "Administrator nie ma dostępu do webpanelu.");
+  await assertPanelAccessEnabled(communityId);
+  const token = `${randomCode(12)}${randomCode(12)}`;
+  const target = safeText(request.data?.target || "/dashboard");
+  await db.doc(`webSessions/${token}`).set({ uid, communityId, used: false, target, createdAtMs: nowMs(), expiresAtMs: nowMs() + 15 * 60 * 1000 });
+  return { token, target };
+});
 
+exports.ksefFetchInvoices = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  const period = parsePeriod(request.data?.period);
+  const list = [
+    { vendorName: "TAURON", title: `Energia elektryczna ${period}`, totalGrossCents: 184299, currency: "PLN" },
+    { vendorName: "WODOCIĄGI", title: `Woda i ścieki ${period}`, totalGrossCents: 96340, currency: "PLN" },
+  ];
+  const batch = db.batch();
+  const createdIds = [];
+  list.forEach((item) => {
+    const ref = db.collection("communities").doc(communityId).collection("invoices").doc();
+    createdIds.push(ref.id);
+    batch.set(ref, {
+      ...item,
+      communityId,
+      period,
+      status: "NOWA",
+      source: "KSEF_MOCK",
+      createdAtMs: nowMs(),
+      updatedAtMs: nowMs(),
+    }, { merge: true });
+  });
+  await batch.commit();
+  return { ok: true, createdIds };
+});
+
+exports.ksefParseInvoice = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const invoiceId = safeText(request.data?.invoiceId);
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  const ref = db.collection("communities").doc(communityId).collection("invoices").doc(invoiceId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
+  const invoice = { id: snap.id, ...snap.data() };
+  const period = parsePeriod(invoice.period || request.data?.period);
+  const rule = await findRuleMatch(communityId, invoice);
+  const parsed = {
+    category: normalizeCategory(rule?.category || invoice.category || (safeText(invoice.vendorName).toUpperCase().includes("TAURON") ? "PRAD" : safeText(invoice.vendorName).toUpperCase().includes("WOD") ? "WODA" : "INNE")),
+    amountCents: Number(invoice.totalGrossCents || invoice.amountCents || 0),
+    period,
+    scope: safeText(rule?.scope || invoice.scope || "COMMON"),
+    common: safeText(rule?.scope || invoice.scope || "COMMON") !== "FLAT",
+    buildingId: safeText(rule?.buildingId || invoice.buildingId || ""),
+    flatId: safeText(rule?.flatId || invoice.flatId || ""),
+    confidence: rule ? 0.99 : 0.72,
+    matchedBy: rule ? "RULE" : "HEURISTIC",
+  };
+  await ref.set({ parsed, status: rule ? "READY_TO_APPROVE" : "SUGGESTED", updatedAtMs: nowMs() }, { merge: true });
+  return { ok: true, parsed };
+});
+
+exports.aiSuggestInvoice = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const invoiceId = safeText(request.data?.invoiceId);
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  const ref = db.collection("communities").doc(communityId).collection("invoices").doc(invoiceId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
+  const inv = snap.data();
+  const parsed = inv.parsed || {};
+  const suggestion = {
+    category: normalizeCategory(parsed.category || inv.category || "INNE"),
+    buildingId: safeText(parsed.buildingId || inv.buildingId || ""),
+    period: parsePeriod(parsed.period || inv.period),
+    common: parsed.scope !== "FLAT",
+    confidence: Math.max(Number(parsed.confidence || 0.67), 0.67),
+    source: "AI_SUGGESTION",
+  };
+  const suggRef = db.collection("communities").doc(communityId).collection("aiSuggestions").doc();
+  await suggRef.set({ invoiceId, suggestion, createdAtMs: nowMs() });
+  await ref.set({ ai: { suggestion, updatedAtMs: nowMs() }, status: suggestion.confidence >= 0.85 ? "READY_TO_APPROVE" : "SUGGESTED", updatedAtMs: nowMs() }, { merge: true });
+  if (suggestion.confidence < 0.85) {
+    const reviewCol = db.collection("communities").doc(communityId).collection("reviewQueue");
+    const existingOpen = await reviewCol.where("invoiceId", "==", invoiceId).where("type", "==", "INVOICE_LOW_CONFIDENCE").where("status", "==", "OPEN").limit(1).get();
+    if (existingOpen.empty) {
+      await reviewCol.add({ type: "INVOICE_LOW_CONFIDENCE", invoiceId, confidence: suggestion.confidence, status: "OPEN", createdAtMs: nowMs() });
+    }
+  }
+  return { ok: true, suggestion };
+});
+
+exports.approveInvoice = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const invoiceId = safeText(request.data?.invoiceId);
+  const assignment = request.data?.assignment || {};
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  const invRef = db.collection("communities").doc(communityId).collection("invoices").doc(invoiceId);
+  const invSnap = await invRef.get();
+  if (!invSnap.exists) throw new HttpsError("not-found", "Faktura nie istnieje.");
+  const inv = invSnap.data();
+  const parsed = inv.parsed || {};
+  const period = parsePeriod(assignment.period || parsed.period || inv.period);
+  const category = normalizeCategory(assignment.category || parsed.category || inv.category || "INNE");
+  const scope = safeText(assignment.scope || parsed.scope || "COMMON");
+  const amountCents = Number(parsed.amountCents || inv.totalGrossCents || inv.amountCents || 0);
+  const buildingId = safeText(assignment.buildingId || parsed.buildingId || inv.buildingId || "");
+  const dueDateMs = Number(assignment.dueDateMs || inv.dueDateMs || periodToDueDateMs(period));
+  const dueDate = new Date(dueDateMs).toISOString().slice(0, 10);
+  const transferAccount = safeText(inv.accountNumber || request.data?.accountNumber || "00 0000 0000 0000 0000 0000 0000");
+  const flatsQ = db.collection("communities").doc(communityId).collection("flats");
+  let flatsSnap;
+  if (scope === "FLAT") {
+    const flatId = safeText(assignment.flatId || parsed.flatId || inv.flatId);
+    if (!flatId) throw new HttpsError("invalid-argument", "Brak flatId dla faktury typu FLAT.");
+    const flatSnap = await flatsQ.doc(flatId).get();
+    if (!flatSnap.exists) throw new HttpsError("not-found", "Lokal nie istnieje.");
+    flatsSnap = { docs: [flatSnap] };
+  } else if (buildingId) {
+    flatsSnap = await flatsQ.where("buildingId", "==", buildingId).get();
+  } else {
+    flatsSnap = await flatsQ.get();
+  }
+  const flats = flatsSnap.docs.filter((d) => d.exists).map((d) => ({ id: d.id, ...d.data() }));
+  if (!flats.length) throw new HttpsError("failed-precondition", "Brak lokali do naliczenia.");
+  const totalArea = flats.reduce((a, f) => a + Number(f.areaM2 || 0), 0);
+  const useArea = totalArea > 0;
+  let allocated = 0;
+  let chargesCreated = 0;
+  for (let i = 0; i < flats.length; i++) {
+    const flat = flats[i];
+    let part;
+    if (i === flats.length - 1) {
+      part = amountCents - allocated;
+    } else if (useArea) {
+      part = Math.round(amountCents * (Number(flat.areaM2 || 0) / totalArea));
+    } else {
+      part = Math.floor(amountCents / flats.length);
+    }
+    allocated += part;
+    const chargeRef = db.collection("communities").doc(communityId).collection("charges").doc();
+    await chargeRef.set({
+      invoiceId,
+      flatId: flat.id,
+      buildingId: flat.buildingId || buildingId || null,
+      period,
+      category,
+      label: safeText(assignment.label || parsed.label || inv.title || `${category} ${period}`),
+      amountCents: part,
+      currency: safeText(inv.currency || "PLN"),
+      source: "INVOICE_APPROVAL",
+      createdAtMs: nowMs(),
+      updatedAtMs: nowMs(),
+    });
+    chargesCreated += 1;
+    const settlementRef = db.collection("communities").doc(communityId).collection("settlements").doc(`${flat.id}_${period}`);
+    const existing = await settlementRef.get();
+    const current = existing.exists ? existing.data() : { paymentsCents: 0 };
+    const chargesCents = Number(current?.chargesCents || 0) + part;
+    const paymentsCents = Number(current?.paymentsCents || 0);
+    const balanceCents = chargesCents - paymentsCents;
+    await settlementRef.set({
+      flatId: flat.id,
+      buildingId: flat.buildingId || buildingId || null,
+      period,
+      title: `Rozliczenie za ${monthTitle(period)}`,
+      chargesCents,
+      paymentsCents,
+      balanceCents,
+      currency: safeText(inv.currency || "PLN"),
+      dueDateMs,
+      dueDate,
+      accountNumber: transferAccount,
+      transferTitle: `EL-${safeText(flat.flatNumber || flat.localNumber || flat.id)} ${period}`,
+      flatLabel: safeText(flat.flatLabel || [flat.street, flat.buildingNo, flat.apartmentNo].filter(Boolean).join(' ')),
+      residentName: safeText(flat.name || flat.displayName || ''),
+      isPublished: false,
+      status: 'DRAFT',
+      createdAtMs: Number(current?.createdAtMs || nowMs()),
+      updatedAtMs: nowMs(),
+    }, { merge: true });
+    await refreshBalanceDoc(communityId, flat.id);
+  }
+  await invRef.set({ status: "STAGED", approvedAtMs: nowMs(), approvedAssignment: { period, category, scope, buildingId, dueDateMs } }, { merge: true });
+  const openReviewSnap = await db.collection("communities").doc(communityId).collection("reviewQueue").where("invoiceId", "==", invoiceId).where("status", "==", "OPEN").get();
+  for (const docSnap of openReviewSnap.docs) {
+    await docSnap.ref.set({ status: "CLOSED", resolution: "closed-after-approval", closedAtMs: nowMs() }, { merge: true });
+  }
+  return { ok: true, chargesCreated, period, dueDateMs };
+});
+
+exports.importPayments = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const rows = Array.isArray(request.data?.rows) ? request.data.rows : [];
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
   let matched = 0;
   let unmatched = 0;
   const created = [];
-
   for (const row of rows) {
-    const title = compatSafeText(row.title || row.description || row.tytul || row.tytuł || row.opis);
-    const amountCents = compatParseAmountToCents(row.amount ?? row.kwota);
+    const title = safeText(row.title || row.description || row.tytul || row.tytuł || row.opis);
+    const amountCents = parseAmountToCents(row.amount ?? row.kwota);
     const bookedAtMs = Number(row.bookedAtMs || row.dateMs || Date.parse(row.date || row.data || new Date().toISOString()) || nowMs());
-    const code = compatPaymentCodeFromText(`${title} ${compatSafeText(row.code)}`);
-
+    const code = paymentCodeFromText(`${title} ${safeText(row.code)}`);
     let flatSnap = null;
     let matchedBy = "NONE";
     if (code) {
@@ -3514,18 +1169,17 @@ exports.importPayments = onCall(async (request) => {
       if (flatSnap) matchedBy = "CODE";
     }
     if (!flatSnap) {
-      flatSnap = await compatFuzzyFindFlatForPayment(communityId, row);
+      flatSnap = await fuzzyFindFlatForPayment(communityId, row);
       if (flatSnap) matchedBy = "AI_HINT";
     }
-
     const paymentRef = db.collection("communities").doc(communityId).collection("payments").doc();
-    const period = compatParsePeriod(row.period || new Date(bookedAtMs).toISOString().slice(0, 7));
+    const period = parsePeriod(row.period || new Date(bookedAtMs).toISOString().slice(0, 7));
     const payload = {
       flatId: flatSnap?.id || null,
       period,
       code: code || null,
       title,
-      source: compatSafeText(row.source || "CSV_IMPORT"),
+      source: safeText(row.source || "CSV_IMPORT"),
       amountCents,
       bookedAtMs,
       createdAtMs: nowMs(),
@@ -3533,86 +1187,135 @@ exports.importPayments = onCall(async (request) => {
       matched: !!flatSnap,
       matchedBy,
     };
-
     await paymentRef.set(payload);
     created.push(paymentRef.id);
-
     if (flatSnap) {
       matched += 1;
       const settlementRef = db.collection("communities").doc(communityId).collection("settlements").doc(`${flatSnap.id}_${period}`);
       const settlementSnap = await settlementRef.get();
-      const settlement = settlementSnap.exists ? (settlementSnap.data() || {}) : {
-        chargesCents: 0,
-        accountNumber: "",
-        transferTitle: `EL-${code || compatSafeText(flatSnap.get("flatNumber") || flatSnap.id)} ${period}`,
-        dueDateMs: compatPeriodToDueDateMs(period),
-        dueDate: new Date(compatPeriodToDueDateMs(period)).toISOString().slice(0, 10),
-      };
+      const settlement = settlementSnap.exists ? settlementSnap.data() : { chargesCents: 0, accountNumber: "", transferTitle: `EL-${code} ${period}`, dueDateMs: periodToDueDateMs(period), dueDate: new Date(periodToDueDateMs(period)).toISOString().slice(0,10) };
       const paymentsCents = Number(settlement?.paymentsCents || 0) + amountCents;
       const chargesCents = Number(settlement?.chargesCents || 0);
       await settlementRef.set({
         flatId: flatSnap.id,
         buildingId: flatSnap.get("buildingId") || null,
         period,
-        title: `Rozliczenie za ${compatMonthTitle(period)}`,
+        title: `Rozliczenie za ${monthTitle(period)}`,
         chargesCents,
         paymentsCents,
         balanceCents: chargesCents - paymentsCents,
         accountNumber: settlement.accountNumber || "",
-        transferTitle: settlement.transferTitle || `EL-${code || compatSafeText(flatSnap.get("flatNumber") || flatSnap.id)} ${period}`,
+        transferTitle: settlement.transferTitle || `EL-${code} ${period}`,
         isPublished: Boolean(settlement.isPublished),
-        status: settlement.status || "DRAFT",
-        dueDateMs: settlement.dueDateMs || compatPeriodToDueDateMs(period),
-        dueDate: settlement.dueDate || new Date(compatPeriodToDueDateMs(period)).toISOString().slice(0, 10),
+        status: settlement.status || 'DRAFT',
+        dueDateMs: settlement.dueDateMs || periodToDueDateMs(period),
+        dueDate: settlement.dueDate || new Date(periodToDueDateMs(period)).toISOString().slice(0,10),
         createdAtMs: Number(settlement.createdAtMs || nowMs()),
         updatedAtMs: nowMs(),
       }, { merge: true });
-      await compatRefreshBalanceDoc(communityId, flatSnap.id);
+      await refreshBalanceDoc(communityId, flatSnap.id);
     } else {
       unmatched += 1;
-      await db.collection("communities").doc(communityId).collection("reviewQueue").add({
-        type: "PAYMENT_UNMATCHED",
-        paymentId: paymentRef.id,
-        title,
-        amountCents,
-        code: code || null,
-        source: compatSafeText(row.source || ""),
-        status: "OPEN",
-        createdAtMs: nowMs(),
-      });
+      await db.collection("communities").doc(communityId).collection("reviewQueue").add({ type: "PAYMENT_UNMATCHED", paymentId: paymentRef.id, title, amountCents, code: code || null, source: safeText(row.source || ""), status: "OPEN", createdAtMs: nowMs() });
     }
   }
-
   return { ok: true, matched, unmatched, created };
 });
 
-exports.closeReviewItem = onCall(async (request) => {
-  const communityId = compatSafeText(request.data?.communityId);
-  const reviewId = compatSafeText(request.data?.reviewId);
-  await compatRequireCommunityStaff(request, communityId);
-  await compatAssertPanelAccessEnabled(communityId);
-  await db.collection("communities").doc(communityId).collection("reviewQueue").doc(reviewId).set({
-    status: compatSafeText(request.data?.status || "CLOSED"),
-    resolution: compatSafeText(request.data?.resolution || ""),
-    closedAtMs: nowMs(),
-  }, { merge: true });
-  return { ok: true };
+
+exports.publishSettlement = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const settlementId = safeText(request.data?.settlementId);
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  const ref = db.collection("communities").doc(communityId).collection("settlements").doc(settlementId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Rozliczenie nie istnieje.");
+  await ref.set({ isPublished: true, status: "PUBLISHED", publishedAtMs: nowMs(), updatedAtMs: nowMs() }, { merge: true });
+  return { ok: true, settlementId };
 });
 
-exports.onSettlementUpdated = onDocumentUpdated("communities/{communityId}/settlements/{settlementId}", async (event) => {
-  const before = event.data.before.data() || {};
-  const after = event.data.after.data() || {};
-  const changed = Number(before.balanceCents || 0) !== Number(after.balanceCents || 0)
-    || Number(before.chargesCents || 0) !== Number(after.chargesCents || 0)
-    || Number(before.paymentsCents || 0) !== Number(after.paymentsCents || 0)
-    || compatSafeText(before.pdfUrl) !== compatSafeText(after.pdfUrl);
-  if (!changed) return;
+exports.publishAllDraftSettlements = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  const snap = await db.collection("communities").doc(communityId).collection("settlements").where("isPublished", "!=", true).get();
+  const batch = db.batch();
+  snap.docs.forEach((docSnap) => batch.set(docSnap.ref, { isPublished: true, status: "PUBLISHED", publishedAtMs: nowMs(), updatedAtMs: nowMs() }, { merge: true }));
+  await batch.commit();
+  return { ok: true, published: snap.size };
+});
 
-  const flatId = compatSafeText(after.flatId);
-  const tokens = await compatGetResidentTokensForFlat(event.params.communityId, flatId);
-  await sendToTokens(tokens, "due_created", "Aktualizacja rozliczenia", compatSafeText(after.title || `Rozliczenie za ${after.period || ""}`), {
-    settlementId: event.params.settlementId,
-    flatId,
-    period: compatSafeText(after.period),
+exports.generateSettlementPdf = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const settlementId = safeText(request.data?.settlementId);
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  const settlementRef = db.collection("communities").doc(communityId).collection("settlements").doc(settlementId);
+  const snap = await settlementRef.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Rozliczenie nie istnieje.");
+  const settlement = snap.data();
+  const detail = await getSettlementData(communityId, settlement.flatId, settlement.period);
+  const uploaded = await uploadSettlementPdf(communityId, settlementId, {
+    ...settlement,
+    ...detail,
   });
+  await settlementRef.set({ pdfPath: uploaded.path, pdfUrl: uploaded.url, updatedAtMs: nowMs() }, { merge: true });
+  return { ok: true, pdfUrl: uploaded.url, pdfPath: uploaded.path };
+});
+
+exports.sendSettlementEmail = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const settlementId = safeText(request.data?.settlementId);
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  const settlementRef = db.collection("communities").doc(communityId).collection("settlements").doc(settlementId);
+  const settlementSnap = await settlementRef.get();
+  if (!settlementSnap.exists) throw new HttpsError("not-found", "Rozliczenie nie istnieje.");
+  const settlement = settlementSnap.data();
+  const flatId = safeText(settlement.flatId);
+  const payerSnap = await db.collection("communities").doc(communityId).collection("payers").where("flatId", "==", flatId).limit(1).get();
+  const flatSnap = await db.collection("communities").doc(communityId).collection("flats").doc(flatId).get();
+  const payer = payerSnap.docs[0]?.data() || {};
+  const flat = flatSnap.exists ? flatSnap.data() : {};
+  const email = sanitizeEmail(request.data?.email || payer.email || flat.email);
+  if (!email) {
+    await db.collection("communities").doc(communityId).collection("reviewQueue").add({ type: "MISSING_EMAIL", settlementId, flatId, status: "OPEN", createdAtMs: nowMs() });
+    throw new HttpsError("failed-precondition", "Brak adresu email dla płatnika.");
+  }
+  let pdfUrl = settlement.pdfUrl || null;
+  if (!pdfUrl) {
+    const detail = await getSettlementData(communityId, settlement.flatId, settlement.period);
+    const uploaded = await uploadSettlementPdf(communityId, settlementId, { ...settlement, ...detail });
+    pdfUrl = uploaded.url;
+    await settlementRef.set({ pdfPath: uploaded.path, pdfUrl, updatedAtMs: nowMs() }, { merge: true });
+  }
+  const queueRef = db.collection("communities").doc(communityId).collection("emailQueue").doc();
+  await queueRef.set({
+    to: email,
+    subject: `Rozliczenie za ${monthTitle(settlement.period)}`,
+    template: "settlement",
+    settlementId,
+    flatId,
+    pdfUrl,
+    status: "QUEUED",
+    createdAtMs: nowMs(),
+    payload: {
+      period: settlement.period,
+      balanceCents: settlement.balanceCents,
+      transferTitle: settlement.transferTitle,
+      accountNumber: settlement.accountNumber,
+    },
+  });
+  await settlementRef.set({ emailedAtMs: nowMs(), emailedTo: email, updatedAtMs: nowMs() }, { merge: true });
+  return { ok: true, queued: true, email, pdfUrl };
+});
+
+exports.closeReviewItem = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const reviewId = safeText(request.data?.reviewId);
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  await db.collection("communities").doc(communityId).collection("reviewQueue").doc(reviewId).set({ status: safeText(request.data?.status || "CLOSED"), resolution: safeText(request.data?.resolution || ""), closedAtMs: nowMs() }, { merge: true });
+  return { ok: true };
 });

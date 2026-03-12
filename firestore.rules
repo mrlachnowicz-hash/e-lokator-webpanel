@@ -10,7 +10,10 @@ service cloud.firestore {
     }
 
     function canUse() {
-      return signedIn() && getMyData().get('appBlocked', false) == false;
+      return signedIn() && (
+        !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+        getMyData().get('appBlocked', false) == false
+      );
     }
 
     function isOwner() {
@@ -20,18 +23,23 @@ service cloud.firestore {
       );
     }
 
-    function myRole() { return getMyData().get('role', 'RESIDENT'); }
-    function myCommId() { return getMyData().get('communityId', ''); }
+    function myRole() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? getMyData().get('role', 'RESIDENT')
+        : 'RESIDENT';
+    }
+
+    function myCommId() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? getMyData().get('communityId', '')
+        : '';
+    }
 
     function isAdminOrMaster() {
       return canUse() && (myRole() == "ADMIN" || myRole() == "MASTER");
     }
 
-    function isAccountant() {
-      return canUse() && (myRole() == "ACCOUNTANT");
-    }
-
-    function isStaff() {
+    function isCommunityStaff() {
       return canUse() && (myRole() == "ADMIN" || myRole() == "MASTER" || myRole() == "ACCOUNTANT");
     }
 
@@ -39,73 +47,186 @@ service cloud.firestore {
       return canUse() && (myCommId() == communityId || isOwner());
     }
 
+    function panelAccessEnabled(communityId) {
+      return exists(/databases/$(database)/documents/communities/$(communityId)) &&
+        get(/databases/$(database)/documents/communities/$(communityId)).data.get('panelAccessEnabled', false) == true;
+    }
+
+    function canUsePanel(communityId) {
+      return isMember(communityId) && panelAccessEnabled(communityId) && (myRole() == "MASTER" || myRole() == "ACCOUNTANT" || isOwner());
+    }
+
+    function canManagePanel(communityId) {
+      return (isOwner() || ((myRole() == "MASTER" || myRole() == "ACCOUNTANT") && myCommId() == communityId)) && panelAccessEnabled(communityId);
+    }
+
     match /users/{uid} {
       allow read: if signedIn() && (
         request.auth.uid == uid ||
         (myCommId() != "" && myCommId() == resource.data.get('communityId', '')) ||
-        isStaff()
+        isAdminOrMaster()
       );
-      allow create, update, delete: if signedIn() && request.auth.uid == uid;
-      allow update: if isAdminOrMaster()
-        && myCommId() == resource.data.get('communityId', '')
-        && request.resource.data.diff(resource.data).changedKeys().hasOnly([
-          "chatMutedUntilMs", "chatBanned", "appBlocked", "blockedAtMs"
-        ]);
+      allow create: if signedIn() && request.auth.uid == uid;
+      allow update: if signedIn() && (
+        request.auth.uid == uid ||
+        (isAdminOrMaster() && myCommId() == resource.data.get('communityId', '') &&
+         request.resource.data.diff(resource.data).changedKeys().hasOnly([
+           "chatMutedUntilMs", "chatBanned", "appBlocked", "blockedAtMs"
+         ]))
+      );
+      allow delete: if signedIn() && request.auth.uid == uid;
     }
 
     match /communities/{communityId} {
       allow read: if signedIn();
       allow create: if canUse() || isOwner();
-      allow update, delete: if isOwner() || (isStaff() && myCommId() == communityId);
+      allow update, delete: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
 
-      match /chatMessages/{msgId} {
-        allow create: if isMember(communityId) && getMyData().get('chatBanned', false) == false;
-        // Pozwól autorowi na "usunięcie" (edycję pola 'deleted')
-        allow update: if isMember(communityId) && resource.data.senderUid == request.auth.uid
-                      && request.resource.data.diff(resource.data).changedKeys().hasOnly(['deleted', 'deletedAtMs']);
+      match /seat_purchases/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
+
+      match /streets/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
+
+      match /streetAssignments/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
+
+      match /contractorAssignments/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
       }
 
       match /tickets/{ticketId} {
+        allow read: if isMember(communityId);
         allow create: if isMember(communityId);
+        allow update, delete: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
+
+      match /contractor_performance_logs/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
+
+      match /calendar/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
+
+      match /gates/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
+
+      match /phoneNumbers/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
+
+      match /announcements/{annId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
       }
 
       match /residentAnnouncements/{annId} {
         allow read: if isMember(communityId);
-        allow create: if isMember(communityId);
-        allow update: if isMember(communityId);
+        allow create, update: if isMember(communityId);
         allow delete: if isAdminOrMaster() || (isMember(communityId) && resource.data.createdByUid == request.auth.uid);
       }
 
       match /votes/{voteId} {
         allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
         match /ballots/{ballotId} {
           allow list, read: if isMember(communityId);
           allow write: if isMember(communityId) && getMyData().get('flatId', '') == ballotId;
         }
       }
 
+      match /chatMessages/{msgId} {
+        allow read: if isMember(communityId);
+        allow create: if isMember(communityId) && getMyData().get('chatBanned', false) == false;
+        allow update: if isMember(communityId) && resource.data.senderUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).changedKeys().hasOnly(['deleted', 'deletedAtMs']);
+      }
+
       match /correspondence/{resUid} {
         allow read, write: if (resUid == request.auth.uid && canUse()) || (isAdminOrMaster() && myCommId() == communityId);
         match /messages/{msgId} {
           allow read, create: if (resUid == request.auth.uid && canUse()) || (isAdminOrMaster() && myCommId() == communityId);
+          allow delete: if isAdminOrMaster() && myCommId() == communityId;
         }
       }
 
-      match /{sub=**} {
+      match /activeInvites/{docId} {
         allow read: if isMember(communityId);
-        // Webpanel (ADMIN/MASTER/ACCOUNTANT) może zarządzać danymi wspólnoty
-        allow write: if isOwner() || (isStaff() && myCommId() == communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
       }
-    }
 
-    // One-time SSO tokens (zapisywane przez Functions / konsumowane przez webpanel API)
-    match /webSessions/{token} {
-      allow read, write: if false;
-    }
+      match /staircases/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
 
-    // Join codes (zapisywane przez Functions, czytane przez claimJoinCode)
-    match /join_codes/{code} {
-      allow read, write: if false;
+      match /flats/{docId} {
+        allow read: if isMember(communityId) || canUsePanel(communityId);
+        allow write: if false;
+      }
+
+      match /payers/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if false;
+      }
+
+      match /invoices/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /charges/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /settlements/{docId} {
+        allow read: if canUsePanel(communityId) || (isMember(communityId) && getMyData().get('flatId', '') == resource.data.get('flatId', ''));
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /payments/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /reviewQueue/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /aiSuggestions/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /invoiceRules/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /dues/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
+
+      match /members/{docId} {
+        allow read: if isMember(communityId);
+        allow write: if isOwner() || (isAdminOrMaster() && myCommId() == communityId);
+      }
     }
 
     match /communityNames/{name} {
@@ -118,15 +239,20 @@ service cloud.firestore {
     }
 
     match /seat_requests/{reqId} {
-      allow create: if canUse()
-        && myRole() == "MASTER"
-        && request.resource.data.communityId == myCommId()
-        && request.resource.data.status == "PENDING";
+      allow create: if canUse() && myRole() == "MASTER" && request.resource.data.communityId == myCommId() && request.resource.data.status == "PENDING";
       allow read, update, delete: if isOwner();
     }
 
     match /activation_codes/{code} {
       allow read, write: if isOwner();
+    }
+
+    match /join_codes/{code} {
+      allow read, write: if isOwner();
+    }
+
+    match /webSessions/{token} {
+      allow read, write: if false;
     }
   }
 }
