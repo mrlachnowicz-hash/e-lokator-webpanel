@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { collection, doc, onSnapshot, orderBy, query, setDoc, writeBatch } from "firebase/firestore";
+import { collection, doc, onSnapshot, orderBy, query } from "firebase/firestore";
 import * as XLSX from "xlsx";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
@@ -184,7 +184,7 @@ export default function PaymentsPage() {
   }), [payments]);
 
   async function saveSettings() {
-    if (!communityId) return;
+    if (!communityId || !user) return;
     setSettingsBusy(true);
     setMsg("");
     try {
@@ -195,7 +195,7 @@ export default function PaymentsPage() {
         recipientAddress: normalizeText(settings.recipientAddress) || normalizeText(previousDefaults.recipientAddress),
       };
 
-      await setDoc(doc(db, "communities", communityId), {
+      const communityPatch = {
         defaultAccountNumber: nextDefaults.accountNumber,
         accountNumber: nextDefaults.accountNumber,
         bankAccount: nextDefaults.accountNumber,
@@ -221,32 +221,48 @@ export default function PaymentsPage() {
           recipientAddress: nextDefaults.recipientAddress,
         },
         updatedAtMs: Date.now(),
-      }, { merge: true });
+      };
 
-      const batch = writeBatch(db);
-      settlements.filter((s) => s.isPublished !== true).forEach((settlement) => {
-        const flat = flatById.get(String(settlement.flatId || ""));
-        const patch: Record<string, any> = { updatedAtMs: Date.now() };
-        if (nextDefaults.accountNumber && (!normalizeAccountNumber(settlement.accountNumber || settlement.bankAccount) || sameAccount(settlement.accountNumber || settlement.bankAccount, previousDefaults.accountNumber))) {
-          patch.accountNumber = nextDefaults.accountNumber;
-          patch.bankAccount = nextDefaults.accountNumber;
-        }
-        if (nextDefaults.recipientName && (!normalizeText(settlement.transferName || settlement.receiverName) || sameText(settlement.transferName || settlement.receiverName, previousDefaults.recipientName))) {
-          patch.transferName = nextDefaults.recipientName;
-          patch.receiverName = nextDefaults.recipientName;
-        }
-        if (nextDefaults.recipientAddress && (!normalizeText(settlement.transferAddress || settlement.receiverAddress) || sameText(settlement.transferAddress || settlement.receiverAddress, previousDefaults.recipientAddress))) {
-          patch.transferAddress = nextDefaults.recipientAddress;
-          patch.receiverAddress = nextDefaults.recipientAddress;
-        }
-        const paymentRef = settlementRefForDraft(communityId, settlement, flat);
-        patch.paymentRef = paymentRef;
-        patch.paymentTitle = paymentRef;
-        patch.transferTitle = paymentRef;
-        patch.paymentCode = paymentRef;
-        batch.set(doc(db, "communities", communityId, settlement.__collection || SETTLEMENT_DRAFTS_COLLECTION, settlement.id), patch, { merge: true });
+      const settlementPatches = settlements
+        .filter((s) => s.isPublished !== true)
+        .map((settlement) => {
+          const flat = flatById.get(String(settlement.flatId || ""));
+          const patch: Record<string, any> = { updatedAtMs: Date.now() };
+          if (nextDefaults.accountNumber && (!normalizeAccountNumber(settlement.accountNumber || settlement.bankAccount) || sameAccount(settlement.accountNumber || settlement.bankAccount, previousDefaults.accountNumber))) {
+            patch.accountNumber = nextDefaults.accountNumber;
+            patch.bankAccount = nextDefaults.accountNumber;
+          }
+          if (nextDefaults.recipientName && (!normalizeText(settlement.transferName || settlement.receiverName) || sameText(settlement.transferName || settlement.receiverName, previousDefaults.recipientName))) {
+            patch.transferName = nextDefaults.recipientName;
+            patch.receiverName = nextDefaults.recipientName;
+          }
+          if (nextDefaults.recipientAddress && (!normalizeText(settlement.transferAddress || settlement.receiverAddress) || sameText(settlement.transferAddress || settlement.receiverAddress, previousDefaults.recipientAddress))) {
+            patch.transferAddress = nextDefaults.recipientAddress;
+            patch.receiverAddress = nextDefaults.recipientAddress;
+          }
+          const paymentRef = settlementRefForDraft(communityId, settlement, flat);
+          patch.paymentRef = paymentRef;
+          patch.paymentTitle = paymentRef;
+          patch.transferTitle = paymentRef;
+          patch.paymentCode = paymentRef;
+          return {
+            settlementId: settlement.id,
+            collection: settlement.__collection || SETTLEMENT_DRAFTS_COLLECTION,
+            patch,
+          };
+        });
+
+      const token = await user.getIdToken();
+      const res = await fetch("/api/panel/payment-settings", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ communityId, communityPatch, settlementPatches }),
       });
-      await batch.commit();
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(data?.error || "Błąd zapisu ustawień płatności.");
 
       setSettings((prev) => ({
         ...prev,
@@ -255,6 +271,8 @@ export default function PaymentsPage() {
         recipientAddress: nextDefaults.recipientAddress,
       }));
       setMsg("Zapisano dane do przelewów i konfigurację automatyzacji.");
+    } catch (error: any) {
+      setMsg(error?.message || "Błąd zapisu ustawień płatności.");
     } finally {
       setSettingsBusy(false);
     }

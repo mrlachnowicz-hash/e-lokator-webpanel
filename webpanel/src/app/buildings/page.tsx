@@ -8,13 +8,62 @@ import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
 
-type Flat = { id: string; street?: string; streetId?: string; streetName?: string; buildingNo?: string; apartmentNo?: string; flatLabel?: string; residentName?: string; displayName?: string; email?: string; phone?: string; residentUid?: string | null; userId?: string | null; };
-type User = { id: string; flatId?: string; displayName?: string; email?: string; phone?: string; street?: string; buildingNo?: string; apartmentNo?: string; role?: string };
+type Flat = {
+  id: string;
+  street?: string;
+  streetId?: string;
+  streetName?: string;
+  buildingNo?: string;
+  apartmentNo?: string;
+  flatLabel?: string;
+  residentName?: string;
+  displayName?: string;
+  email?: string;
+  phone?: string;
+  residentUid?: string | null;
+  userId?: string | null;
+};
+
+type User = {
+  id: string;
+  flatId?: string;
+  displayName?: string;
+  email?: string;
+  phone?: string;
+  street?: string;
+  buildingNo?: string;
+  apartmentNo?: string;
+  role?: string;
+  isShadow?: boolean;
+  placeholderResident?: boolean;
+  removedAtMs?: number | null;
+};
+
 type BuildingRow = { key: string; street: string; buildingNo: string; flatsCount: number; flats: Flat[] };
 type StreetRow = { key: string; street: string; buildings: BuildingRow[]; flatsCount: number };
 
-function apartment(flat: Flat) { return String(flat.apartmentNo || "").trim(); }
-function flatLabel(flat: Flat) { return String(flat.flatLabel || `${flat.street || flat.streetName || ""} ${flat.buildingNo || ""}/${apartment(flat)}`.trim()); }
+function apartment(flat: Flat) {
+  return String(flat.apartmentNo || "").trim();
+}
+
+function flatLabel(flat: Flat) {
+  return String(flat.flatLabel || `${flat.street || flat.streetName || ""} ${flat.buildingNo || ""}/${apartment(flat)}`.trim());
+}
+
+function isSyntheticUserId(value: unknown) {
+  const id = String(value || "").trim();
+  return id.startsWith("payer_") || id.startsWith("shadow_");
+}
+
+function isVisibleLinkedUser(user: any) {
+  if (!user) return false;
+  const role = String(user.role || "").toUpperCase();
+  if (role === "REMOVED") return false;
+  if (user.isShadow === true || user.placeholderResident === true) return false;
+  if (user.removedAtMs != null) return false;
+  if (isSyntheticUserId(user.id)) return false;
+  return true;
+}
 
 export default function BuildingsPage() {
   const { profile } = useAuth();
@@ -32,7 +81,23 @@ export default function BuildingsPage() {
       const streetsMap = new Map<string, StreetRow>();
       flatsCache.forEach((flat) => {
         const linkedUser = usersByFlatId.get(flat.id);
-        const merged: Flat = linkedUser ? { ...flat, displayName: flat.displayName || linkedUser.displayName || "", email: flat.email || linkedUser.email || "", phone: flat.phone || linkedUser.phone || "", residentName: flat.residentName || linkedUser.displayName || "", residentUid: flat.residentUid || linkedUser.id || null, userId: flat.userId || linkedUser.id || null } : flat;
+        const flatResidentUid = isSyntheticUserId(flat.residentUid) ? null : flat.residentUid || null;
+        const flatUserId = isSyntheticUserId(flat.userId) ? null : flat.userId || null;
+        const merged: Flat = linkedUser
+          ? {
+              ...flat,
+              displayName: flat.displayName || linkedUser.displayName || "",
+              email: flat.email || linkedUser.email || "",
+              phone: flat.phone || linkedUser.phone || "",
+              residentName: flat.residentName || linkedUser.displayName || "",
+              residentUid: flatResidentUid || linkedUser.id || null,
+              userId: flatUserId || linkedUser.id || null,
+            }
+          : {
+              ...flat,
+              residentUid: flatResidentUid,
+              userId: flatUserId,
+            };
         const street = String(displayStreetName(merged.street || merged.streetName || linkedUser?.street, (merged as any).streetId, streetsById) || "").trim();
         const buildingNo = String(merged.buildingNo || linkedUser?.buildingNo || "").trim();
         if (!street || !buildingNo) return;
@@ -67,11 +132,18 @@ export default function BuildingsPage() {
     });
     const unsubUsers = onSnapshot(query(collection(db, "users"), where("communityId", "==", communityId)), (snap) => {
       usersByFlatId = new Map(
-        snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })).filter((u: any) => String(u.flatId || "").trim()).map((u: any) => [String(u.flatId), u])
+        snap.docs
+          .map((d) => ({ id: d.id, ...(d.data() as any) }))
+          .filter((u: any) => isVisibleLinkedUser(u) && String(u.flatId || "").trim())
+          .map((u: any) => [String(u.flatId), u])
       );
       merge();
     });
-    return () => { unsubFlats(); unsubUsers(); unsubStreets(); };
+    return () => {
+      unsubFlats();
+      unsubUsers();
+      unsubStreets();
+    };
   }, [communityId]);
 
   const totalBuildings = useMemo(() => items.reduce((a, x) => a + x.buildings.length, 0), [items]);

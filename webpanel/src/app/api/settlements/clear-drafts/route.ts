@@ -1,16 +1,19 @@
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
-import { NextRequest, NextResponse } from 'next/server';
-import { getAdminDb } from '../../../../lib/server/firebaseAdmin';
+import { NextResponse } from 'next/server';
+import { PanelAuthError, requirePanelAccess } from '@/lib/server/panelAuth';
 
-export async function POST(req: NextRequest) {
+function safe(value: unknown): string {
+  return String(value || '').trim();
+}
+
+export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({} as any));
-    const communityId = String(body?.communityId || '').trim();
-    if (!communityId) return NextResponse.json({ error: 'Brak communityId.' }, { status: 400 });
+    const communityId = safe(body?.communityId);
+    const { db } = await requirePanelAccess(req, { communityId });
 
-    const db = getAdminDb();
     const snap = await db.collection(`communities/${communityId}/settlementDrafts`).get();
     if (snap.empty) return NextResponse.json({ ok: true, deleted: 0 });
 
@@ -30,6 +33,9 @@ export async function POST(req: NextRequest) {
     if (ops > 0) await batch.commit();
     return NextResponse.json({ ok: true, deleted });
   } catch (error: any) {
+    if (error instanceof PanelAuthError) {
+      return NextResponse.json({ error: error.message }, { status: error.status });
+    }
     return NextResponse.json({ error: error?.message || 'Błąd czyszczenia szkiców.' }, { status: 500 });
   }
 }

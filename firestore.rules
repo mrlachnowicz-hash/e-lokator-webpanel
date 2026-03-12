@@ -198,7 +198,32 @@ service cloud.firestore {
         allow write: if canManagePanel(communityId);
       }
 
+      match /settlementDrafts/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
       match /payments/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /ksefInvoices/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /meters/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /meterReadings/{docId} {
+        allow read: if canUsePanel(communityId);
+        allow write: if canManagePanel(communityId);
+      }
+
+      match /ksef/{document=**} {
         allow read: if canUsePanel(communityId);
         allow write: if canManagePanel(communityId);
       }

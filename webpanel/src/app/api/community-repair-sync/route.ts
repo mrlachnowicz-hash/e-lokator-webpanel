@@ -32,7 +32,8 @@ async function repairCommunity(db: FirebaseFirestore.Firestore, communityId: str
   usersSnap.docs.forEach((doc) => {
     const data = doc.data() || {};
     const email = normEmail(data.email);
-    if (email && data.isShadow !== true && !usersByEmail.has(email)) usersByEmail.set(email, { id: doc.id, data });
+    const role = safe(data.role).toUpperCase();
+    if (email && data.isShadow !== true && data.placeholderResident !== true && role != "REMOVED" && !usersByEmail.has(email)) usersByEmail.set(email, { id: doc.id, data });
   });
 
   let payerCount = 0;
@@ -104,12 +105,12 @@ async function repairCommunity(db: FirebaseFirestore.Firestore, communityId: str
         flatLabel: safe(payer.flatLabel),
         flatKey: safe(payer.flatKey),
         mailOnly: false,
-        placeholderResident: false,
-        isShadow: false,
+        placeholderResident: true,
+        isShadow: true,
         authLinked: false,
-        active: true,
-        appVisible: true,
-        source: "WEBPANEL_PAYER",
+        active: false,
+        appVisible: false,
+        source: "WEBPANEL_PLACEHOLDER",
         createdAtMs: Number(payer.createdAtMs || Date.now()),
         updatedAtMs: Date.now(),
       };

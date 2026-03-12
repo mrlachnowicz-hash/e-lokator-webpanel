@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { collection, deleteDoc, doc, getDocs, onSnapshot, setDoc, updateDoc, writeBatch } from "firebase/firestore";
+import { collection, doc, onSnapshot } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
@@ -16,12 +16,6 @@ type PaymentDefaults = { defaultAccountNumber: string; recipientName: string; re
 
 function money(v: any) { return `${Number(v || 0).toFixed(2)} PLN`; }
 function centsOrAmount(cents: any, amount: any) { return cents != null ? Number(cents) / 100 : Number(amount || 0); }
-function monthLabel(period: string) {
-  const names = ["styczeń", "luty", "marzec", "kwiecień", "maj", "czerwiec", "lipiec", "sierpień", "wrzesień", "październik", "listopad", "grudzień"];
-  const m = String(period || "").match(/^(\d{4})-(\d{2})/);
-  if (!m) return period || "bez daty";
-  return `${names[Number(m[2]) - 1] || m[2]} ${m[1]}`;
-}
 function readCommunityDefaults(data: any): PaymentDefaults {
   return {
     defaultAccountNumber: String(data?.defaultAccountNumber || data?.accountNumber || data?.bankAccount || data?.paymentSettings?.accountNumber || data?.paymentDefaults?.accountNumber || ""),
@@ -56,6 +50,11 @@ function mergeDefaults(input: PaymentDefaults, currentCommunity: any): PaymentDe
     recipientAddress: normalizeText(input.recipientAddress) || normalizeText(existing.recipientAddress),
   };
 }
+async function requireToken() {
+  const token = await auth.currentUser?.getIdToken();
+  if (!token) throw new Error("Brak aktywnej sesji Firebase.");
+  return token;
+}
 
 export default function ChargesPage() {
   const { profile } = useAuth();
@@ -74,9 +73,9 @@ export default function ChargesPage() {
       try {
         const token = await auth.currentUser?.getIdToken();
         if (!token) return;
-        const res = await fetch('/api/charges/overview', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', authorization: `Bearer ${token}` },
+        const res = await fetch("/api/charges/overview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", authorization: `Bearer ${token}` },
           body: JSON.stringify({ communityId }),
         });
         if (!res.ok) return;
@@ -102,11 +101,11 @@ export default function ChargesPage() {
       setDefaults(readCommunityDefaults(data));
     });
     const onVisible = () => { if (!document.hidden) loadViaAdmin(); };
-    document.addEventListener('visibilitychange', onVisible);
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
       window.clearInterval(refreshTimer);
-      document.removeEventListener('visibilitychange', onVisible);
+      document.removeEventListener("visibilitychange", onVisible);
       unsubFlats();
       unsubCommunity();
     };
@@ -122,59 +121,88 @@ export default function ChargesPage() {
 
   const saveDefaults = async () => {
     if (!communityId) return;
-    const previousDefaults = readCommunityDefaults(communityDoc || {});
-    const nextDefaults = mergeDefaults(defaults, communityDoc || {});
-    await setDoc(doc(db, "communities", communityId), {
-      defaultAccountNumber: nextDefaults.defaultAccountNumber,
-      accountNumber: nextDefaults.defaultAccountNumber,
-      bankAccount: nextDefaults.defaultAccountNumber,
-      recipientName: nextDefaults.recipientName,
-      receiverName: nextDefaults.recipientName,
-      transferName: nextDefaults.recipientName,
-      recipientAddress: nextDefaults.recipientAddress,
-      receiverAddress: nextDefaults.recipientAddress,
-      transferAddress: nextDefaults.recipientAddress,
-      paymentSettings: { ...(communityDoc?.paymentSettings || {}), accountNumber: nextDefaults.defaultAccountNumber, recipientName: nextDefaults.recipientName, recipientAddress: nextDefaults.recipientAddress, updatedAtMs: Date.now() },
-      paymentDefaults: { accountNumber: nextDefaults.defaultAccountNumber, recipientName: nextDefaults.recipientName, recipientAddress: nextDefaults.recipientAddress },
-      updatedAtMs: Date.now(),
-    }, { merge: true });
+    try {
+      const previousDefaults = readCommunityDefaults(communityDoc || {});
+      const nextDefaults = mergeDefaults(defaults, communityDoc || {});
+      const communityPatch = {
+        defaultAccountNumber: nextDefaults.defaultAccountNumber,
+        accountNumber: nextDefaults.defaultAccountNumber,
+        bankAccount: nextDefaults.defaultAccountNumber,
+        recipientName: nextDefaults.recipientName,
+        receiverName: nextDefaults.recipientName,
+        transferName: nextDefaults.recipientName,
+        recipientAddress: nextDefaults.recipientAddress,
+        receiverAddress: nextDefaults.recipientAddress,
+        transferAddress: nextDefaults.recipientAddress,
+        paymentSettings: {
+          ...(communityDoc?.paymentSettings || {}),
+          accountNumber: nextDefaults.defaultAccountNumber,
+          recipientName: nextDefaults.recipientName,
+          recipientAddress: nextDefaults.recipientAddress,
+          updatedAtMs: Date.now(),
+        },
+        paymentDefaults: {
+          accountNumber: nextDefaults.defaultAccountNumber,
+          recipientName: nextDefaults.recipientName,
+          recipientAddress: nextDefaults.recipientAddress,
+        },
+        updatedAtMs: Date.now(),
+      };
 
-    const batch = writeBatch(db);
-    items.forEach((draft) => {
-      const flat = flats[draft.flatId] || null;
-      const patch: Record<string, any> = { updatedAtMs: Date.now() };
-      if (nextDefaults.defaultAccountNumber && shouldReplaceAccount(draft.accountNumber || draft.bankAccount, previousDefaults)) {
-        patch.accountNumber = nextDefaults.defaultAccountNumber; patch.bankAccount = nextDefaults.defaultAccountNumber;
-      }
-      if (nextDefaults.recipientName && shouldReplaceText(draft.transferName || draft.receiverName, previousDefaults.recipientName)) {
-        patch.transferName = nextDefaults.recipientName; patch.receiverName = nextDefaults.recipientName;
-      }
-      if (nextDefaults.recipientAddress && shouldReplaceText(draft.transferAddress || draft.receiverAddress, previousDefaults.recipientAddress)) {
-        patch.transferAddress = nextDefaults.recipientAddress; patch.receiverAddress = nextDefaults.recipientAddress;
-      }
-      const paymentRef = pickSettlementTitle(draft, flat);
-      patch.transferTitle = paymentRef; patch.paymentTitle = paymentRef; patch.paymentRef = paymentRef; patch.paymentCode = paymentRef;
-      batch.set(doc(db, "communities", communityId, draft.__collection || SETTLEMENT_DRAFTS_COLLECTION, draft.id), patch, { merge: true });
-    });
-    await batch.commit();
-    setDefaults(nextDefaults);
-    setMsg("Zapisano domyślne dane do przelewu.");
+      const settlementPatches = items.map((draft) => {
+        const flat = flats[draft.flatId] || null;
+        const patch: Record<string, any> = { updatedAtMs: Date.now() };
+        if (nextDefaults.defaultAccountNumber && shouldReplaceAccount(draft.accountNumber || draft.bankAccount, previousDefaults)) {
+          patch.accountNumber = nextDefaults.defaultAccountNumber;
+          patch.bankAccount = nextDefaults.defaultAccountNumber;
+        }
+        if (nextDefaults.recipientName && shouldReplaceText(draft.transferName || draft.receiverName, previousDefaults.recipientName)) {
+          patch.transferName = nextDefaults.recipientName;
+          patch.receiverName = nextDefaults.recipientName;
+        }
+        if (nextDefaults.recipientAddress && shouldReplaceText(draft.transferAddress || draft.receiverAddress, previousDefaults.recipientAddress)) {
+          patch.transferAddress = nextDefaults.recipientAddress;
+          patch.receiverAddress = nextDefaults.recipientAddress;
+        }
+        const paymentRef = pickSettlementTitle(draft, flat);
+        patch.transferTitle = paymentRef;
+        patch.paymentTitle = paymentRef;
+        patch.paymentRef = paymentRef;
+        patch.paymentCode = paymentRef;
+        return {
+          settlementId: draft.id,
+          collection: draft.__collection || SETTLEMENT_DRAFTS_COLLECTION,
+          patch,
+        };
+      });
+
+      const token = await requireToken();
+      const res = await fetch("/api/panel/payment-settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ communityId, communityPatch, settlementPatches }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(data?.error || "Błąd zapisu domyślnych danych przelewu.");
+      setDefaults(nextDefaults);
+      setMsg("Zapisano domyślne dane do przelewu.");
+    } catch (error: any) {
+      setMsg(error?.message || "Błąd zapisu domyślnych danych przelewu.");
+    }
   };
 
   const clearAllDrafts = async () => {
     if (!communityId || !window.confirm("Usunąć wszystkie szkice rozliczeń?")) return;
     try {
-      const draftRefs = drafts.map((item) => doc(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION, item.id));
-      if (!draftRefs.length) {
-        setMsg("Brak szkiców do usunięcia.");
-        return;
-      }
-      for (let i = 0; i < draftRefs.length; i += 400) {
-        const batch = writeBatch(db);
-        draftRefs.slice(i, i + 400).forEach((ref) => batch.delete(ref));
-        await batch.commit();
-      }
-      setMsg(`Usunięto szkice: ${draftRefs.length}.`);
+      const token = await requireToken();
+      const res = await fetch("/api/settlements/clear-drafts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ communityId }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(data?.error || "Błąd czyszczenia szkiców.");
+      setMsg(`Usunięto szkice: ${data?.deleted || 0}.`);
     } catch (error: any) {
       setMsg(`Błąd czyszczenia szkiców: ${error?.message || error?.details || "nieznany"}`);
     }
@@ -195,9 +223,18 @@ export default function ChargesPage() {
           <div>Szkice: <strong>{drafts.length}</strong></div>
           <div>Archiwum: <strong>{archived.length}</strong></div>
           <button className="btn" onClick={async () => {
-            const res = await fetch("/api/settlements/publish-all-drafts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ communityId }) });
-            const data = await res.json();
-            setMsg(res.ok ? `Wysłano do lokatorów: ${data.published || data.publishedCount || 0} rozliczeń.` : `Błąd: ${data.error || "nieznany"}`);
+            try {
+              const token = await requireToken();
+              const res = await fetch("/api/settlements/publish-all-drafts", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ communityId }),
+              });
+              const data = await res.json().catch(() => ({} as any));
+              setMsg(res.ok ? `Wysłano do lokatorów: ${data.published || data.publishedCount || 0} rozliczeń.` : `Błąd: ${data.error || "nieznany"}`);
+            } catch (error: any) {
+              setMsg(error?.message || "Błąd publikacji szkiców.");
+            }
           }}>Wyślij wszystkie szkice</button>
           <button className="btnGhost" onClick={clearAllDrafts}>Wyczyść wszystkie szkice</button>
         </div>
@@ -250,11 +287,46 @@ function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = fal
     const cleanName = transferName.trim() || computedName;
     const cleanAddress = transferAddress.trim() || computedAddress;
     const cleanTitle = normalizePaymentRef(transferTitle) || buildTransferTitle(flat, s);
-    const payload = { accountNumber: cleanAccount, bankAccount: cleanAccount, transferName: cleanName, receiverName: cleanName, transferAddress: cleanAddress, receiverAddress: cleanAddress, transferTitle: cleanTitle, paymentTitle: cleanTitle, paymentRef: cleanTitle, paymentCode: cleanTitle, updatedAtMs: Date.now() };
-    await updateDoc(doc(db, "communities", communityId, targetCollection, s.id), payload);
-    if (flat?.id) {
-      await setDoc(doc(db, "communities", communityId, "flats", flat.id), { accountNumber: cleanAccount, bankAccount: cleanAccount, recipientName: cleanName, receiverName: cleanName, recipientAddress: cleanAddress, receiverAddress: cleanAddress, updatedAtMs: Date.now() }, { merge: true });
-    }
+    const paymentPatch = {
+      accountNumber: cleanAccount,
+      bankAccount: cleanAccount,
+      transferName: cleanName,
+      receiverName: cleanName,
+      transferAddress: cleanAddress,
+      receiverAddress: cleanAddress,
+      transferTitle: cleanTitle,
+      paymentTitle: cleanTitle,
+      paymentRef: cleanTitle,
+      paymentCode: cleanTitle,
+      updatedAtMs: Date.now(),
+    };
+    const flatPatch = flat?.id
+      ? {
+          accountNumber: cleanAccount,
+          bankAccount: cleanAccount,
+          recipientName: cleanName,
+          receiverName: cleanName,
+          recipientAddress: cleanAddress,
+          receiverAddress: cleanAddress,
+          updatedAtMs: Date.now(),
+        }
+      : null;
+
+    const token = await requireToken();
+    const res = await fetch("/api/settlements/payment-data", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        communityId,
+        settlementId: s.id,
+        targetCollection,
+        paymentPatch,
+        flatId: flat?.id || "",
+        flatPatch,
+      }),
+    });
+    const data = await res.json().catch(() => ({} as any));
+    if (!res.ok) throw new Error(data?.error || "Błąd zapisu danych przelewu.");
     setTransferTitle(cleanTitle);
     setMsg(`Zapisano dane przelewu dla ${s.flatLabel || s.id}.`);
   };
@@ -277,25 +349,59 @@ function SettlementCard({ s, communityId, flat, setMsg, defaults, archived = fal
       </div>
       <div style={{ display: "grid", gap: 4, opacity: 0.9 }}><div>Termin płatności: {s.dueDate || "—"}</div></div>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-        <button className="btnGhost" onClick={savePaymentData}>Zapisz dane przelewu</button>
+        <button className="btnGhost" onClick={async () => {
+          try {
+            await savePaymentData();
+          } catch (error: any) {
+            setMsg(error?.message || "Błąd zapisu danych przelewu.");
+          }
+        }}>Zapisz dane przelewu</button>
         <Link href={`/settlements/${s.id}`} className="btn" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center" }}>Otwórz podgląd</Link>
         {!archived ? <button className="btn" onClick={async () => {
-          await savePaymentData();
-          const res = await fetch("/api/settlements/publish", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ communityId, settlementId: s.id }) });
-          const data = await res.json();
-          setMsg(res.ok ? `Rozliczenie ${data.settlementId} wysłane do lokatora.` : `Błąd publikacji: ${data.error || "nieznany"}`);
+          try {
+            await savePaymentData();
+            const token = await requireToken();
+            const res = await fetch("/api/settlements/publish", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ communityId, settlementId: s.id }),
+            });
+            const data = await res.json().catch(() => ({} as any));
+            setMsg(res.ok ? `Rozliczenie ${data.settlementId} wysłane do lokatora.` : `Błąd publikacji: ${data.error || "nieznany"}`);
+          } catch (error: any) {
+            setMsg(error?.message || "Błąd publikacji rozliczenia.");
+          }
         }}>Wyślij do lokatora</button> : null}
         {!archived ? <button className="btnGhost" onClick={async () => {
-          if (window.confirm(`Usunąć szkic ${s.id}?`)) {
-            await deleteDoc(doc(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION, s.id));
+          if (!window.confirm(`Usunąć szkic ${s.id}?`)) return;
+          try {
+            const token = await requireToken();
+            const res = await fetch("/api/settlements/delete-draft", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ communityId, settlementId: s.id }),
+            });
+            const data = await res.json().catch(() => ({} as any));
+            if (!res.ok) throw new Error(data?.error || "Błąd usuwania szkicu.");
             setMsg(`Usunięto szkic ${s.id}.`);
+          } catch (error: any) {
+            setMsg(error?.message || "Błąd usuwania szkicu.");
           }
         }}>Usuń szkic</button> : null}
         <button className="btnGhost" onClick={async () => { window.open(`/api/settlements/${s.id}/pdf?communityId=${encodeURIComponent(communityId)}`, "_blank"); }}>PDF</button>
         <button className="btnGhost" onClick={async () => {
-          const res = await fetch(`/api/settlements/${s.id}/send-email`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ communityId }) });
-          const data = await res.json();
-          setMsg(res.ok ? `Email wysłany do: ${data.email || "—"}` : `Błąd email: ${data.error || "nieznany"}`);
+          try {
+            const token = await requireToken();
+            const res = await fetch(`/api/settlements/${s.id}/send-email`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ communityId }),
+            });
+            const data = await res.json().catch(() => ({} as any));
+            setMsg(res.ok ? `Email wysłany do: ${data.email || "—"}` : `Błąd email: ${data.error || "nieznany"}`);
+          } catch (error: any) {
+            setMsg(error?.message || "Błąd wysyłki emaila.");
+          }
         }}>Wyślij email</button>
       </div>
     </div>

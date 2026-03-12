@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { collection, doc, getDoc, onSnapshot, setDoc } from "firebase/firestore";
+import { collection, doc, getDoc, onSnapshot } from "firebase/firestore";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
@@ -12,7 +12,7 @@ import { IconSpreadsheet, IconBuilding, IconHome, IconReceipt, IconCoins, IconSh
 import { isPanelEnabled } from "../../lib/panelAccess";
 
 export default function DashboardPage() {
-  const { profile, community } = useAuth();
+  const { user, profile, community } = useAuth();
   const communityId = profile?.communityId || "";
   const role = String(profile?.role || "");
   const panelEnabled = isPanelEnabled(community?.panelAccessEnabled);
@@ -29,7 +29,9 @@ export default function DashboardPage() {
     });
     if (!panelEnabled) {
       setStats({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0, meters: 0 });
-      return () => { mounted = false; };
+      return () => {
+        mounted = false;
+      };
     }
 
     const unsubs = [
@@ -46,13 +48,30 @@ export default function DashboardPage() {
         setStats((prev) => ({ ...prev, unmatchedPayments: unmatched }));
       }),
     ];
-    return () => { mounted = false; unsubs.forEach((x) => x()); };
+    return () => {
+      mounted = false;
+      unsubs.forEach((x) => x());
+    };
   }, [communityId, panelEnabled]);
 
   const saveWebpanelUrl = async () => {
-    if (!communityId) return;
-    await setDoc(doc(db, "communities", communityId), { webpanelUrl, updatedAtMs: Date.now() }, { merge: true });
-    alert("Zapisano adres webpanelu / SSO.");
+    if (!communityId || !user) return;
+    try {
+      const token = await user.getIdToken();
+      const res = await fetch("/api/panel/webpanel-url", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ communityId, webpanelUrl }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(data?.error || "Błąd zapisu adresu webpanelu.");
+      alert("Zapisano adres webpanelu / SSO.");
+    } catch (error: any) {
+      alert(error?.message || "Błąd zapisu adresu webpanelu.");
+    }
   };
 
   const genJoinCode = async () => {
@@ -108,7 +127,7 @@ export default function DashboardPage() {
           <p>Aplikacja może otwierać webpanel przez <code>createWebSession</code> i ekran <code>/sso?token=...</code>.</p>
           <div className="formRow">
             <input className="input" value={webpanelUrl} onChange={(e) => setWebpanelUrl(e.target.value)} placeholder="https://twoj-panel.vercel.app" />
-            <button className="btn" onClick={saveWebpanelUrl} disabled={!communityId}>Zapisz</button>
+            <button className="btn" onClick={saveWebpanelUrl} disabled={!communityId || !user}>Zapisz</button>
           </div>
         </div>
         {role === "MASTER" && panelEnabled && (
