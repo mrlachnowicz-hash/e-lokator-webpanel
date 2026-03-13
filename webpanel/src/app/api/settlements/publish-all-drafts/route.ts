@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { getAdminDb } from "@/lib/server/firebaseAdmin";
 import { PanelAuthError, requirePanelAccess } from "@/lib/server/panelAuth";
 
 export const runtime = "nodejs";
@@ -44,21 +43,117 @@ export async function POST(req: Request) {
     const authHeader = req.headers.get("authorization") || "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
     const { db: adminDb } = await requirePanelAccess(req, { communityId });
-    const allSnap = await adminDb.collection(`communities/${communityId}/settlementDrafts`).get();
-    const docs = allSnap.docs.filter((doc) => !periodFilter || safe(doc.data()?.period) === periodFilter);
-    if (!docs.length) return NextResponse.json({ ok: true, published: 0, publishedCount: 0, emailFallbackCount: 0, settlementIds: [] });
+
+    const emptySnap = { docs: [] as FirebaseFirestore.QueryDocumentSnapshot[] };
+    const [communitySnap, legacySnap] = await Promise.all([
+      adminDb.collection(`communities/${communityId}/settlementDrafts`).get(),
+      adminDb
+        .collection(`settlementDrafts`)
+        .where("communityId", "==", communityId)
+        .get()
+        .catch(() => emptySnap as any),
+    ]);
+
+    const dedupe = new Map<
+      string,
+      {
+        id: string;
+        data: any;
+        sourceRef: FirebaseFirestore.DocumentReference | null;
+        duplicateRefs: FirebaseFirestore.DocumentReference[];
+      }
+    >();
+
+    for (const docSnap of communitySnap.docs) {
+      const data: any = docSnap.data() || {};
+      if (periodFilter && safe(data.period || data.archiveMonth) !== periodFilter) continue;
+      dedupe.set(docSnap.id, {
+        id: docSnap.id,
+        data,
+        sourceRef: docSnap.ref,
+        duplicateRefs: [],
+      });
+    }
+
+    for (const docSnap of legacySnap.docs || []) {
+      const data: any = docSnap.data() || {};
+      if (periodFilter && safe(data.period || data.archiveMonth) !== periodFilter) continue;
+      const existing = dedupe.get(docSnap.id);
+      if (existing) {
+        existing.duplicateRefs.push(docSnap.ref);
+        continue;
+      }
+      dedupe.set(docSnap.id, {
+        id: docSnap.id,
+        data,
+        sourceRef: docSnap.ref,
+        duplicateRefs: [],
+      });
+    }
+
+    const docs = Array.from(dedupe.values()).sort(
+      (a, b) => Number(b.data?.updatedAtMs || b.data?.createdAtMs || 0) - Number(a.data?.updatedAtMs || a.data?.createdAtMs || 0)
+    );
+
+    if (!docs.length) {
+      return NextResponse.json({
+        ok: true,
+        published: 0,
+        publishedCount: 0,
+        emailFallbackCount: 0,
+        settlementIds: [],
+      });
+    }
 
     const now = Date.now();
-    for (const docSnap of docs) {
-      const data: any = docSnap.data() || {};
-      await adminDb.doc(`communities/${communityId}/settlements/${docSnap.id}`).set({ ...data, isPublished: true, status: "PUBLISHED", publishedAtMs: now, updatedAtMs: now, archiveMonth: safe(data.period || data.archiveMonth) }, { merge: true });
-      await docSnap.ref.delete();
+    let batch = adminDb.batch();
+    let ops = 0;
+    const commitIfNeeded = async () => {
+      if (ops < 380) return;
+      await batch.commit();
+      batch = adminDb.batch();
+      ops = 0;
+    };
+
+    for (const entry of docs) {
+      const data: any = entry.data || {};
+      batch.set(
+        adminDb.doc(`communities/${communityId}/settlements/${entry.id}`),
+        {
+          ...data,
+          communityId,
+          isPublished: true,
+          status: "PUBLISHED",
+          publishedAtMs: now,
+          updatedAtMs: now,
+          archiveMonth: safe(data.period || data.archiveMonth),
+        },
+        { merge: true }
+      );
+      ops += 1;
+      await commitIfNeeded();
+
+      if (entry.sourceRef) {
+        batch.delete(entry.sourceRef);
+        ops += 1;
+        await commitIfNeeded();
+      }
+
+      for (const duplicateRef of entry.duplicateRefs) {
+        batch.delete(duplicateRef);
+        ops += 1;
+        await commitIfNeeded();
+      }
+    }
+
+    if (ops > 0) {
+      await batch.commit();
     }
 
     let emailFallbackCount = 0;
     const origin = new URL(req.url).origin;
     for (const settlementDoc of docs) {
-      const data: any = settlementDoc.data() || {};
+      const data: any = settlementDoc.data || {};
       if (!data.flatId) continue;
       const flatSnap = await adminDb.doc(`communities/${communityId}/flats/${data.flatId}`).get().catch(() => null as any);
       const flat: any = flatSnap?.exists ? flatSnap.data() : {};
@@ -71,7 +166,13 @@ export async function POST(req: Request) {
       }
     }
 
-    return NextResponse.json({ ok: true, published: docs.length, publishedCount: docs.length, emailFallbackCount, settlementIds: docs.map((doc) => doc.id) });
+    return NextResponse.json({
+      ok: true,
+      published: docs.length,
+      publishedCount: docs.length,
+      emailFallbackCount,
+      settlementIds: docs.map((doc) => doc.id),
+    });
   } catch (error: any) {
     if (error instanceof PanelAuthError) {
       return NextResponse.json({ error: error.message }, { status: error.status });

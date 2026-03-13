@@ -17,8 +17,30 @@ export async function POST(req: Request) {
     }
 
     const { db } = await requirePanelAccess(req, { communityId });
-    await db.doc(`communities/${communityId}/settlementDrafts/${settlementId}`).delete();
-    return NextResponse.json({ ok: true, settlementId });
+    const nestedRef = db.doc(`communities/${communityId}/settlementDrafts/${settlementId}`);
+    const legacyRef = db.doc(`settlementDrafts/${settlementId}`);
+    const [nestedSnap, rawLegacySnap] = await Promise.all([
+      nestedRef.get(),
+      legacyRef.get().catch(() => null as any),
+    ]);
+
+    const batch = db.batch();
+    let deleted = 0;
+
+    if (nestedSnap.exists) {
+      batch.delete(nestedRef);
+      deleted += 1;
+    }
+    if (rawLegacySnap?.exists && safe(rawLegacySnap.data()?.communityId) === communityId) {
+      batch.delete(legacyRef);
+      deleted += 1;
+    }
+
+    if (deleted > 0) {
+      await batch.commit();
+    }
+
+    return NextResponse.json({ ok: true, settlementId, deleted });
   } catch (error: any) {
     if (error instanceof PanelAuthError) {
       return NextResponse.json({ error: error.message }, { status: error.status });

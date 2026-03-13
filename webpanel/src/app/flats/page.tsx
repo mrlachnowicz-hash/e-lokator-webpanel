@@ -8,12 +8,36 @@ import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
 import { buildFlatLabel } from "../../lib/flatMapping";
 import { displayStreetName } from "../../lib/streetUtils";
-import { getFlatApartmentNo as getDisplayApartmentNo, getFlatDisplayLabel, getFlatEmail, getFlatPhone, getFlatResidentName } from "../../lib/flatDisplay";
+import {
+  getFlatApartmentNo as getDisplayApartmentNo,
+  getFlatDisplayLabel,
+  getFlatEmail,
+  getFlatPhone,
+  getFlatResidentName,
+} from "../../lib/flatDisplay";
 
 type Flat = any;
-type FormState = { id: string | null; street: string; buildingNo: string; apartmentNo: string; name: string; surname: string; email: string; phone: string };
+type FormState = {
+  id: string | null;
+  street: string;
+  buildingNo: string;
+  apartmentNo: string;
+  name: string;
+  surname: string;
+  email: string;
+  phone: string;
+};
 
-const emptyForm: FormState = { id: null, street: "", buildingNo: "", apartmentNo: "", name: "", surname: "", email: "", phone: "" };
+const emptyForm: FormState = {
+  id: null,
+  street: "",
+  buildingNo: "",
+  apartmentNo: "",
+  name: "",
+  surname: "",
+  email: "",
+  phone: "",
+};
 
 function getResidentName(flat: Flat) {
   return String(getFlatResidentName(flat));
@@ -26,7 +50,14 @@ function getApartmentNo(flat: Flat) {
 function getFlatLabel(flat: Flat, streetNames?: Map<string, string>) {
   const fallback = String(getFlatDisplayLabel(flat));
   if (fallback && fallback !== String(flat.id || "")) return fallback;
-  return String(flat.flatLabel || buildFlatLabel(displayStreetName(flat.street || flat.streetName, flat.streetId, streetNames), flat.buildingNo, getApartmentNo(flat)));
+  return String(
+    flat.flatLabel ||
+      buildFlatLabel(
+        displayStreetName(flat.street || flat.streetName, flat.streetId, streetNames),
+        flat.buildingNo,
+        getApartmentNo(flat)
+      )
+  );
 }
 
 function isSyntheticUserId(value: unknown) {
@@ -49,6 +80,7 @@ export default function FlatsPage() {
   const communityId = profile?.communityId || "";
   const role = String(profile?.role || "");
   const canEdit = ["MASTER", "ACCOUNTANT"].includes(role);
+
   const [items, setItems] = useState<Flat[]>([]);
   const [form, setForm] = useState<FormState>(emptyForm);
   const [msg, setMsg] = useState<string | null>(null);
@@ -69,24 +101,68 @@ export default function FlatsPage() {
           const user = usersByFlatId.get(flat.id);
           const payer = payersByFlatId.get(flat.id);
           const hasVisibleUser = isVisibleLinkedUser(user);
-          const residentUid = isSyntheticUserId(flat.residentUid) ? null : (flat.residentUid || (hasVisibleUser ? user.id : null));
-          const userId = isSyntheticUserId(flat.userId) ? null : (flat.userId || (hasVisibleUser ? user.id : null));
+          const residentUid = isSyntheticUserId(flat.residentUid)
+            ? null
+            : flat.residentUid || (hasVisibleUser ? user.id : null);
+          const userId = isSyntheticUserId(flat.userId)
+            ? null
+            : flat.userId || (hasVisibleUser ? user.id : null);
+
           return {
             ...flat,
-            street: displayStreetName(flat.street || flat.streetName || payer?.street, flat.streetId || user?.streetId || payer?.streetId, streetNamesById) || flat.street || payer?.street || "",
+            street:
+              displayStreetName(
+                flat.street || flat.streetName || payer?.street,
+                flat.streetId || user?.streetId || payer?.streetId,
+                streetNamesById
+              ) ||
+              flat.street ||
+              payer?.street ||
+              "",
             buildingNo: flat.buildingNo || payer?.buildingNo || "",
             apartmentNo: getApartmentNo(flat) || payer?.apartmentNo || "",
             residentUid,
             userId,
-            displayName: flat.displayName || (hasVisibleUser ? user?.displayName : "") || payer?.displayName || "",
-            name: flat.name || flat.firstName || (hasVisibleUser ? user?.firstName : "") || payer?.name || "",
-            surname: flat.surname || flat.lastName || (hasVisibleUser ? user?.lastName : "") || payer?.surname || "",
-            email: flat.email || (hasVisibleUser ? (user?.email || user?.mail || user?.contactEmail) : "") || payer?.email || "",
-            phone: flat.phone || (hasVisibleUser ? (user?.phone || user?.phoneNumber || user?.mobile) : "") || payer?.phone || "",
-            residentName: flat.residentName || (hasVisibleUser ? user?.displayName : "") || payer?.displayName || `${hasVisibleUser ? user?.firstName || "" : ""} ${hasVisibleUser ? user?.lastName || "" : ""}`.trim(),
+            displayName:
+              flat.displayName ||
+              (hasVisibleUser ? user?.displayName : "") ||
+              payer?.displayName ||
+              "",
+            name:
+              flat.name ||
+              flat.firstName ||
+              (hasVisibleUser ? user?.firstName : "") ||
+              payer?.name ||
+              "",
+            surname:
+              flat.surname ||
+              flat.lastName ||
+              (hasVisibleUser ? user?.lastName : "") ||
+              payer?.surname ||
+              "",
+            email:
+              flat.email ||
+              (hasVisibleUser ? user?.email || user?.mail || user?.contactEmail : "") ||
+              payer?.email ||
+              "",
+            phone:
+              flat.phone ||
+              (hasVisibleUser ? user?.phone || user?.phoneNumber || user?.mobile : "") ||
+              payer?.phone ||
+              "",
+            residentName:
+              flat.residentName ||
+              (hasVisibleUser ? user?.displayName : "") ||
+              payer?.displayName ||
+              `${hasVisibleUser ? user?.firstName || "" : ""} ${hasVisibleUser ? user?.lastName || "" : ""}`.trim(),
           };
         })
-        .sort((a, b) => getFlatLabel(a, streetNamesById).localeCompare(getFlatLabel(b, streetNamesById), "pl", { numeric: true }));
+        .sort((a, b) =>
+          getFlatLabel(a, streetNamesById).localeCompare(getFlatLabel(b, streetNamesById), "pl", {
+            numeric: true,
+          })
+        );
+
       setItems(merged);
     };
 
@@ -95,9 +171,33 @@ export default function FlatsPage() {
       try {
         const cs = await getDoc(doc(db, "communities", communityId));
         const c: any = cs.data() || {};
-        const limit = Number(c.seatsTotal || c.panelSeats || c.panelSeatsLimit || c.seats || c.seatsLimit || c.totalSeats || c.maxSeats || c.purchasedSeats || c.seatsPurchased || c.flatsLimit || c.localsLimit || c.localiLimit || c.unitsLimit || c.licenses || c.seatCount || 0) || null;
-        const used = typeof c.seatsUsed === "number" ? Math.max(Math.floor(c.seatsUsed), snap.size) : snap.size;
-        setSeatInfo({ limit, used, remaining: limit == null ? null : Math.max(0, limit - used) });
+        const limit =
+          Number(
+            c.seatsTotal ||
+              c.panelSeats ||
+              c.panelSeatsLimit ||
+              c.seats ||
+              c.seatsLimit ||
+              c.totalSeats ||
+              c.maxSeats ||
+              c.purchasedSeats ||
+              c.seatsPurchased ||
+              c.flatsLimit ||
+              c.localsLimit ||
+              c.localiLimit ||
+              c.unitsLimit ||
+              c.licenses ||
+              c.seatCount ||
+              0
+          ) || null;
+        const used =
+          typeof c.seatsUsed === "number" ? Math.max(Math.floor(c.seatsUsed), snap.size) : snap.size;
+
+        setSeatInfo({
+          limit,
+          used,
+          remaining: limit == null ? null : Math.max(0, limit - used),
+        });
       } catch {
         setSeatInfo({ limit: null, used: snap.size, remaining: null });
       }
@@ -132,11 +232,14 @@ export default function FlatsPage() {
     };
   }, [communityId]);
 
-  const stats = useMemo(() => ({
-    total: items.length,
-    withResidents: items.filter((x) => !!getResidentName(x) || !!x.residentUid || !!x.userId).length,
-    withEmail: items.filter((x) => !!String(x.email || "").trim()).length,
-  }), [items]);
+  const stats = useMemo(
+    () => ({
+      total: items.length,
+      withResidents: items.filter((x) => !!getResidentName(x) || !!x.residentUid || !!x.userId).length,
+      withEmail: items.filter((x) => !!String(x.email || "").trim()).length,
+    }),
+    [items]
+  );
 
   const startEdit = (flat: Flat) => {
     setForm({
@@ -153,17 +256,21 @@ export default function FlatsPage() {
 
   async function saveFlat() {
     if (!communityId || !form.street.trim() || !form.buildingNo.trim() || !form.apartmentNo.trim()) return;
+
     setBusy(true);
     try {
       const token = await (await import("firebase/auth")).getAuth().currentUser?.getIdToken();
       if (!token) throw new Error("Brak aktywnej sesji Firebase.");
+
       const response = await fetch("/api/upsert-flat", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ communityId, ...form }),
       });
+
       const data = await response.json().catch(() => ({} as any));
       if (!response.ok) throw new Error(data?.error || "Błąd zapisu lokalu.");
+
       setForm(emptyForm);
       setMsg(data?.message || "Zapisano lokal.");
     } catch (e: any) {
@@ -175,17 +282,21 @@ export default function FlatsPage() {
 
   async function removeFlat(flat: Flat) {
     if (!communityId || !window.confirm(`Usunąć lokal ${getFlatLabel(flat)}?`)) return;
+
     setBusy(true);
     try {
       const token = await (await import("firebase/auth")).getAuth().currentUser?.getIdToken();
       if (!token) throw new Error("Brak aktywnej sesji Firebase.");
+
       const response = await fetch("/api/remove-flat", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ communityId, flatId: flat.id }),
       });
+
       const data = await response.json().catch(() => ({} as any));
       if (!response.ok) throw new Error(data?.error || "Błąd usuwania lokalu.");
+
       setMsg(`Usunięto lokal: ${getFlatLabel(flat)}`);
     } catch (e: any) {
       setMsg(e?.message || "Błąd usuwania lokalu.");
@@ -199,20 +310,32 @@ export default function FlatsPage() {
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 16 }}>
         <h2>Lokale</h2>
+
         <div style={{ display: "grid", gap: 12, maxWidth: 980 }}>
           <div style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 16 }}>
             <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
-              <div><b>Łącznie lokali:</b> {stats.total}</div>
-              <div><b>Z przypisanym mieszkańcem:</b> {stats.withResidents}</div>
-              <div><b>Z adresem email:</b> {stats.withEmail}</div>
-              <div><b>Seats:</b> {seatInfo.limit == null ? `${seatInfo.used} / brak limitu` : `${seatInfo.used} / ${seatInfo.limit}`}</div>
-              <div><b>Pozostało:</b> {seatInfo.remaining == null ? "—" : Math.max(0, seatInfo.remaining)}</div>
+              <div>
+                <b>Łącznie lokali:</b> {stats.total}
+              </div>
+              <div>
+                <b>Z przypisanym mieszkańcem:</b> {stats.withResidents}
+              </div>
+              <div>
+                <b>Z adresem email:</b> {stats.withEmail}
+              </div>
+              <div>
+                <b>Seats:</b> {seatInfo.limit == null ? `${seatInfo.used} / brak limitu` : `${seatInfo.used} / ${seatInfo.limit}`}
+              </div>
+              <div>
+                <b>Pozostało:</b> {seatInfo.remaining == null ? "—" : Math.max(0, seatInfo.remaining)}
+              </div>
             </div>
           </div>
 
           {canEdit ? (
             <div style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 16 }}>
               <h3>{form.id ? "Edytuj lokal" : "Dodaj lub zaktualizuj lokal"}</h3>
+
               <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr 1fr" }}>
                 <input placeholder="Ulica" value={form.street} onChange={(e) => setForm({ ...form, street: e.target.value })} />
                 <input placeholder="Nr budynku" value={form.buildingNo} onChange={(e) => setForm({ ...form, buildingNo: e.target.value })} />
@@ -222,17 +345,28 @@ export default function FlatsPage() {
                 <input placeholder="Email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
                 <input placeholder="Telefon" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
               </div>
+
               <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
                 <button onClick={saveFlat} disabled={busy}>Zapisz</button>
                 {form.id ? <button onClick={() => setForm(emptyForm)} disabled={busy}>Anuluj edycję</button> : null}
               </div>
+
               {msg ? <div style={{ marginTop: 10 }}>{msg}</div> : null}
             </div>
           ) : null}
         </div>
 
         <div style={{ border: "1px solid #e5e5e5", borderRadius: 12, overflow: "hidden", maxWidth: 1280 }}>
-          <div style={{ display: "grid", gridTemplateColumns: "1.4fr .8fr 1.2fr 1.1fr .9fr 1fr", gap: 12, padding: 14, fontWeight: 700, borderBottom: "1px solid rgba(229,229,229,0.25)" }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1.4fr .8fr 1.2fr 1.1fr .9fr 1fr",
+              gap: 12,
+              padding: 14,
+              fontWeight: 700,
+              borderBottom: "1px solid rgba(229,229,229,0.25)",
+            }}
+          >
             <div>Adres</div>
             <div>Numer</div>
             <div>Mieszkaniec</div>
@@ -240,19 +374,38 @@ export default function FlatsPage() {
             <div>Telefon</div>
             <div>Akcje</div>
           </div>
+
           {items.map((flat) => (
-            <div key={flat.id} style={{ display: "grid", gridTemplateColumns: "1.4fr .8fr 1.2fr 1.1fr .9fr 1fr", gap: 12, padding: 14, borderTop: "1px solid rgba(229,229,229,0.12)", alignItems: "center" }}>
+            <div
+              key={flat.id}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1.4fr .8fr 1.2fr 1.1fr .9fr 1fr",
+                gap: 12,
+                padding: 14,
+                borderTop: "1px solid rgba(229,229,229,0.12)",
+                alignItems: "center",
+              }}
+            >
               <div>
                 <div style={{ fontWeight: 700 }}>{getFlatLabel(flat)}</div>
-                <div style={{ opacity: 0.7, fontSize: 13 }}>Ulica: {flat.street || "—"} · Budynek: {flat.buildingNo || "—"}</div>
+                <div style={{ opacity: 0.7, fontSize: 13 }}>
+                  Ulica: {flat.street || "—"} · Budynek: {flat.buildingNo || "—"}
+                </div>
               </div>
+
               <div>{getApartmentNo(flat) || "—"}</div>
+
               <div>
                 <div>{getResidentName(flat) || "Brak danych"}</div>
-                <div style={{ opacity: 0.7, fontSize: 13 }}>{flat.residentUid || flat.userId ? "Powiązany z aplikacją" : "Brak użytkownika aplikacji"}</div>
+                <div style={{ opacity: 0.7, fontSize: 13 }}>
+                  {flat.residentUid || flat.userId ? "Powiązany z aplikacją" : "Brak użytkownika aplikacji"}
+                </div>
               </div>
+
               <div>{getFlatEmail(flat) || "—"}</div>
               <div>{getFlatPhone(flat) || "—"}</div>
+
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <button onClick={() => startEdit(flat)} disabled={!canEdit || busy}>Edytuj</button>
                 <button onClick={() => removeFlat(flat)} disabled={!canEdit || busy}>Usuń</button>

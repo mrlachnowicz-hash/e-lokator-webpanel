@@ -1,11 +1,11 @@
-export const dynamic = 'force-dynamic';
-export const runtime = 'nodejs';
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
-import { NextResponse } from 'next/server';
-import { PanelAuthError, requirePanelAccess } from '@/lib/server/panelAuth';
+import { NextResponse } from "next/server";
+import { PanelAuthError, requirePanelAccess } from "@/lib/server/panelAuth";
 
 function safe(value: unknown): string {
-  return String(value || '').trim();
+  return String(value || "").trim();
 }
 
 export async function POST(req: Request) {
@@ -14,28 +14,50 @@ export async function POST(req: Request) {
     const communityId = safe(body?.communityId);
     const { db } = await requirePanelAccess(req, { communityId });
 
-    const snap = await db.collection(`communities/${communityId}/settlementDrafts`).get();
-    if (snap.empty) return NextResponse.json({ ok: true, deleted: 0 });
+    const emptySnap = { docs: [] as FirebaseFirestore.QueryDocumentSnapshot[] };
+    const [communitySnap, legacySnap] = await Promise.all([
+      db.collection(`communities/${communityId}/settlementDrafts`).get(),
+      db
+        .collection("settlementDrafts")
+        .where("communityId", "==", communityId)
+        .get()
+        .catch(() => emptySnap as any),
+    ]);
+
+    if (communitySnap.empty && !(legacySnap.docs || []).length) {
+      return NextResponse.json({ ok: true, deleted: 0 });
+    }
 
     let deleted = 0;
     let batch = db.batch();
     let ops = 0;
-    for (const d of snap.docs) {
+    const flush = async () => {
+      if (ops === 0) return;
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    };
+
+    for (const d of communitySnap.docs) {
       batch.delete(d.ref);
       deleted += 1;
       ops += 1;
-      if (ops >= 450) {
-        await batch.commit();
-        batch = db.batch();
-        ops = 0;
-      }
+      if (ops >= 380) await flush();
     }
-    if (ops > 0) await batch.commit();
+
+    for (const d of legacySnap.docs || []) {
+      batch.delete(d.ref);
+      deleted += 1;
+      ops += 1;
+      if (ops >= 380) await flush();
+    }
+
+    await flush();
     return NextResponse.json({ ok: true, deleted });
   } catch (error: any) {
     if (error instanceof PanelAuthError) {
       return NextResponse.json({ error: error.message }, { status: error.status });
     }
-    return NextResponse.json({ error: error?.message || 'Błąd czyszczenia szkiców.' }, { status: 500 });
+    return NextResponse.json({ error: error?.message || "Błąd czyszczenia szkiców." }, { status: 500 });
   }
 }

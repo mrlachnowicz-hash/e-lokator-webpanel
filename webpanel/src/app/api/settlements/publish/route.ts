@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { getAdminDb } from "@/lib/server/firebaseAdmin";
 import { PanelAuthError, requirePanelAccess } from "@/lib/server/panelAuth";
 
 export const runtime = "nodejs";
@@ -39,22 +38,43 @@ export async function POST(req: Request) {
     const body = await req.json().catch(() => ({}));
     const communityId = safe(body?.communityId);
     const settlementId = safe(body?.settlementId);
-    if (!communityId || !settlementId) return NextResponse.json({ error: "Missing communityId or settlementId" }, { status: 400 });
+    if (!communityId || !settlementId) {
+      return NextResponse.json({ error: "Missing communityId or settlementId" }, { status: 400 });
+    }
 
     const authHeader = req.headers.get("authorization") || "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
     const { db: adminDb } = await requirePanelAccess(req, { communityId });
     const draftRef = adminDb.doc(`communities/${communityId}/settlementDrafts/${settlementId}`);
+    const legacyDraftRef = adminDb.doc(`settlementDrafts/${settlementId}`);
     const publishedRef = adminDb.doc(`communities/${communityId}/settlements/${settlementId}`);
-    const [draftSnap, publishedSnap] = await Promise.all([draftRef.get(), publishedRef.get()]);
-    const sourceSnap = draftSnap.exists ? draftSnap : publishedSnap;
-    if (!sourceSnap.exists) return NextResponse.json({ error: "Settlement not found" }, { status: 404 });
+    const [draftSnap, rawLegacyDraftSnap, publishedSnap] = await Promise.all([
+      draftRef.get(),
+      legacyDraftRef.get().catch(() => null as any),
+      publishedRef.get(),
+    ]);
+
+    const legacyDraftSnap =
+      rawLegacyDraftSnap?.exists && safe(rawLegacyDraftSnap.data()?.communityId) === communityId
+        ? rawLegacyDraftSnap
+        : null;
+
+    const sourceSnap = draftSnap.exists ? draftSnap : legacyDraftSnap?.exists ? legacyDraftSnap : publishedSnap;
+    if (!sourceSnap?.exists) return NextResponse.json({ error: "Settlement not found" }, { status: 404 });
+
     const data: any = sourceSnap.data() || {};
     const period = safe(data.period || data.archiveMonth);
     const now = Date.now();
 
-    await publishedRef.set({ ...data, isPublished: true, status: "PUBLISHED", publishedAtMs: now, updatedAtMs: now, archiveMonth: period }, { merge: true });
-    if (draftSnap.exists) await draftRef.delete();
+    const batch = adminDb.batch();
+    batch.set(
+      publishedRef,
+      { ...data, communityId, isPublished: true, status: "PUBLISHED", publishedAtMs: now, updatedAtMs: now, archiveMonth: period },
+      { merge: true }
+    );
+    if (draftSnap.exists) batch.delete(draftRef);
+    if (legacyDraftSnap?.exists) batch.delete(legacyDraftRef);
+    await batch.commit();
 
     let emailFallback = false;
     if (data.flatId) {

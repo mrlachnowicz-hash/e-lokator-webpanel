@@ -149,7 +149,9 @@ export default function ChargesPage() {
         updatedAtMs: Date.now(),
       };
 
-      const settlementPatches = items.map((draft) => {
+      const settlementPatches = items
+        .filter((draft) => draft.__collection === SETTLEMENT_DRAFTS_COLLECTION)
+        .map((draft) => {
         const flat = flats[draft.flatId] || null;
         const patch: Record<string, any> = { updatedAtMs: Date.now() };
         if (nextDefaults.defaultAccountNumber && shouldReplaceAccount(draft.accountNumber || draft.bankAccount, previousDefaults)) {

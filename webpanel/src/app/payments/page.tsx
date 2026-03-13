@@ -1,19 +1,23 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { collection, doc, onSnapshot, orderBy, query } from "firebase/firestore";
+import { collection, doc, onSnapshot, orderBy, query, where } from "firebase/firestore";
 import * as XLSX from "xlsx";
 import { RequireAuth } from "../../components/RequireAuth";
 import { Nav } from "../../components/Nav";
 import { useAuth } from "../../lib/authContext";
 import { db } from "../../lib/firebase";
 import { buildStablePaymentTitle, normalizeAccountNumber, normalizePaymentRef } from "../../lib/paymentRefs";
-import { getFlatDisplayLabel, getFlatResidentName } from "../../lib/flatDisplay";
+import { getFlatDisplayLabel, getFlatResidentName, getFlatEmail, getFlatPhone } from "../../lib/flatDisplay";
 import { mergeSettlementsForView, SETTLEMENTS_COLLECTION, SETTLEMENT_DRAFTS_COLLECTION } from "../../lib/settlementCollections";
 
 const money = (c: unknown) => `${(Number(c || 0) / 100).toFixed(2)} PLN`;
 
-type PaymentDefaults = { accountNumber: string; recipientName: string; recipientAddress: string };
+type PaymentDefaults = {
+  accountNumber: string;
+  recipientName: string;
+  recipientAddress: string;
+};
 
 const pickValue = (row: any, keys: string[]) => {
   for (const key of keys) {
@@ -39,9 +43,30 @@ const flatDisplay = (flat: any) => String(getFlatDisplayLabel(flat));
 
 function readCommunityDefaults(data: any): PaymentDefaults {
   return {
-    accountNumber: String(data?.defaultAccountNumber || data?.accountNumber || data?.bankAccount || data?.paymentSettings?.accountNumber || data?.paymentDefaults?.accountNumber || ""),
-    recipientName: String(data?.recipientName || data?.receiverName || data?.transferName || data?.paymentSettings?.recipientName || data?.paymentDefaults?.recipientName || ""),
-    recipientAddress: String(data?.recipientAddress || data?.receiverAddress || data?.transferAddress || data?.paymentSettings?.recipientAddress || data?.paymentDefaults?.recipientAddress || ""),
+    accountNumber: String(
+      data?.defaultAccountNumber ||
+        data?.accountNumber ||
+        data?.bankAccount ||
+        data?.paymentSettings?.accountNumber ||
+        data?.paymentDefaults?.accountNumber ||
+        ""
+    ),
+    recipientName: String(
+      data?.recipientName ||
+        data?.receiverName ||
+        data?.transferName ||
+        data?.paymentSettings?.recipientName ||
+        data?.paymentDefaults?.recipientName ||
+        ""
+    ),
+    recipientAddress: String(
+      data?.recipientAddress ||
+        data?.receiverAddress ||
+        data?.transferAddress ||
+        data?.paymentSettings?.recipientAddress ||
+        data?.paymentDefaults?.recipientAddress ||
+        ""
+    ),
   };
 }
 
@@ -58,15 +83,24 @@ function sameText(a: any, b: any) {
 }
 
 function settlementRefForDraft(communityId: string, settlement: any, flat?: any) {
-  return normalizePaymentRef(settlement?.paymentRef || settlement?.paymentTitle || settlement?.transferTitle || settlement?.paymentCode || "") || buildStablePaymentTitle({
-    communityId,
-    flatId: settlement?.flatId || flat?.id || "",
-    flatLabel: settlement?.flatLabel || flat?.flatLabel || "",
-    street: settlement?.street || flat?.street || flat?.streetName || "",
-    buildingNo: settlement?.buildingNo || flat?.buildingNo || "",
-    apartmentNo: settlement?.apartmentNo || flat?.apartmentNo || flat?.flatNumber || "",
-    period: settlement?.period || new Date().toISOString().slice(0, 7),
-  });
+  return (
+    normalizePaymentRef(
+      settlement?.paymentRef ||
+        settlement?.paymentTitle ||
+        settlement?.transferTitle ||
+        settlement?.paymentCode ||
+        ""
+    ) ||
+    buildStablePaymentTitle({
+      communityId,
+      flatId: settlement?.flatId || flat?.id || "",
+      flatLabel: settlement?.flatLabel || flat?.flatLabel || "",
+      street: settlement?.street || flat?.street || flat?.streetName || "",
+      buildingNo: settlement?.buildingNo || flat?.buildingNo || "",
+      apartmentNo: settlement?.apartmentNo || flat?.apartmentNo || flat?.flatNumber || "",
+      period: settlement?.period || new Date().toISOString().slice(0, 7),
+    })
+  );
 }
 
 function parseBankXml(xmlText: string) {
@@ -87,6 +121,7 @@ function parseBankXml(xmlText: string) {
 async function readImportFile(file: File) {
   const lower = file.name.toLowerCase();
   if (lower.endsWith(".xml")) return parseBankXml(await file.text());
+
   if (lower.endsWith(".csv")) {
     const bytes = new Uint8Array(await file.arrayBuffer());
     const utf8 = new TextDecoder("utf-8").decode(bytes);
@@ -96,17 +131,36 @@ async function readImportFile(file: File) {
     const ws = wb.Sheets[wb.SheetNames[0]!];
     return XLSX.utils.sheet_to_json(ws, { defval: "" }) as any[];
   }
+
   const buffer = await file.arrayBuffer();
   const wb = XLSX.read(buffer);
   const ws = wb.Sheets[wb.SheetNames[0]!];
   return XLSX.utils.sheet_to_json(ws, { defval: "" }) as any[];
 }
 
+function isSyntheticUserId(value: unknown) {
+  const id = String(value || "").trim();
+  return id.startsWith("payer_") || id.startsWith("shadow_");
+}
+
+function isVisibleLinkedUser(user: any) {
+  if (!user) return false;
+  const role = String(user.role || "").toUpperCase();
+  if (role === "REMOVED") return false;
+  if (user.isShadow === true || user.placeholderResident === true) return false;
+  if (user.removedAtMs != null) return false;
+  if (isSyntheticUserId(user.id)) return false;
+  return true;
+}
+
 export default function PaymentsPage() {
   const { user, profile } = useAuth();
   const communityId = profile?.communityId || "";
+
   const [payments, setPayments] = useState<any[]>([]);
   const [flats, setFlats] = useState<any[]>([]);
+  const [users, setUsers] = useState<any[]>([]);
+  const [payers, setPayers] = useState<any[]>([]);
   const [settlements, setSettlements] = useState<any[]>([]);
   const [msg, setMsg] = useState("");
   const [busyId, setBusyId] = useState("");
@@ -123,23 +177,57 @@ export default function PaymentsPage() {
 
   useEffect(() => {
     if (!communityId) return;
+
     let drafts: any[] = [];
     let published: any[] = [];
     const syncSettlements = () => setSettlements(mergeSettlementsForView(drafts, published));
-    const u1 = onSnapshot(query(collection(db, "communities", communityId, "payments"), orderBy("createdAtMs", "desc")), (s) => {
-      setPayments(s.docs.map((d) => ({ id: d.id, ...(d.data() as any) })));
-    });
+
+    const u1 = onSnapshot(
+      query(collection(db, "communities", communityId, "payments"), orderBy("createdAtMs", "desc")),
+      (s) => {
+        setPayments(s.docs.map((d) => ({ id: d.id, ...(d.data() as any) })));
+      }
+    );
+
     const u2 = onSnapshot(collection(db, "communities", communityId, "flats"), (s) => {
       setFlats(s.docs.map((d) => ({ id: d.id, ...(d.data() as any) })));
     });
+
+    const u2b = onSnapshot(
+      query(collection(db, "users"), where("communityId", "==", communityId)),
+      (s) => {
+        setUsers(
+          s.docs
+            .map((d) => ({ id: d.id, ...(d.data() as any) }))
+            .filter((u: any) => isVisibleLinkedUser(u) && String(u.flatId || "").trim())
+        );
+      }
+    );
+
+    const u2c = onSnapshot(collection(db, "communities", communityId, "payers"), (s) => {
+      setPayers(s.docs.map((d) => ({ id: d.id, ...(d.data() as any) })));
+    });
+
     const u3 = onSnapshot(collection(db, "communities", communityId, SETTLEMENT_DRAFTS_COLLECTION), (s) => {
-      drafts = s.docs.map((d) => ({ id: d.id, ...(d.data() as any), __collection: SETTLEMENT_DRAFTS_COLLECTION, isPublished: false }));
+      drafts = s.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as any),
+        __collection: SETTLEMENT_DRAFTS_COLLECTION,
+        isPublished: false,
+      }));
       syncSettlements();
     });
+
     const u3b = onSnapshot(collection(db, "communities", communityId, SETTLEMENTS_COLLECTION), (s) => {
-      published = s.docs.map((d) => ({ id: d.id, ...(d.data() as any), __collection: SETTLEMENTS_COLLECTION, isPublished: true }));
+      published = s.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as any),
+        __collection: SETTLEMENTS_COLLECTION,
+        isPublished: true,
+      }));
       syncSettlements();
     });
+
     const u4 = onSnapshot(doc(db, "communities", communityId), (snap) => {
       const data: any = snap.data() || {};
       setCommunityDoc(data);
@@ -153,46 +241,163 @@ export default function PaymentsPage() {
         automationLogin: String(data?.paymentSettings?.automationLogin || ""),
       });
     });
+
     return () => {
       u1();
       u2();
+      u2b();
+      u2c();
       u3();
       u3b();
       u4();
     };
   }, [communityId]);
 
-  const flatById = useMemo(() => new Map(flats.map((f) => [f.id, f])), [flats]);
-  const settlementById = useMemo(() => new Map(settlements.map((s) => [s.id, s])), [settlements]);
-  const flatStatus = useMemo(() => flats.map((flat) => {
-    const related = settlements.filter((s) => s.flatId === flat.id).sort((a, b) => Number(b.updatedAtMs || b.createdAtMs || 0) - Number(a.updatedAtMs || a.createdAtMs || 0));
-    const latest = related[0];
-    const balance = Number(latest?.balanceCents || 0);
-    return {
-      flat,
-      residentName: String(latest?.residentName || getFlatResidentName(flat) || "—"),
-      payerName: String(latest?.payerName || latest?.residentName || getFlatResidentName(flat) || ""),
-      status: latest ? (balance <= 0 ? "PAID" : "UNPAID") : "NO_SETTLEMENT",
-      paymentTitle: String(latest?.paymentRef || latest?.paymentTitle || latest?.transferTitle || ""),
-      balanceCents: balance,
-    };
-  }), [flats, settlements]);
-  const stats = useMemo(() => ({
-    total: payments.length,
-    matched: payments.filter((p) => p.matched || String(p.status || "").toUpperCase() === "MATCHED").length,
-    review: payments.filter((p) => !p.matched && String(p.status || "").toUpperCase() === "REVIEW").length,
-  }), [payments]);
+  const mergedFlatById = useMemo(() => {
+    const usersByFlatId = new Map(users.map((u) => [String(u.flatId), u]));
+    const payersByFlatId = new Map(payers.map((p) => [String(p.id), p]));
+
+    return new Map(
+      flats.map((flat) => {
+        const userForFlat = usersByFlatId.get(String(flat.id));
+        const payer = payersByFlatId.get(String(flat.id));
+        const hasVisibleUser = isVisibleLinkedUser(userForFlat);
+
+        const mergedFlat = {
+          ...flat,
+          residentUid: isSyntheticUserId(flat.residentUid)
+            ? null
+            : flat.residentUid || (hasVisibleUser ? userForFlat?.id : null),
+          userId: isSyntheticUserId(flat.userId)
+            ? null
+            : flat.userId || (hasVisibleUser ? userForFlat?.id : null),
+          displayName:
+            flat.displayName ||
+            (hasVisibleUser ? userForFlat?.displayName : "") ||
+            payer?.displayName ||
+            "",
+          name:
+            flat.name ||
+            flat.firstName ||
+            (hasVisibleUser ? userForFlat?.firstName : "") ||
+            payer?.name ||
+            "",
+          surname:
+            flat.surname ||
+            flat.lastName ||
+            (hasVisibleUser ? userForFlat?.lastName : "") ||
+            payer?.surname ||
+            "",
+          email:
+            flat.email ||
+            (hasVisibleUser
+              ? userForFlat?.email || userForFlat?.mail || userForFlat?.contactEmail
+              : "") ||
+            payer?.email ||
+            "",
+          phone:
+            flat.phone ||
+            (hasVisibleUser
+              ? userForFlat?.phone || userForFlat?.phoneNumber || userForFlat?.mobile
+              : "") ||
+            payer?.phone ||
+            "",
+          residentName:
+            flat.residentName ||
+            (hasVisibleUser ? userForFlat?.displayName : "") ||
+            payer?.displayName ||
+            `${hasVisibleUser ? userForFlat?.firstName || "" : ""} ${hasVisibleUser ? userForFlat?.lastName || "" : ""}`.trim(),
+        };
+
+        return [flat.id, mergedFlat];
+      })
+    );
+  }, [flats, users, payers]);
+
+  const flatById = mergedFlatById;
+
+  const settlementById = useMemo(
+    () => new Map(settlements.map((s) => [s.id, s])),
+    [settlements]
+  );
+
+  const flatStatus = useMemo(
+    () =>
+      flats.map((flat) => {
+        const mergedFlat = mergedFlatById.get(flat.id) || flat;
+        const related = settlements
+          .filter((s) => s.flatId === flat.id)
+          .sort(
+            (a, b) =>
+              Number(b.updatedAtMs || b.createdAtMs || 0) -
+              Number(a.updatedAtMs || a.createdAtMs || 0)
+          );
+
+        const latest = related[0];
+        const balance = Number(latest?.balanceCents || 0);
+
+        const residentName = String(
+          latest?.residentName ||
+            getFlatResidentName(mergedFlat) ||
+            mergedFlat?.residentName ||
+            "—"
+        );
+
+        const payerName = String(
+          latest?.payerName ||
+            latest?.residentName ||
+            getFlatResidentName(mergedFlat) ||
+            mergedFlat?.residentName ||
+            getFlatEmail(mergedFlat) ||
+            getFlatPhone(mergedFlat) ||
+            ""
+        );
+
+        return {
+          flat: mergedFlat,
+          residentName,
+          payerName,
+          status: latest ? (balance <= 0 ? "PAID" : "UNPAID") : "NO_SETTLEMENT",
+          paymentTitle: String(
+            latest?.paymentRef || latest?.paymentTitle || latest?.transferTitle || ""
+          ),
+          balanceCents: balance,
+        };
+      }),
+    [flats, settlements, mergedFlatById]
+  );
+
+  const stats = useMemo(
+    () => ({
+      total: payments.length,
+      matched: payments.filter(
+        (p) => p.matched || String(p.status || "").toUpperCase() === "MATCHED"
+      ).length,
+      review: payments.filter(
+        (p) => !p.matched && String(p.status || "").toUpperCase() === "REVIEW"
+      ).length,
+    }),
+    [payments]
+  );
 
   async function saveSettings() {
     if (!communityId || !user) return;
+
     setSettingsBusy(true);
     setMsg("");
+
     try {
       const previousDefaults = readCommunityDefaults(communityDoc || {});
       const nextDefaults: PaymentDefaults = {
-        accountNumber: normalizeAccountNumber(settings.accountNumber) || normalizeAccountNumber(previousDefaults.accountNumber),
-        recipientName: normalizeText(settings.recipientName) || normalizeText(previousDefaults.recipientName),
-        recipientAddress: normalizeText(settings.recipientAddress) || normalizeText(previousDefaults.recipientAddress),
+        accountNumber:
+          normalizeAccountNumber(settings.accountNumber) ||
+          normalizeAccountNumber(previousDefaults.accountNumber),
+        recipientName:
+          normalizeText(settings.recipientName) ||
+          normalizeText(previousDefaults.recipientName),
+        recipientAddress:
+          normalizeText(settings.recipientAddress) ||
+          normalizeText(previousDefaults.recipientAddress),
       };
 
       const communityPatch = {
@@ -228,23 +433,49 @@ export default function PaymentsPage() {
         .map((settlement) => {
           const flat = flatById.get(String(settlement.flatId || ""));
           const patch: Record<string, any> = { updatedAtMs: Date.now() };
-          if (nextDefaults.accountNumber && (!normalizeAccountNumber(settlement.accountNumber || settlement.bankAccount) || sameAccount(settlement.accountNumber || settlement.bankAccount, previousDefaults.accountNumber))) {
+
+          if (
+            nextDefaults.accountNumber &&
+            (!normalizeAccountNumber(settlement.accountNumber || settlement.bankAccount) ||
+              sameAccount(
+                settlement.accountNumber || settlement.bankAccount,
+                previousDefaults.accountNumber
+              ))
+          ) {
             patch.accountNumber = nextDefaults.accountNumber;
             patch.bankAccount = nextDefaults.accountNumber;
           }
-          if (nextDefaults.recipientName && (!normalizeText(settlement.transferName || settlement.receiverName) || sameText(settlement.transferName || settlement.receiverName, previousDefaults.recipientName))) {
+
+          if (
+            nextDefaults.recipientName &&
+            (!normalizeText(settlement.transferName || settlement.receiverName) ||
+              sameText(
+                settlement.transferName || settlement.receiverName,
+                previousDefaults.recipientName
+              ))
+          ) {
             patch.transferName = nextDefaults.recipientName;
             patch.receiverName = nextDefaults.recipientName;
           }
-          if (nextDefaults.recipientAddress && (!normalizeText(settlement.transferAddress || settlement.receiverAddress) || sameText(settlement.transferAddress || settlement.receiverAddress, previousDefaults.recipientAddress))) {
+
+          if (
+            nextDefaults.recipientAddress &&
+            (!normalizeText(settlement.transferAddress || settlement.receiverAddress) ||
+              sameText(
+                settlement.transferAddress || settlement.receiverAddress,
+                previousDefaults.recipientAddress
+              ))
+          ) {
             patch.transferAddress = nextDefaults.recipientAddress;
             patch.receiverAddress = nextDefaults.recipientAddress;
           }
+
           const paymentRef = settlementRefForDraft(communityId, settlement, flat);
           patch.paymentRef = paymentRef;
           patch.paymentTitle = paymentRef;
           patch.transferTitle = paymentRef;
           patch.paymentCode = paymentRef;
+
           return {
             settlementId: settlement.id,
             collection: settlement.__collection || SETTLEMENT_DRAFTS_COLLECTION,
@@ -261,6 +492,7 @@ export default function PaymentsPage() {
         },
         body: JSON.stringify({ communityId, communityPatch, settlementPatches }),
       });
+
       const data = await res.json().catch(() => ({} as any));
       if (!res.ok) throw new Error(data?.error || "Błąd zapisu ustawień płatności.");
 
@@ -270,6 +502,7 @@ export default function PaymentsPage() {
         recipientName: nextDefaults.recipientName,
         recipientAddress: nextDefaults.recipientAddress,
       }));
+
       setMsg("Zapisano dane do przelewów i konfigurację automatyzacji.");
     } catch (error: any) {
       setMsg(error?.message || "Błąd zapisu ustawień płatności.");
@@ -283,58 +516,142 @@ export default function PaymentsPage() {
       <Nav />
       <div style={{ padding: 24, display: "grid", gap: 16 }}>
         <h2>Przelewy i rozpoznawanie wpłat</h2>
+
         <div className="card" style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
-          <div>Łącznie: <strong>{stats.total}</strong></div>
-          <div>Dopasowane: <strong>{stats.matched}</strong></div>
-          <div>Do review: <strong>{stats.review}</strong></div>
+          <div>
+            Łącznie: <strong>{stats.total}</strong>
+          </div>
+          <div>
+            Dopasowane: <strong>{stats.matched}</strong>
+          </div>
+          <div>
+            Do review: <strong>{stats.review}</strong>
+          </div>
         </div>
 
         <div className="card" style={{ display: "grid", gap: 12 }}>
           <h3>Dane do przelewów</h3>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10 }}>
-            <input className="input" placeholder="Numer konta" value={settings.accountNumber} onChange={(e) => setSettings((s) => ({ ...s, accountNumber: e.target.value }))} />
-            <input className="input" placeholder="Odbiorca" value={settings.recipientName} onChange={(e) => setSettings((s) => ({ ...s, recipientName: e.target.value }))} />
-            <input className="input" placeholder="Adres odbiorcy" value={settings.recipientAddress} onChange={(e) => setSettings((s) => ({ ...s, recipientAddress: e.target.value }))} />
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+              gap: 10,
+            }}
+          >
+            <input
+              className="input"
+              placeholder="Numer konta"
+              value={settings.accountNumber}
+              onChange={(e) => setSettings((s) => ({ ...s, accountNumber: e.target.value }))}
+            />
+            <input
+              className="input"
+              placeholder="Odbiorca"
+              value={settings.recipientName}
+              onChange={(e) => setSettings((s) => ({ ...s, recipientName: e.target.value }))}
+            />
+            <input
+              className="input"
+              placeholder="Adres odbiorcy"
+              value={settings.recipientAddress}
+              onChange={(e) => setSettings((s) => ({ ...s, recipientAddress: e.target.value }))}
+            />
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10 }}>
-            <select className="select" value={settings.automationMode} onChange={(e) => setSettings((s) => ({ ...s, automationMode: e.target.value }))}>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+              gap: 10,
+            }}
+          >
+            <select
+              className="select"
+              value={settings.automationMode}
+              onChange={(e) => setSettings((s) => ({ ...s, automationMode: e.target.value }))}
+            >
               <option value="MANUAL_ONLY">Tylko ręczny import</option>
-              <option value="PREPARED_AUTOMATION">Automatyczny pobór — konfiguracja przygotowana</option>
+              <option value="PREPARED_AUTOMATION">
+                Automatyczny pobór — konfiguracja przygotowana
+              </option>
             </select>
-            <input className="input" placeholder="Źródło / bank / skrzynka importu" value={settings.automationSource} onChange={(e) => setSettings((s) => ({ ...s, automationSource: e.target.value }))} />
-            <input className="input" placeholder="Login / identyfikator automatyzacji" value={settings.automationLogin} onChange={(e) => setSettings((s) => ({ ...s, automationLogin: e.target.value }))} />
+
+            <input
+              className="input"
+              placeholder="Źródło / bank / skrzynka importu"
+              value={settings.automationSource}
+              onChange={(e) => setSettings((s) => ({ ...s, automationSource: e.target.value }))}
+            />
+
+            <input
+              className="input"
+              placeholder="Login / identyfikator automatyzacji"
+              value={settings.automationLogin}
+              onChange={(e) => setSettings((s) => ({ ...s, automationLogin: e.target.value }))}
+            />
           </div>
+
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <button className="btn" disabled={settingsBusy} onClick={saveSettings}>{settingsBusy ? "Zapisywanie..." : "Zapisz konfigurację"}</button>
-            <div style={{ opacity: 0.78 }}>Tryb automatyczny ma gotowy punkt konfiguracji i zapis danych. Codzienny pobór wyciągu wymaga jeszcze zewnętrznej integracji i sekretów banku.</div>
+            <button className="btn" disabled={settingsBusy} onClick={saveSettings}>
+              {settingsBusy ? "Zapisywanie..." : "Zapisz konfigurację"}
+            </button>
+            <div style={{ opacity: 0.78 }}>
+              Tryb automatyczny ma gotowy punkt konfiguracji i zapis danych. Codzienny pobór
+              wyciągu wymaga jeszcze zewnętrznej integracji i sekretów banku.
+            </div>
           </div>
         </div>
 
         <div className="card" style={{ display: "grid", gap: 12 }}>
           <h3>Ręczny import wyciągu</h3>
-          <p style={{ opacity: 0.8, marginTop: -4 }}>Obsługiwane pliki: CSV, XLSX, XLS, XML (np. wyciągi bankowe). Kolumny: date/data, title/opis, amount/kwota, source/bank, code/kod, payerName/nadawca, payerAddress/adres.</p>
-          <input type="file" accept=".csv,.xlsx,.xls,.xml" onChange={async (e) => {
-            const file = e.target.files?.[0];
-            if (!file || !communityId || !user) return;
-            setMsg("");
-            try {
-              const raw = await readImportFile(file);
-              const rows = raw.map(normalizePaymentRow).filter((x: any) => x.title || x.amount || x.code || x.payerName);
-              const token = await user.getIdToken();
-              const res = await fetch("/api/payments/import", {
-                method: "POST",
-                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-                body: JSON.stringify({ communityId, rows }),
-              });
-              const data = await res.json();
-              if (!res.ok) throw new Error(data.error || "Błąd importu przelewów");
-              setMsg(`Zaimportowano wyciąg. Dopasowane: ${data.matched || 0}, review: ${data.unmatched || 0}, duplikaty: ${data.duplicates || 0}.`);
-            } catch (error: any) {
-              setMsg(error?.message || "Błąd importu przelewów.");
-            } finally {
-              e.currentTarget.value = "";
-            }
-          }} />
+          <p style={{ opacity: 0.8, marginTop: -4 }}>
+            Obsługiwane pliki: CSV, XLSX, XLS, XML (np. wyciągi bankowe). Kolumny: date/data,
+            title/opis, amount/kwota, source/bank, code/kod, payerName/nadawca, payerAddress/adres.
+          </p>
+
+          <input
+            type="file"
+            accept=".csv,.xlsx,.xls,.xml"
+            onChange={async (e) => {
+              const input = e.currentTarget;
+              const file = input.files?.[0];
+              if (!file || !communityId || !user) return;
+
+              setMsg("");
+
+              try {
+                const raw = await readImportFile(file);
+                const rows = raw
+                  .map(normalizePaymentRow)
+                  .filter((x: any) => x.title || x.amount || x.code || x.payerName);
+
+                const token = await user.getIdToken();
+                const res = await fetch("/api/payments/import", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${token}`,
+                  },
+                  body: JSON.stringify({ communityId, rows }),
+                });
+
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || "Błąd importu przelewów");
+
+                setMsg(
+                  `Zaimportowano wyciąg. Dopasowane: ${data.matched || 0}, review: ${
+                    data.unmatched || 0
+                  }, duplikaty: ${data.duplicates || 0}.`
+                );
+              } catch (error: any) {
+                setMsg(error?.message || "Błąd importu przelewów.");
+              } finally {
+                input.value = "";
+              }
+            }}
+          />
+
           {msg ? <div style={{ color: "#8ef0c8" }}>{msg}</div> : null}
         </div>
 
@@ -342,13 +659,39 @@ export default function PaymentsPage() {
           <h3>Status rozliczeń lokali</h3>
           <div style={{ display: "grid", gap: 8 }}>
             {flatStatus.map((row) => (
-              <div key={row.flat.id} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 1fr auto", gap: 10, alignItems: "center", borderTop: "1px solid rgba(255,255,255,.08)", paddingTop: 8 }}>
-                <div><strong>{flatDisplay(row.flat)}</strong></div>
+              <div
+                key={row.flat.id}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1.4fr 1fr 1fr 1fr auto",
+                  gap: 10,
+                  alignItems: "center",
+                  borderTop: "1px solid rgba(255,255,255,.08)",
+                  paddingTop: 8,
+                }}
+              >
+                <div>
+                  <strong>{flatDisplay(row.flat)}</strong>
+                </div>
                 <div>{row.residentName}</div>
                 <div>{row.payerName || "—"}</div>
                 <div>{row.paymentTitle || "—"}</div>
-                <div style={{ fontWeight: 700, color: row.status === "PAID" ? "#6ee7b7" : row.status === "UNPAID" ? "#fca5a5" : "#facc15" }}>
-                  {row.status === "PAID" ? `✔ Zapłacone (${money(Math.max(0, -row.balanceCents))})` : row.status === "UNPAID" ? `! Brak wpłaty (${money(row.balanceCents)})` : "— Brak rozliczenia"}
+                <div
+                  style={{
+                    fontWeight: 700,
+                    color:
+                      row.status === "PAID"
+                        ? "#6ee7b7"
+                        : row.status === "UNPAID"
+                        ? "#fca5a5"
+                        : "#facc15",
+                  }}
+                >
+                  {row.status === "PAID"
+                    ? `✔ Zapłacone (${money(Math.max(0, -row.balanceCents))})`
+                    : row.status === "UNPAID"
+                    ? `! Brak wpłaty (${money(row.balanceCents)})`
+                    : "— Brak rozliczenia"}
                 </div>
               </div>
             ))}
@@ -360,6 +703,7 @@ export default function PaymentsPage() {
             const flat = flatById.get(String(p.flatId || ""));
             const settlement = settlementById.get(String(p.settlementId || ""));
             const needsReview = !p.matched && String(p.status || "").toUpperCase() === "REVIEW";
+
             return (
               <div key={p.id} className="card" style={{ display: "grid", gap: 8 }}>
                 <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
@@ -369,26 +713,45 @@ export default function PaymentsPage() {
                   <span>{p.title || p.source || "Wpłata"}</span>
                   <span>{money(p.amountCents)}</span>
                   <span>{p.paymentRef || p.code || "—"}</span>
-                  <span style={{ color: needsReview ? "#fca5a5" : "#6ee7b7" }}>{needsReview ? "Review" : "Dopasowane"}</span>
+                  <span style={{ color: needsReview ? "#fca5a5" : "#6ee7b7" }}>
+                    {needsReview ? "Review" : "Dopasowane"}
+                  </span>
                 </div>
-                <div style={{ opacity: 0.82 }}>{p.matchReason || p.aiSuggestion?.reason || "—"}</div>
-                {needsReview ? <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}><button className="btnGhost" onClick={async () => {
-                  setBusyId(p.id);
-                  try {
-                    const res = await fetch("/api/ai/payment-apply", {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ communityId, paymentId: p.id }),
-                    });
-                    const data = await res.json();
-                    if (!res.ok) throw new Error(data.error || "AI payment error");
-                    setMsg(data.applied ? `AI dopasowało wpłatę do ${data.settlementId}.` : "AI nadal wymaga review.");
-                  } catch (error: any) {
-                    setMsg(error?.message || "Błąd AI.");
-                  } finally {
-                    setBusyId("");
-                  }
-                }}>{busyId === p.id ? "AI..." : "Spróbuj AI"}</button></div> : null}
+
+                <div style={{ opacity: 0.82 }}>
+                  {p.matchReason || p.aiSuggestion?.reason || "—"}
+                </div>
+
+                {needsReview ? (
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                    <button
+                      className="btnGhost"
+                      onClick={async () => {
+                        setBusyId(p.id);
+                        try {
+                          const res = await fetch("/api/ai/payment-apply", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ communityId, paymentId: p.id }),
+                          });
+                          const data = await res.json();
+                          if (!res.ok) throw new Error(data.error || "AI payment error");
+                          setMsg(
+                            data.applied
+                              ? `AI dopasowało wpłatę do ${data.settlementId}.`
+                              : "AI nadal wymaga review."
+                          );
+                        } catch (error: any) {
+                          setMsg(error?.message || "Błąd AI.");
+                        } finally {
+                          setBusyId("");
+                        }
+                      }}
+                    >
+                      {busyId === p.id ? "AI..." : "Spróbuj AI"}
+                    </button>
+                  </div>
+                ) : null}
               </div>
             );
           })}
