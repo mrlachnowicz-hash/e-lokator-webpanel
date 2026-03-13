@@ -7,7 +7,7 @@ import { auth, db } from "./firebase";
 import { isPanelEnabled } from "./panelAccess";
 
 export type UserProfile = {
-  role?: "MASTER" | "ADMIN" | "ACCOUNTANT" | "RESIDENT" | string;
+  role?: "OWNER" | "MASTER" | "ADMIN" | "ACCOUNTANT" | "RESIDENT" | "CONTRACTOR" | string;
   communityId?: string;
   customerId?: string;
   activeCommunityId?: string;
@@ -43,6 +43,7 @@ function normalizeUserProfile(raw: any): UserProfile | null {
     activeCommunityId: cleanId(raw.activeCommunityId),
     currentCommunityId: cleanId(raw.currentCommunityId),
     selectedCommunityId: cleanId(raw.selectedCommunityId),
+    role: String(raw.role || "").toUpperCase() || undefined,
   } as UserProfile;
 }
 
@@ -59,14 +60,14 @@ async function resolveCommunity(profile: UserProfile | null, user: User | null):
     try {
       const snap = await getDoc(doc(db, "communities", communityId));
       if (snap.exists()) {
-        return { ...snap.data(), panelAccessEnabled: isPanelEnabled(snap.data() as any) } as CommunityProfile;
+        return { ...snap.data(), panelAccessEnabled: isPanelEnabled(snap.data()) } as CommunityProfile;
       }
     } catch {}
 
     try {
       const q = query(collection(db, "communities"), where("id", "==", communityId), limit(1));
       const qs = await getDocs(q);
-      if (!qs.empty) return { ...qs.docs[0].data(), panelAccessEnabled: isPanelEnabled(qs.docs[0].data() as any) } as CommunityProfile;
+      if (!qs.empty) return { ...qs.docs[0].data(), panelAccessEnabled: isPanelEnabled(qs.docs[0].data()) } as CommunityProfile;
     } catch {}
   }
 
@@ -76,7 +77,7 @@ async function resolveCommunity(profile: UserProfile | null, user: User | null):
       try {
         const q = query(collection(db, "communities"), where(field, "==", email), limit(1));
         const qs = await getDocs(q);
-        if (!qs.empty) return { ...qs.docs[0].data(), panelAccessEnabled: isPanelEnabled(qs.docs[0].data() as any) } as CommunityProfile;
+        if (!qs.empty) return { ...qs.docs[0].data(), panelAccessEnabled: isPanelEnabled(qs.docs[0].data()) } as CommunityProfile;
       } catch {}
     }
   }

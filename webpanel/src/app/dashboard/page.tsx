@@ -13,9 +13,9 @@ import { isPanelEnabled } from "../../lib/panelAccess";
 
 export default function DashboardPage() {
   const { user, profile, community } = useAuth();
-  const communityId = profile?.communityId || profile?.customerId || "";
+  const communityId = profile?.communityId || "";
   const role = String(profile?.role || "");
-  const panelEnabled = isPanelEnabled(community);
+  const panelEnabled = isPanelEnabled(community?.panelAccessEnabled);
   const [webpanelUrl, setWebpanelUrl] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [stats, setStats] = useState({ flats: 0, invoices: 0, settlements: 0, review: 0, unmatchedPayments: 0, meters: 0 });

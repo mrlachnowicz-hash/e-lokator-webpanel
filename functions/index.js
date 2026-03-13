@@ -1,7 +1,8 @@
+const crypto = require("node:crypto");
 const admin = require("firebase-admin");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
-const { onDocumentCreated, onDocumentUpdated, onDocumentWritten } = require("firebase-functions/v2/firestore");
+const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
 
 setGlobalOptions({ region: "europe-west1" });
 
@@ -17,6 +18,7 @@ const { FieldValue } = admin.firestore;
 
 const OWNER_UIDS = ["C4NPiqCNCChdDZ0s54di5g8Mt5l2"];
 const OWNER_EMAILS = ["mrlachnowicz@gmail.com"];
+let openAiClient = null;
 
 function nowMs() {
   return Date.now();
@@ -38,9 +40,9 @@ async function requireCommunityStaff(request, communityId) {
   const uid = requireAuth(request);
   const profile = await getMyProfile(uid);
   const role = String(profile?.role || "");
-  const ok = isOwnerRequest(request) || (["MASTER", "ADMIN", "ACCOUNTANT"].includes(role) && sameCommunity(profile, communityId));
+  const ok = ["MASTER", "ADMIN", "ACCOUNTANT"].includes(role) && profileCommunityId(profile) === safeText(communityId);
   if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień do tej wspólnoty.");
-  return { uid, profile, role };
+  return { uid, profile };
 }
 
 async function getCommunity(communityId) {
@@ -51,18 +53,18 @@ async function getCommunity(communityId) {
 
 async function assertPanelAccessEnabled(communityId) {
   const community = await getCommunity(communityId);
-  if (!community || !panelEnabledFromCommunity(community)) {
+  if (!community || communityPanelEnabledValue(community) !== true) {
     throw new HttpsError("permission-denied", "Panel nie jest aktywny dla tej wspólnoty.");
   }
   return community;
 }
 
+
 async function requireCommunityRole(request, communityId, allowedRoles) {
   const uid = requireAuth(request);
   const profile = await getMyProfile(uid);
   const role = String(profile?.role || "");
-  const owner = isOwnerRequest(request);
-  const ok = owner || (Array.isArray(allowedRoles) && allowedRoles.includes(role) && sameCommunity(profile, communityId));
+  const ok = Array.isArray(allowedRoles) && allowedRoles.includes(role) && profileCommunityId(profile) === safeText(communityId);
   if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień do tej operacji.");
   return { uid, profile, role };
 }
@@ -107,12 +109,13 @@ async function upsertFlatWithSeat({ communityId, flatId = "", staircaseId = "", 
     const current = exists ? targetSnap.data() : {};
     const payerSnap = payer ? await tx.get(payerRef) : null;
     if (!exists) {
-      const seatsTotal = Number(communitySnap.get("seatsTotal") || 0);
-      const seatsUsed = Number(communitySnap.get("seatsUsed") || 0);
+      const communityData = communitySnap.data() || {};
+      const seatsTotal = communitySeatsTotalValue(communityData);
+      const seatsUsed = communitySeatsUsedValue(communityData);
       if (seatsUsed >= seatsTotal) {
         throw new HttpsError("failed-precondition", "Brak wolnych seats. Dokup i zatwierdź seats w generatorze ownera.");
       }
-      tx.set(communityRef, { seatsUsed: seatsUsed + 1, updatedAtMs: now }, { merge: true });
+      tx.set(communityRef, { ...seatUsedPatch(seatsUsed + 1), updatedAtMs: now }, { merge: true });
     }
 
     const mergedStreet = safeText(normalizedStreet || current.street);
@@ -161,22 +164,18 @@ async function upsertFlatWithSeat({ communityId, flatId = "", staircaseId = "", 
     return {
       flatId: targetRef.id,
       created: !exists,
-      seatsUsed: exists ? Number(communitySnap.get("seatsUsed") || 0) : Number(communitySnap.get("seatsUsed") || 0) + 1,
-      seatsTotal: Number(communitySnap.get("seatsTotal") || 0),
+      seatsUsed: exists ? communitySeatsUsedValue(communitySnap.data() || {}) : communitySeatsUsedValue(communitySnap.data() || {}) + 1,
+      seatsTotal: communitySeatsTotalValue(communitySnap.data() || {}),
     };
   });
 }
 
-function isOwnerRequest(request) {
-  const uid = request?.auth?.uid || "";
-  const token = request?.auth?.token || {};
-  const email = String(token.email || "");
-  return token.owner === true || OWNER_UIDS.includes(uid) || OWNER_EMAILS.includes(email);
-}
-
 function assertOwner(request) {
-  requireAuth(request);
-  if (!isOwnerRequest(request)) throw new HttpsError("permission-denied", "Brak uprawnień Ownera.");
+  const uid = requireAuth(request);
+  const token = request.auth.token || {};
+  const email = String(token.email || "");
+  const ok = token.owner === true || OWNER_UIDS.includes(uid) || OWNER_EMAILS.includes(email);
+  if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień Ownera.");
 }
 
 function randomCode(len = 10) {
@@ -190,92 +189,177 @@ function safeText(v, fallback = "") {
   return String(v == null ? fallback : v).trim();
 }
 
-
-const PANEL_ACCESS_KEYS = ["panelAccessEnabled", "accessToPanel", "panelActive", "panelEnabled", "webPanelEnabled", "webpanelEnabled"];
-const COMMUNITY_ID_KEYS = ["communityId", "customerId", "activeCommunityId", "currentCommunityId", "selectedCommunityId"];
-const SEAT_LIMIT_KEYS = ["appSeatsTotal", "seatsTotal", "panelSeats", "panelSeatsLimit", "seats", "seatsLimit", "totalSeats", "maxSeats", "purchasedSeats", "seatsPurchased", "flatsLimit", "localsLimit", "localiLimit", "unitsLimit", "licenses", "seatCount"];
-const SEAT_USED_KEYS = ["appSeatsUsed", "seatsUsed", "occupiedSeats", "residentCount", "usersCount", "panelSeatsUsed"];
-
-function asBool(value) {
-  if (value === true) return true;
-  if (typeof value === "number") return Number.isFinite(value) && value !== 0;
-  const text = String(value || "").trim().toLowerCase();
-  return ["1", "true", "yes", "on"].includes(text);
+function boolValue(value, fallback = false) {
+  if (value === true || value === false) return value;
+  if (typeof value === "number") return value !== 0;
+  const text = safeText(value).toLowerCase();
+  if (!text) return fallback;
+  return ["1", "true", "yes", "y", "on", "enabled", "active"].includes(text);
 }
 
-function asNumber(value) {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
-  return null;
+function intValue(value, fallback = 0) {
+  if (value == null) return fallback;
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.floor(value));
+  const normalized = safeText(value).replace(/[^\d-]/g, "");
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.floor(parsed));
 }
 
-function firstNonBlank(...values) {
-  for (const value of values) {
-    const text = safeText(value);
-    if (text) return text;
-  }
-  return "";
-}
-
-function communityIdFromData(data) {
-  if (!data) return "";
-  return firstNonBlank(...COMMUNITY_ID_KEYS.map((key) => data?.[key]));
+function normalizeEmail(value) {
+  return safeText(value).toLowerCase();
 }
 
 function profileCommunityId(profile) {
-  return communityIdFromData(profile || {});
+  return safeText(
+    profile?.communityId ||
+    profile?.customerId ||
+    profile?.activeCommunityId ||
+    profile?.currentCommunityId ||
+    profile?.selectedCommunityId
+  );
 }
 
-function sameCommunity(profile, communityId) {
-  return profileCommunityId(profile) === safeText(communityId);
+function communityPanelEnabledValue(community) {
+  const values = [
+    community?.panelAccessEnabled,
+    community?.accessToPanel,
+    community?.panelActive,
+    community?.panelEnabled,
+    community?.webpanelEnabled,
+    community?.webPanelEnabled,
+  ];
+  const first = values.find((value) => value !== undefined && value !== null);
+  return boolValue(first, false);
 }
 
-function panelEnabledFromCommunity(community) {
-  return PANEL_ACCESS_KEYS.some((key) => asBool(community?.[key]));
+function communityBlockedValue(community) {
+  const values = [
+    community?.blocked,
+    community?.isBlocked,
+    community?.appBlocked,
+  ];
+  const first = values.find((value) => value !== undefined && value !== null);
+  if (first !== undefined) return boolValue(first, false);
+  return safeText(community?.status).toUpperCase() === "BLOCKED";
 }
 
-function communitySeatMetric(community, keys, fallback = 0) {
-  for (const key of keys) {
-    const value = asNumber(community?.[key]);
-    if (value != null) return Math.max(0, Math.floor(value));
+function communitySeatsTotalValue(community) {
+  return Math.max(
+    intValue(community?.seatsTotal, 0),
+    intValue(community?.appSeatsTotal, 0),
+    intValue(community?.panelSeats, 0),
+    intValue(community?.panelSeatsLimit, 0),
+    intValue(community?.seats, 0),
+    intValue(community?.seatsLimit, 0),
+    intValue(community?.totalSeats, 0),
+    intValue(community?.maxSeats, 0),
+    intValue(community?.purchasedSeats, 0),
+    intValue(community?.seatsPurchased, 0),
+    intValue(community?.flatsLimit, 0),
+    intValue(community?.localsLimit, 0),
+    intValue(community?.localiLimit, 0),
+    intValue(community?.unitsLimit, 0),
+    intValue(community?.licenses, 0),
+    intValue(community?.seatCount, 0)
+  );
+}
+
+function communitySeatsUsedValue(community, fallback = 0) {
+  return Math.max(
+    intValue(fallback, 0),
+    intValue(community?.seatsUsed, 0),
+    intValue(community?.panelSeatsUsed, 0),
+    intValue(community?.appSeatsUsed, 0),
+    intValue(community?.occupiedSeats, 0),
+    intValue(community?.residentCount, 0),
+    intValue(community?.usersCount, 0)
+  );
+}
+
+function futureYearMs(baseMs = nowMs()) {
+  return Number(baseMs) + 365 * 24 * 60 * 60 * 1000;
+}
+
+function seatTotalPatch(total) {
+  const seats = intValue(total, 0);
+  return {
+    seatsTotal: seats,
+    appSeatsTotal: seats,
+    panelSeats: seats,
+    panelSeatsLimit: seats,
+    seats: seats,
+    seatsLimit: seats,
+    totalSeats: seats,
+    maxSeats: seats,
+    purchasedSeats: seats,
+    seatsPurchased: seats,
+    flatsLimit: seats,
+    localsLimit: seats,
+    localiLimit: seats,
+    unitsLimit: seats,
+    licenses: seats,
+    seatCount: seats,
+  };
+}
+
+function seatUsedPatch(used) {
+  const seats = intValue(used, 0);
+  return {
+    seatsUsed: seats,
+    panelSeatsUsed: seats,
+    appSeatsUsed: seats,
+    occupiedSeats: seats,
+    residentCount: seats,
+    usersCount: seats,
+  };
+}
+
+function panelPatch(enabled) {
+  const value = enabled === true;
+  return {
+    panelAccessEnabled: value,
+    accessToPanel: value,
+    panelActive: value,
+    panelEnabled: value,
+    webpanelEnabled: value,
+    webPanelEnabled: value,
+  };
+}
+
+function blockedPatch(blocked) {
+  const value = blocked === true;
+  return {
+    blocked: value,
+    isBlocked: value,
+    appBlocked: value,
+    status: value ? "BLOCKED" : "ACTIVE",
+    active: !value,
+    enabled: !value,
+  };
+}
+
+function normalizeStreetName(name) {
+  return safeText(name)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function hashText(value) {
+  return crypto.createHash("sha1").update(String(value || "")).digest("hex");
+}
+
+function getOpenAiClient() {
+  if (!process.env.OPENAI_API_KEY) return null;
+  if (!openAiClient) {
+    const { OpenAI } = require("openai");
+    openAiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   }
-  return Math.max(0, Math.floor(fallback));
-}
-
-function isRemovedUser(data) {
-  const role = safeText(data?.role).toUpperCase();
-  return role === "REMOVED" || data?.removedAtMs != null;
-}
-
-function isVisibleSeatUser(data) {
-  const role = safeText(data?.role).toUpperCase();
-  return ["RESIDENT", "CONTRACTOR"].includes(role) && data?.appVisible !== false && !isRemovedUser(data);
-}
-
-function jsonEq(a, b) {
-  return JSON.stringify(a) === JSON.stringify(b);
-}
-
-async function setIfChanged(ref, patch) {
-  const cleanPatch = Object.fromEntries(Object.entries(patch || {}).filter(([, value]) => value !== undefined));
-  const snap = await ref.get();
-  const current = snap.exists ? (snap.data() || {}) : {};
-  const changed = Object.entries(cleanPatch).some(([key, value]) => !jsonEq(current[key] ?? null, value ?? null));
-  if (!changed) return false;
-  await ref.set(cleanPatch, { merge: true });
-  return true;
-}
-
-async function getCommunityUserDocs(communityId) {
-  const id = safeText(communityId);
-  if (!id) return [];
-  const [byCommunity, byCustomer] = await Promise.all([
-    db.collection("users").where("communityId", "==", id).get(),
-    db.collection("users").where("customerId", "==", id).get(),
-  ]);
-  const merged = new Map();
-  [...byCommunity.docs, ...byCustomer.docs].forEach((doc) => merged.set(doc.id, doc));
-  return Array.from(merged.values());
+  return openAiClient;
 }
 
 function parsePeriod(input) {
@@ -389,252 +473,6 @@ async function claimOrCreateFlatForResident({ communityId, uid, flatId = "", fla
     flatKey: safeText(data.flatKey),
     residentUid: uid,
   };
-}
-
-
-async function syncCommunityDerivedState(communityId) {
-  const id = safeText(communityId);
-  if (!id) return { ok: false, reason: "missing-community" };
-  const communityRef = db.doc(`communities/${id}`);
-  const [communitySnap, payersSnap, flatsSnap, streetsSnap, assignmentsSnap, userDocs] = await Promise.all([
-    communityRef.get(),
-    db.collection(`communities/${id}/payers`).get(),
-    db.collection(`communities/${id}/flats`).get(),
-    db.collection(`communities/${id}/streets`).get(),
-    db.collection(`communities/${id}/streetAssignments`).get(),
-    getCommunityUserDocs(id),
-  ]);
-  if (!communitySnap.exists) return { ok: false, reason: "community-not-found" };
-
-  const preferredUsersByEmail = new Map();
-  const visibleUsers = new Map();
-  for (const doc of userDocs) {
-    const data = doc.data() || {};
-    const email = sanitizeEmail(data.email);
-    const removed = isRemovedUser(data);
-    if (!removed) visibleUsers.set(doc.id, data);
-    const isSynthetic = doc.id.startsWith(`payer_${id}_`) || doc.id.startsWith(`shadow_${id}_`) || data.isShadow === true || data.placeholderResident === true;
-    if (email && !removed && (data.authLinked === true || !isSynthetic) && !preferredUsersByEmail.has(email)) {
-      preferredUsersByEmail.set(email, { id: doc.id, data });
-    }
-  }
-
-  const streetMap = new Map();
-  const registerStreet = (idValue, nameValue) => {
-    const name = safeText(nameValue);
-    const sid = safeText(idValue || normalizeFlatPart(name));
-    if (sid && name) streetMap.set(sid, { id: sid, name });
-  };
-
-  const communityData = communitySnap.data() || {};
-  const communityStreetIds = Array.isArray(communityData.streetIds) ? communityData.streetIds : [];
-  const communityStreetNames = Array.isArray(communityData.streetNames) ? communityData.streetNames : [];
-  const communityStreetList = Array.isArray(communityData.streetsList) ? communityData.streetsList : [];
-  communityStreetIds.forEach((value, index) => registerStreet(value, communityStreetNames[index]));
-  communityStreetList.forEach((item) => registerStreet(item?.id, item?.name));
-
-  for (const doc of streetsSnap.docs) {
-    const data = doc.data() || {};
-    if (data.isActive === false || data.deletedAtMs != null) continue;
-    registerStreet(data.id || doc.id, data.name || data.street || doc.id);
-  }
-  for (const doc of assignmentsSnap.docs) {
-    const data = doc.data() || {};
-    registerStreet(data.streetId || data.id || doc.id, data.streetName || data.name || data.street || doc.id);
-  }
-  for (const doc of flatsSnap.docs) {
-    const data = doc.data() || {};
-    registerStreet(data.streetId, data.street);
-  }
-  for (const doc of payersSnap.docs) {
-    const data = doc.data() || {};
-    registerStreet(data.streetId, data.street);
-  }
-
-  let linkedUsers = 0;
-  let syntheticUsers = 0;
-  const occupiedFlatIds = new Set();
-
-  for (const payerDoc of payersSnap.docs) {
-    const payer = payerDoc.data() || {};
-    const flatId = safeText(payer.flatId || payerDoc.id);
-    if (!flatId) continue;
-    occupiedFlatIds.add(flatId);
-    const street = safeText(payer.street);
-    const buildingNo = safeText(payer.buildingNo);
-    const apartmentNo = safeText(payer.apartmentNo || payer.flatNumber);
-    const streetId = safeText(payer.streetId || normalizeFlatPart(street));
-    const flatLabel = safeText(payer.flatLabel || makeFlatLabel(street, buildingNo, apartmentNo) || apartmentNo);
-    const flatKey = safeText(payer.flatKey || buildFlatKey(id, street, buildingNo, apartmentNo));
-    const email = sanitizeEmail(payer.email);
-    const linked = preferredUsersByEmail.get(email);
-    const linkedUid = safeText(payer.residentUid || payer.userId || linked?.id);
-
-    if (linked && linked.id) {
-      linkedUsers += 1;
-      await Promise.all([
-        setIfChanged(db.doc(`communities/${id}/payers/${payerDoc.id}`), {
-          communityId: id,
-          customerId: id,
-          flatId,
-          residentUid: linked.id,
-          userId: linked.id,
-          street,
-          streetId,
-          buildingNo,
-          apartmentNo,
-          flatLabel,
-          flatKey,
-          mailOnly: false,
-          appVisible: true,
-        }),
-        setIfChanged(db.doc(`communities/${id}/flats/${flatId}`), {
-          communityId: id,
-          flatId,
-          residentUid: linked.id,
-          userId: linked.id,
-          street,
-          streetId,
-          buildingNo,
-          apartmentNo,
-          flatLabel,
-          flatKey,
-          appVisible: true,
-        }),
-        setIfChanged(db.doc(`users/${linked.id}`), {
-          uid: linked.id,
-          communityId: id,
-          customerId: id,
-          role: safeText(linked.data.role || "RESIDENT") || "RESIDENT",
-          displayName: safeText(linked.data.displayName || [safeText(linked.data.firstName || payer.name), safeText(linked.data.lastName || payer.surname)].filter(Boolean).join(" ") || flatLabel || apartmentNo),
-          firstName: safeText(linked.data.firstName || payer.name) || undefined,
-          lastName: safeText(linked.data.lastName || payer.surname) || undefined,
-          source: safeText(linked.data.source || "APP_USER"),
-          appVisible: true,
-          authLinked: true,
-          mailOnly: false,
-          isShadow: false,
-          placeholderResident: false,
-          email: safeText(linked.data.email || payer.email),
-          emailLower: sanitizeEmail(linked.data.email || payer.email),
-          phone: safeText(linked.data.phone || payer.phone),
-          street,
-          streetId,
-          buildingNo,
-          apartmentNo,
-          flatId,
-          flatLabel,
-          flatKey,
-          active: true,
-        }),
-      ]);
-      const syntheticRef = db.doc(`users/payer_${id}_${flatId}`);
-      const syntheticSnap = await syntheticRef.get();
-      if (syntheticSnap.exists && syntheticSnap.id !== linked.id) {
-        await syntheticRef.delete().catch(() => null);
-      }
-      continue;
-    }
-
-    const syntheticUid = linkedUid || `payer_${id}_${flatId}`;
-    syntheticUsers += 1;
-    await Promise.all([
-      setIfChanged(db.doc(`users/${syntheticUid}`), {
-        uid: syntheticUid,
-        communityId: id,
-        customerId: id,
-        role: "RESIDENT",
-        displayName: safeText([safeText(payer.name), safeText(payer.surname)].filter(Boolean).join(" ") || payer.displayName || flatLabel || apartmentNo),
-        firstName: safeText(payer.name) || undefined,
-        lastName: safeText(payer.surname) || undefined,
-        source: "WEBPANEL_PAYER",
-        appVisible: true,
-        authLinked: false,
-        mailOnly: !!safeText(payer.email) && !safeText(payer.phone),
-        isShadow: false,
-        placeholderResident: false,
-        email: safeText(payer.email),
-        emailLower: sanitizeEmail(payer.email),
-        phone: safeText(payer.phone),
-        street,
-        streetId,
-        buildingNo,
-        apartmentNo,
-        flatId,
-        flatLabel,
-        flatKey,
-        active: true,
-        createdAtMs: Number(payer.createdAtMs || nowMs()),
-      }),
-      setIfChanged(db.doc(`communities/${id}/payers/${payerDoc.id}`), {
-        communityId: id,
-        customerId: id,
-        flatId,
-        residentUid: syntheticUid,
-        userId: syntheticUid,
-        street,
-        streetId,
-        buildingNo,
-        apartmentNo,
-        flatLabel,
-        flatKey,
-        appVisible: true,
-      }),
-      setIfChanged(db.doc(`communities/${id}/flats/${flatId}`), {
-        communityId: id,
-        flatId,
-        residentUid: syntheticUid,
-        userId: syntheticUid,
-        street,
-        streetId,
-        buildingNo,
-        apartmentNo,
-        flatLabel,
-        flatKey,
-        appVisible: true,
-      }),
-    ]);
-  }
-
-  for (const item of streetMap.values()) {
-    await setIfChanged(db.doc(`communities/${id}/streets/${item.id}`), {
-      id: item.id,
-      communityId: id,
-      name: item.name,
-      normalizedName: item.id,
-      isActive: true,
-    });
-  }
-
-  const finalUserDocs = await getCommunityUserDocs(id);
-  const visibleSeatUsers = finalUserDocs
-    .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
-    .filter((data) => isVisibleSeatUser(data));
-  const payerCount = payersSnap.size;
-  const appSeatsUsed = visibleSeatUsers.length;
-  const panelSeatsUsed = payerCount;
-  const occupiedSeats = Math.max(occupiedFlatIds.size, appSeatsUsed, panelSeatsUsed);
-
-  await setIfChanged(communityRef, {
-    streetIds: Array.from(streetMap.values()).map((item) => item.id),
-    streetNames: Array.from(streetMap.values()).map((item) => item.name),
-    streetsList: Array.from(streetMap.values()),
-    seatsUsed: occupiedSeats,
-    appSeatsUsed,
-    panelSeatsUsed,
-    residentCount: appSeatsUsed,
-    usersCount: appSeatsUsed,
-    occupiedSeats,
-  });
-
-  return { ok: true, communityId: id, payerCount, appSeatsUsed, panelSeatsUsed, occupiedSeats, linkedUsers, syntheticUsers, streetCount: streetMap.size };
-}
-
-function hasMeaningfulChange(before, after, keys) {
-  const beforeData = before ? before.data() || {} : {};
-  const afterData = after ? after.data() || {} : {};
-  if (!before || !after) return true;
-  return keys.some((key) => !jsonEq(beforeData[key] ?? null, afterData[key] ?? null));
 }
 
 function normalizeCategory(input) {
@@ -765,11 +603,12 @@ async function refreshBalanceDoc(communityId, flatId) {
 }
 
 async function getCommunityAdmins(communityId) {
-  const snap = await db.collection("users")
-    .where("communityId", "==", communityId)
-    .where("role", "in", ["ADMIN", "MASTER"])
-    .get();
-  return snap.docs.map((d) => d.data().fcmToken).filter(Boolean);
+  const users = await listCommunityUsersByAliases(communityId);
+  return users
+    .map((doc) => doc.data())
+    .filter((data) => ["ADMIN", "MASTER", "ACCOUNTANT"].includes(safeText(data?.role).toUpperCase()))
+    .map((data) => safeText(data?.fcmToken))
+    .filter(Boolean);
 }
 
 async function getUserToken(uid) {
@@ -862,6 +701,495 @@ async function fuzzyFindFlatForPayment(communityId, row) {
   return best && best.score >= 70 ? best.doc : null;
 }
 
+async function listCommunityUsersByAliases(communityId) {
+  const [communityUsersSnap, customerUsersSnap] = await Promise.all([
+    db.collection("users").where("communityId", "==", communityId).get().catch(() => null),
+    db.collection("users").where("customerId", "==", communityId).get().catch(() => null),
+  ]);
+  const merged = new Map();
+  [communityUsersSnap, customerUsersSnap].forEach((snap) => {
+    snap?.docs?.forEach((doc) => {
+      if (!merged.has(doc.id)) merged.set(doc.id, { uid: doc.id, ...doc.data() });
+    });
+  });
+  return Array.from(merged.values());
+}
+
+async function countCommunitySeatsUsed(communityId) {
+  const [payersSnap, flatsSnap, users] = await Promise.all([
+    db.collection(`communities/${communityId}/payers`).get().catch(() => null),
+    db.collection(`communities/${communityId}/flats`).get().catch(() => null),
+    listCommunityUsersByAliases(communityId).catch(() => []),
+  ]);
+  const visibleUsers = users.filter((user) => {
+    const role = safeText(user.role).toUpperCase();
+    if (["REMOVED", "DELETED"].includes(role)) return false;
+    if (user.deleted === true) return false;
+    return true;
+  }).length;
+  return Math.max(payersSnap?.size || 0, flatsSnap?.size || 0, visibleUsers, 0);
+}
+
+async function calculateSeatsTotalFromPurchases(communityId, fallbackTotal = 0) {
+  const snap = await db.collection(`communities/${communityId}/seat_purchases`).get().catch(() => null);
+  if (!snap || snap.empty) return intValue(fallbackTotal, 0);
+  const now = nowMs();
+  let total = 0;
+  for (const doc of snap.docs) {
+    const data = doc.data() || {};
+    const seats = intValue(data.seats, 0);
+    const blocked = boolValue(data.blocked, false);
+    const validUntilMs = intValue(data.validUntilMs, 0);
+    if (seats <= 0 || blocked) continue;
+    if (validUntilMs > 0 && validUntilMs < now) continue;
+    total += seats;
+  }
+  return total;
+}
+
+async function syncCommunityDoc(communityId, overrides = {}) {
+  const ref = db.doc(`communities/${communityId}`);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Wspolnota nie istnieje.");
+  const current = snap.data() || {};
+  const seatsTotal = overrides.seatsTotal != null ?
+    intValue(overrides.seatsTotal, 0) :
+    await calculateSeatsTotalFromPurchases(communityId, communitySeatsTotalValue(current));
+  const seatsUsed = overrides.seatsUsed != null ?
+    intValue(overrides.seatsUsed, 0) :
+    await countCommunitySeatsUsed(communityId);
+  const panelEnabled = overrides.panelAccessEnabled != null ?
+    overrides.panelAccessEnabled === true :
+    communityPanelEnabledValue(current);
+  const blocked = overrides.blocked != null ?
+    overrides.blocked === true :
+    communityBlockedValue(current);
+
+  const patch = {
+    id: communityId,
+    ownerEmail: normalizeEmail(overrides.ownerEmail || current.ownerEmail),
+    masterEmail: normalizeEmail(overrides.masterEmail || current.masterEmail),
+    updatedAtMs: nowMs(),
+    ...seatTotalPatch(seatsTotal),
+    ...seatUsedPatch(seatsUsed),
+    ...panelPatch(panelEnabled),
+    ...blockedPatch(blocked),
+  };
+
+  if (Array.isArray(overrides.streetRegistry)) {
+    patch.streetIds = overrides.streetRegistry.map((street) => safeText(street.id)).filter(Boolean);
+    patch.streetNames = overrides.streetRegistry.map((street) => safeText(street.name)).filter(Boolean);
+    patch.streetsList = overrides.streetRegistry
+      .map((street) => ({ id: safeText(street.id), name: safeText(street.name) }))
+      .filter((street) => street.id && street.name);
+  }
+
+  if (overrides.deleted != null) {
+    patch.deleted = overrides.deleted === true;
+    if (patch.deleted) patch.deletedAtMs = nowMs();
+  }
+
+  await ref.set(patch, { merge: true });
+  return {
+    communityId,
+    seatsTotal,
+    seatsUsed,
+    panelAccessEnabled: panelEnabled,
+    blocked,
+    streetCount: Array.isArray(patch.streetIds) ? patch.streetIds.length : undefined,
+  };
+}
+
+function shadowUserId(communityId, flatId) {
+  return `payer_${communityId}_${flatId}`;
+}
+
+function legacyShadowUserId(communityId, flatId) {
+  return `shadow_${communityId}_${flatId}`;
+}
+
+async function repairCommunityData(communityId) {
+  const [payersSnap, streetsSnap, assignmentsSnap, flatsSnap, users] = await Promise.all([
+    db.collection(`communities/${communityId}/payers`).get().catch(() => null),
+    db.collection(`communities/${communityId}/streets`).get().catch(() => null),
+    db.collection(`communities/${communityId}/streetAssignments`).get().catch(() => null),
+    db.collection(`communities/${communityId}/flats`).get().catch(() => null),
+    listCommunityUsersByAliases(communityId).catch(() => []),
+  ]);
+
+  const usersByEmail = new Map();
+  users.forEach((user) => {
+    const email = normalizeEmail(user.email);
+    const role = safeText(user.role).toUpperCase();
+    if (!email) return;
+    if (user.isShadow === true || user.placeholderResident === true) return;
+    if (["REMOVED", "DELETED"].includes(role)) return;
+    if (!usersByEmail.has(email)) usersByEmail.set(email, user);
+  });
+
+  let payerCount = 0;
+  let shadowCreated = 0;
+  let payerLinked = 0;
+
+  for (const payerDoc of payersSnap?.docs || []) {
+    payerCount += 1;
+    const payer = payerDoc.data() || {};
+    const flatId = safeText(payer.flatId || payerDoc.id);
+    if (!flatId) continue;
+    const linked = normalizeEmail(payer.email) ? usersByEmail.get(normalizeEmail(payer.email)) : null;
+    const residentUid = safeText(payer.residentUid || payer.userId || linked?.uid);
+    const flatRef = db.doc(`communities/${communityId}/flats/${flatId}`);
+
+    if (linked?.uid) {
+      await Promise.all([
+        db.doc(`communities/${communityId}/payers/${payerDoc.id}`).set({
+          residentUid: linked.uid,
+          userId: linked.uid,
+          mailOnly: false,
+          updatedAtMs: nowMs(),
+        }, { merge: true }),
+        flatRef.set({
+          residentUid: linked.uid,
+          userId: linked.uid,
+          occupantsUids: FieldValue.arrayUnion(linked.uid),
+          flatLabel: safeText(payer.flatLabel),
+          flatKey: safeText(payer.flatKey),
+          status: "ACTIVE",
+          updatedAtMs: nowMs(),
+        }, { merge: true }),
+        db.doc(`users/${linked.uid}`).set({
+          communityId,
+          customerId: communityId,
+          activeCommunityId: communityId,
+          currentCommunityId: communityId,
+          selectedCommunityId: communityId,
+          flatId,
+          street: safeText(linked.street || payer.street),
+          streetId: safeText(linked.streetId || payer.streetId),
+          buildingNo: safeText(linked.buildingNo || payer.buildingNo),
+          apartmentNo: safeText(linked.apartmentNo || payer.apartmentNo || payer.flatNumber),
+          flatLabel: safeText(linked.flatLabel || payer.flatLabel),
+          updatedAtMs: nowMs(),
+        }, { merge: true }),
+      ]);
+      await db.doc(`users/${shadowUserId(communityId, flatId)}`).delete().catch(() => null);
+      await db.doc(`users/${legacyShadowUserId(communityId, flatId)}`).delete().catch(() => null);
+      payerLinked += 1;
+      continue;
+    }
+
+    if (!residentUid) {
+      const placeholderUid = shadowUserId(communityId, flatId);
+      const placeholderRef = db.doc(`users/${placeholderUid}`);
+      const placeholderSnap = await placeholderRef.get().catch(() => null);
+      await Promise.all([
+        placeholderRef.set({
+          uid: placeholderUid,
+          communityId,
+          customerId: communityId,
+          activeCommunityId: communityId,
+          currentCommunityId: communityId,
+          selectedCommunityId: communityId,
+          flatId,
+          role: "RESIDENT",
+          displayName: safeText(payer.displayName || `${safeText(payer.name)} ${safeText(payer.surname)}`).trim(),
+          firstName: safeText(payer.name),
+          lastName: safeText(payer.surname),
+          name: safeText(payer.name),
+          surname: safeText(payer.surname),
+          email: safeText(payer.email),
+          emailLower: normalizeEmail(payer.email),
+          phone: safeText(payer.phone),
+          street: safeText(payer.street),
+          streetId: safeText(payer.streetId),
+          buildingNo: safeText(payer.buildingNo),
+          apartmentNo: safeText(payer.apartmentNo || payer.flatNumber),
+          flatLabel: safeText(payer.flatLabel),
+          flatKey: safeText(payer.flatKey),
+          mailOnly: false,
+          placeholderResident: true,
+          isShadow: true,
+          authLinked: false,
+          active: false,
+          appVisible: false,
+          source: "WEBPANEL_PLACEHOLDER",
+          createdAtMs: Number(payer.createdAtMs || nowMs()),
+          updatedAtMs: nowMs(),
+        }, { merge: true }),
+        db.doc(`communities/${communityId}/payers/${payerDoc.id}`).set({
+          residentUid: placeholderUid,
+          userId: placeholderUid,
+          updatedAtMs: nowMs(),
+        }, { merge: true }),
+        flatRef.set({
+          residentUid: placeholderUid,
+          userId: placeholderUid,
+          flatLabel: safeText(payer.flatLabel),
+          flatKey: safeText(payer.flatKey),
+          updatedAtMs: nowMs(),
+        }, { merge: true }),
+      ]);
+      await db.doc(`users/${legacyShadowUserId(communityId, flatId)}`).delete().catch(() => null);
+      if (!placeholderSnap?.exists) shadowCreated += 1;
+    }
+  }
+
+  const streetMap = new Map();
+  const registerStreet = (idCandidate, nameCandidate) => {
+    const name = safeText(nameCandidate);
+    const id = safeText(idCandidate || normalizeStreetName(name));
+    if (!id || !name) return;
+    streetMap.set(id, { id, name });
+  };
+
+  for (const doc of streetsSnap?.docs || []) {
+    const data = doc.data() || {};
+    registerStreet(doc.id || data.id, data.name || data.street);
+  }
+  for (const doc of assignmentsSnap?.docs || []) {
+    const data = doc.data() || {};
+    registerStreet(data.id || doc.id, data.name || data.street || data.streetName);
+  }
+  for (const doc of flatsSnap?.docs || []) {
+    const data = doc.data() || {};
+    registerStreet(data.streetId, data.street);
+  }
+
+  await Promise.all(Array.from(streetMap.values()).map((street) => Promise.all([
+    db.doc(`communities/${communityId}/streets/${street.id}`).set({
+      id: street.id,
+      communityId,
+      name: street.name,
+      normalizedName: street.id,
+      isActive: true,
+      updatedAtMs: nowMs(),
+      createdAtMs: nowMs(),
+    }, { merge: true }),
+    db.doc(`communities/${communityId}/streetAssignments/${street.id}`).set({
+      id: street.id,
+      communityId,
+      street: street.name,
+      streetName: street.name,
+      name: street.name,
+      isActive: true,
+      updatedAtMs: nowMs(),
+    }, { merge: true }),
+  ])));
+
+  const sync = await syncCommunityDoc(communityId, {
+    seatsUsed: Math.max(payerCount, users.length, flatsSnap?.size || 0),
+    streetRegistry: Array.from(streetMap.values()),
+  });
+
+  return {
+    ...sync,
+    payerCount,
+    shadowCreated,
+    payerLinked,
+    streetCount: streetMap.size,
+  };
+}
+
+function sanitizeHtmlToText(html) {
+  return safeText(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<(br|p|div|li|section|article|h[1-6])[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;/gi, "'")
+    .replace(/\r/g, "\n")
+    .replace(/\n{2,}/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function detectAiCategory(text) {
+  const hay = safeText(text).toLowerCase();
+  if (/awari|przerw|usterk|brak wody|brak pradu|zalan/.test(hay)) return "AWARIE";
+  if (/oplata|czynsz|platn|rachunk|rozliczen/.test(hay)) return "OPLATY";
+  if (/ostrzez|uwaga|zagrozen|alarm|pilne/.test(hay)) return "OSTRZEZENIA";
+  if (/wydarzen|spotkan|zebran|festyn|piknik|warsztat/.test(hay)) return "WYDARZENIA";
+  return "ADMINISTRACJA";
+}
+
+function detectAiPriority(text) {
+  const hay = safeText(text).toLowerCase();
+  if (/pilne|natychmiast|awari|ostrzez|uwaga/.test(hay)) return "HIGH";
+  if (/wazne|termin|oplata|czynsz|zebran/.test(hay)) return "MEDIUM";
+  return "LOW";
+}
+
+function extractAiNewsCandidates(text, maxItems = 5) {
+  const items = [];
+  const seen = new Set();
+  const paragraphs = safeText(text)
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter((line) => line.length >= 40);
+  for (const paragraph of paragraphs) {
+    const normalized = paragraph.toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    items.push(paragraph);
+    if (items.length >= maxItems) break;
+  }
+  if (!items.length && safeText(text)) items.push(safeText(text).slice(0, 400));
+  return items;
+}
+
+async function summarizeAiCandidate(source, candidate) {
+  const client = getOpenAiClient();
+  const text = safeText(candidate).slice(0, 2400);
+  if (client) {
+    try {
+      const response = await client.responses.create({
+        model: process.env.COMMUNITY_AI_MODEL || "gpt-4.1-mini",
+        input: [
+          {
+            role: "system",
+            content: [
+              {
+                type: "input_text",
+                text: "Summarize community notices for residents. Return JSON with title, summary, importance and category. Keep it short and practical.",
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: JSON.stringify({
+                  sourceName: safeText(source.name),
+                  sourceCategory: safeText(source.category),
+                  text,
+                }),
+              },
+            ],
+          },
+        ],
+      });
+      const outputText = safeText(response.output_text);
+      const parsed = JSON.parse(outputText);
+      return {
+        title: safeText(parsed.title).slice(0, 120),
+        aiSummary: safeText(parsed.summary).slice(0, 500),
+        priority: ["HIGH", "MEDIUM", "LOW"].includes(safeText(parsed.importance).toUpperCase()) ? safeText(parsed.importance).toUpperCase() : detectAiPriority(text),
+        category: safeText(parsed.category).toUpperCase() || detectAiCategory(text),
+      };
+    } catch (_) {}
+  }
+  const firstSentence = safeText(text.split(/[.!?]\s+/)[0]).slice(0, 120);
+  return {
+    title: firstSentence || safeText(source.name) || "Wspolnota AI",
+    aiSummary: safeText(text).slice(0, 400),
+    priority: detectAiPriority(text),
+    category: detectAiCategory(text),
+  };
+}
+
+async function publishAiItemAsAnnouncement(communityId, item, actorUid = "") {
+  const ref = db.collection(`communities/${communityId}/announcements`).doc();
+  await ref.set({
+    title: item.title,
+    body: item.aiSummary,
+    communityId,
+    source: "COMMUNITY_AI",
+    aiNewsId: item.id,
+    aiSourceId: item.sourceId,
+    createdAtMs: nowMs(),
+    createdByUid: actorUid,
+    importance: item.priority,
+    category: item.category,
+  }, { merge: true });
+  return ref.id;
+}
+
+async function refreshAiSourceInternal(communityId, sourceId, actorUid = "", options = {}) {
+  const sourceRef = db.doc(`communities/${communityId}/aiSources/${sourceId}`);
+  const sourceSnap = await sourceRef.get();
+  if (!sourceSnap.exists) throw new HttpsError("not-found", "Zrodlo AI nie istnieje.");
+  const source = { id: sourceSnap.id, ...sourceSnap.data() };
+  if (source.enabled === false && options.force !== true) {
+    return { sourceId, skipped: true, reason: "disabled" };
+  }
+
+  let response;
+  try {
+    response = await fetch(safeText(source.url), {
+      headers: { "user-agent": "e-lokator-community-ai/1.0" },
+    });
+  } catch (error) {
+    await sourceRef.set({ lastRefreshAtMs: nowMs(), lastError: safeText(error?.message || "fetch_failed"), updatedAtMs: nowMs() }, { merge: true });
+    throw new HttpsError("unavailable", "Nie udalo sie pobrac zrodla AI.");
+  }
+
+  if (!response.ok) {
+    await sourceRef.set({ lastRefreshAtMs: nowMs(), lastError: `http_${response.status}`, updatedAtMs: nowMs() }, { merge: true });
+    throw new HttpsError("failed-precondition", "Zrodlo AI zwrocilo blad HTTP.");
+  }
+
+  const html = await response.text();
+  const cleanText = sanitizeHtmlToText(html);
+  const candidates = extractAiNewsCandidates(cleanText, 5);
+  let created = 0;
+
+  for (const candidate of candidates) {
+    const summary = await summarizeAiCandidate(source, candidate);
+    const sourceHash = hashText(`${safeText(source.url)}|${safeText(candidate)}`);
+    const newsRef = db.doc(`communities/${communityId}/aiNews/${sourceHash}`);
+    const existing = await newsRef.get();
+    if (existing.exists && options.force !== true) continue;
+
+    const payload = {
+      id: sourceHash,
+      communityId,
+      sourceId,
+      sourceName: safeText(source.name),
+      sourceCategory: safeText(source.category),
+      sourceUrl: safeText(source.url),
+      title: safeText(summary.title),
+      aiSummary: safeText(summary.aiSummary),
+      sourceExcerpt: safeText(candidate).slice(0, 1200),
+      category: safeText(summary.category || detectAiCategory(candidate)),
+      priority: safeText(summary.priority || detectAiPriority(candidate)),
+      important: safeText(summary.priority).toUpperCase() === "HIGH",
+      pinned: false,
+      hidden: false,
+      archived: false,
+      publishedAsAnnouncement: false,
+      contentHash: sourceHash,
+      fetchedAtMs: nowMs(),
+      updatedAtMs: nowMs(),
+      createdAtMs: existing.exists ? Number(existing.data()?.createdAtMs || nowMs()) : nowMs(),
+      createdByUid: actorUid,
+    };
+
+    await newsRef.set(payload, { merge: true });
+    if (source.publishAsAnnouncement === true && payload.priority === "HIGH") {
+      const announcementId = await publishAiItemAsAnnouncement(communityId, payload, actorUid).catch(() => "");
+      if (announcementId) {
+        await newsRef.set({ publishedAsAnnouncement: true, announcementId, updatedAtMs: nowMs() }, { merge: true });
+      }
+    }
+    created += 1;
+  }
+
+  await sourceRef.set({
+    lastRefreshAtMs: nowMs(),
+    lastError: "",
+    lastStatus: "OK",
+    lastItemsCount: candidates.length,
+    updatedAtMs: nowMs(),
+    updatedByUid: actorUid,
+  }, { merge: true });
+
+  return { sourceId, created, processed: candidates.length };
+}
+
 async function sendToToken(token, type, title, body, extraData = {}) {
   if (!token) return;
   await admin.messaging().send({ token, data: { type, title, body, ...Object.fromEntries(Object.entries(extraData).map(([k, v]) => [k, String(v)])) }, android: { priority: "high" } }).catch((e) => console.error("FCM error", e));
@@ -951,13 +1279,27 @@ exports.createActivationCode = onCall(async (request) => {
   assertOwner(request);
   const name = safeText(request.data?.name || request.data?.orgName);
   const nip = safeText(request.data?.nip).replace(/\D/g, "");
+  const initialSeats = Math.max(intValue(request.data?.initialSeats, 2), 1);
   if (!name || nip.length !== 10) throw new HttpsError("invalid-argument", "Podaj nazwę i poprawny NIP.");
   for (let i = 0; i < 10; i++) {
     const code = randomCode(10);
     const ref = db.doc(`activation_codes/${code}`);
     try {
-      await ref.create({ code, name, nip, used: false, status: "ACTIVE", createdAtMs: nowMs(), createdByUid: request.auth.uid });
-      return { code, docPath: ref.path };
+      await ref.create({
+        code,
+        name,
+        nip,
+        initialSeats,
+        seatsTotal: initialSeats,
+        panelAccessEnabled: true,
+        blocked: false,
+        used: false,
+        status: "ACTIVE",
+        createdAtMs: nowMs(),
+        createdByUid: request.auth.uid,
+        createdByEmail: normalizeEmail(request.auth?.token?.email),
+      });
+      return { code, docPath: ref.path, initialSeats };
     } catch (e) {
       if (e.code !== 6) throw e;
     }
@@ -966,19 +1308,17 @@ exports.createActivationCode = onCall(async (request) => {
 });
 
 exports.createInvite = onCall(async (request) => {
-  const communityId = safeText(request.data?.communityId || request.data?.customerId);
-  const role = safeText(request.data?.role || "RESIDENT").toUpperCase() || "RESIDENT";
-  const { uid, profile, role: myRole } = await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
-  if (role === "ADMIN" && !(isOwnerRequest(request) || myRole === "MASTER")) {
-    throw new HttpsError("permission-denied", "Tylko MASTER lub owner może tworzyć zaproszenie ADMIN.");
-  }
+  const uid = requireAuth(request);
+  const me = await getMyProfile(uid);
+  const communityId = safeText(request.data?.communityId || profileCommunityId(me));
+  const role = safeText(request.data?.role || "RESIDENT");
   const invite = {
-    customerId: firstNonBlank(request.data?.customerId, profile?.customerId, profile?.communityId, communityId),
+    customerId: me?.customerId || me?.communityId || communityId,
     communityId,
     role,
     status: "active",
+    invitedByUid: uid,
     createdAtMs: nowMs(),
-    createdByUid: uid,
     expiresAtMs: Number(request.data?.expiresAtMs || nowMs() + 7 * 24 * 3600 * 1000),
     staircaseId: safeText(request.data?.staircaseId),
     flatId: safeText(request.data?.flatId),
@@ -995,6 +1335,17 @@ exports.createInvite = onCall(async (request) => {
     industry: safeText(request.data?.industry),
   };
   const ref = await db.collection("invites").add(invite);
+  const activeInviteDocId = role === "ADMIN" ? "last_admin_invite" : (invite.flatId ? `flat_${invite.flatId}` : "");
+  if (activeInviteDocId) {
+    await db.doc(`communities/${communityId}/activeInvites/${activeInviteDocId}`).set({
+      inviteId: ref.id,
+      role,
+      flatId: invite.flatId,
+      communityId,
+      expiresAtMs: invite.expiresAtMs,
+      updatedAtMs: nowMs(),
+    }, { merge: true });
+  }
   return { inviteId: ref.id };
 });
 
@@ -1009,15 +1360,11 @@ exports.claimInvite = onCall(async (request) => {
   const inviteRef = db.doc(`invites/${inviteId}`);
   const snap = await inviteRef.get();
   if (!snap.exists) throw new HttpsError("not-found", "Invite nie istnieje.");
-  const inv = snap.data() || {};
-  const communityId = firstNonBlank(inv.communityId, inv.customerId);
-  const role = safeText(inv.role || "RESIDENT").toUpperCase() || "RESIDENT";
-  if (!communityId) throw new HttpsError("failed-precondition", "Invite nie ma communityId.");
-  if (safeText(inv.status || "active").toLowerCase() !== "active") throw new HttpsError("failed-precondition", "Zaproszenie nie jest już aktywne.");
-  if (Number(inv.expiresAtMs || 0) > 0 && Number(inv.expiresAtMs || 0) < nowMs()) throw new HttpsError("deadline-exceeded", "Zaproszenie wygasło.");
-  if (role === "RESIDENT" && !safeText(requestApartmentNo || inv.apartmentNo)) {
-    throw new HttpsError("invalid-argument", "Brak numeru mieszkania/lokalu.");
-  }
+  const inv = snap.data();
+  if (safeText(inv.status).toLowerCase() === "revoked") throw new HttpsError("failed-precondition", "Invite zostal odwolany.");
+  if (Number(inv.expiresAtMs || 0) > 0 && Number(inv.expiresAtMs || 0) < nowMs()) throw new HttpsError("deadline-exceeded", "Invite wygasl.");
+  const communityId = safeText(inv.communityId);
+  const role = safeText(inv.role || "RESIDENT");
   let flat = null;
   if (role === "RESIDENT" && communityId) {
     flat = await claimOrCreateFlatForResident({
@@ -1033,27 +1380,22 @@ exports.claimInvite = onCall(async (request) => {
     });
   }
   await db.doc(`users/${uid}`).set({
-    uid,
     role,
     communityId,
-    customerId: firstNonBlank(inv.customerId, communityId),
+    customerId: inv.customerId || communityId,
+    activeCommunityId: communityId,
+    currentCommunityId: communityId,
+    selectedCommunityId: communityId,
     displayName: senderName || undefined,
     street: flat?.street || requestStreet || safeText(inv.street),
-    streetId: safeText((flat && flat.street ? normalizeFlatPart(flat.street) : "") || inv.streetId || normalizeFlatPart(requestStreet || safeText(inv.street))),
     buildingNo: flat?.buildingNo || requestBuildingNo || safeText(inv.buildingNo),
     apartmentNo: flat?.apartmentNo || requestApartmentNo || safeText(inv.apartmentNo),
     flatId: flat?.flatId || safeText(inv.flatId) || undefined,
     staircaseId: flat?.staircaseId || safeText(inv.staircaseId) || undefined,
     flatLabel: flat?.flatLabel || safeText(inv.flatLabel) || undefined,
-    flatKey: flat?.flatKey || safeText(inv.flatKey) || buildFlatKey(communityId, requestStreet || safeText(inv.street), requestBuildingNo || safeText(inv.buildingNo), requestApartmentNo || safeText(inv.apartmentNo)),
-    authLinked: true,
-    appVisible: true,
-    placeholderResident: false,
-    isShadow: false,
     updatedAtMs: nowMs(),
   }, { merge: true });
   await inviteRef.set({ status: "used", usedByUid: uid, usedAtMs: nowMs() }, { merge: true });
-  await syncCommunityDerivedState(communityId).catch(() => null);
   return { ok: true, flatId: flat?.flatId || null, flatLabel: flat?.flatLabel || null };
 });
 
@@ -1143,68 +1485,518 @@ exports.importFlats = onCall(async (request) => {
 
 exports.activateCommunity = onCall(async (request) => {
   const uid = requireAuth(request);
-  const code = safeText(request.data?.code);
-  const nip = safeText(request.data?.nip);
-  const name = safeText(request.data?.name);
-  if (!code || !nip || !name) throw new HttpsError("invalid-argument", "Brak danych aktywacji.");
+  const code = safeText(request.data?.code).toUpperCase();
+  if (!code) throw new HttpsError("invalid-argument", "Brak kodu aktywacyjnego.");
   const communityDoc = db.collection("communities").doc();
+  const activationRef = db.doc(`activation_codes/${code}`);
+  const initialPurchaseRef = communityDoc.collection("seat_purchases").doc("activation");
   return db.runTransaction(async (tx) => {
-    const initialSeats = 2;
+    const codeSnap = await tx.get(activationRef);
+    if (!codeSnap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
+    const codeData = codeSnap.data() || {};
+    const status = safeText(codeData.status).toUpperCase();
+    if (codeData.used === true || status === "USED") throw new HttpsError("failed-precondition", "Kod zostal juz uzyty.");
+    if (status && status !== "ACTIVE") throw new HttpsError("failed-precondition", "Kod nie jest aktywny.");
+
+    const name = safeText(request.data?.name || codeData.name);
+    const nip = safeText(request.data?.nip || codeData.nip).replace(/\D/g, "");
+    const initialSeats = Math.max(
+      intValue(request.data?.initialSeats, 0) ||
+      intValue(codeData.initialSeats, 0) ||
+      intValue(codeData.seatsTotal, 0),
+      1
+    );
+    if (!name || nip.length !== 10) throw new HttpsError("invalid-argument", "Brak danych aktywacji.");
+
+    const email = normalizeEmail(request.auth?.token?.email);
+    const now = nowMs();
+
     tx.set(communityDoc, {
       id: communityDoc.id,
       name,
       nip,
-      createdAtMs: nowMs(),
-      seatsTotal: initialSeats,
-      appSeatsTotal: initialSeats,
-      maxSeats: initialSeats,
+      createdAtMs: now,
+      updatedAtMs: now,
+      ownerEmail: normalizeEmail(codeData.createdByEmail || codeData.ownerEmail),
+      masterEmail: email,
+      enableExternalPayments: false,
+      paymentsUrl: "",
+      ...panelPatch(true),
+      ...blockedPatch(false),
+      ...seatTotalPatch(initialSeats),
+      ...seatUsedPatch(0),
+    }, { merge: true });
+    tx.set(initialPurchaseRef, {
+      id: "activation",
       seats: initialSeats,
-      seatsLimit: initialSeats,
-      panelSeats: initialSeats,
-      panelSeatsLimit: initialSeats,
-      licenses: initialSeats,
-      seatsUsed: 0,
-      appSeatsUsed: 0,
-      panelSeatsUsed: 0,
-      residentCount: 0,
-      usersCount: 0,
-      occupiedSeats: 0,
-      panelAccessEnabled: false,
-      accessToPanel: false,
-      panelActive: false,
-      panelEnabled: false,
-      webPanelEnabled: false,
-      webpanelEnabled: false,
-      updatedAtMs: nowMs(),
-    });
-    tx.set(db.doc(`users/${uid}`), { role: "MASTER", communityId: communityDoc.id, customerId: communityDoc.id, updatedAtMs: nowMs() }, { merge: true });
-    tx.set(db.doc(`activation_codes/${code}`), { used: true, communityId: communityDoc.id, usedAtMs: nowMs() }, { merge: true });
-    return { communityId: communityDoc.id };
+      purchasedAtMs: now,
+      validUntilMs: futureYearMs(now),
+      blocked: false,
+      source: "ACTIVATION",
+      createdAtMs: now,
+      updatedAtMs: now,
+    }, { merge: true });
+    tx.set(db.doc(`users/${uid}`), {
+      role: "MASTER",
+      communityId: communityDoc.id,
+      customerId: communityDoc.id,
+      activeCommunityId: communityDoc.id,
+      currentCommunityId: communityDoc.id,
+      selectedCommunityId: communityDoc.id,
+      email,
+      updatedAtMs: now,
+    }, { merge: true });
+    tx.set(activationRef, {
+      used: true,
+      status: "USED",
+      usedAtMs: now,
+      usedByUid: uid,
+      usedByEmail: email,
+      communityId: communityDoc.id,
+      updatedAtMs: now,
+    }, { merge: true });
+    return { communityId: communityDoc.id, seatsTotal: initialSeats };
   });
 });
 
+exports.disableActivationCode = onCall(async (request) => {
+  assertOwner(request);
+  const code = safeText(request.data?.code).toUpperCase();
+  if (!code) throw new HttpsError("invalid-argument", "Brak kodu.");
+  const ref = db.doc(`activation_codes/${code}`);
+  await ref.set({
+    status: "DISABLED",
+    disabledAtMs: nowMs(),
+    disabledByUid: request.auth?.uid || "",
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  return { ok: true, code };
+});
+
+exports.ownerSetCommunityBlocked = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  return { ok: true, ...(await syncCommunityDoc(communityId, { blocked: request.data?.blocked === true })) };
+});
+
+exports.ownerSetCommunityPanelAccess = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  return { ok: true, ...(await syncCommunityDoc(communityId, { panelAccessEnabled: request.data?.enabled === true })) };
+});
+
+exports.ownerApproveSeatRequest = onCall(async (request) => {
+  assertOwner(request);
+  const requestId = safeText(request.data?.requestId);
+  const communityId = safeText(request.data?.communityId);
+  const deltaSeats = Math.max(intValue(request.data?.deltaSeats, 0), 0);
+  if (!requestId || !communityId || deltaSeats <= 0) throw new HttpsError("invalid-argument", "Brak danych do zatwierdzenia.");
+
+  const reqRef = db.doc(`seat_requests/${requestId}`);
+  const commRef = db.doc(`communities/${communityId}`);
+  const purchaseRef = commRef.collection("seat_purchases").doc();
+  await db.runTransaction(async (tx) => {
+    const [reqSnap, commSnap] = await Promise.all([tx.get(reqRef), tx.get(commRef)]);
+    if (!reqSnap.exists) throw new HttpsError("not-found", "Prosba nie istnieje.");
+    if (!commSnap.exists) throw new HttpsError("not-found", "Wspolnota nie istnieje.");
+    const reqData = reqSnap.data() || {};
+    if (safeText(reqData.status).toUpperCase() === "APPROVED") return;
+    const now = nowMs();
+    tx.set(purchaseRef, {
+      id: purchaseRef.id,
+      seats: deltaSeats,
+      purchasedAtMs: now,
+      validUntilMs: futureYearMs(now),
+      blocked: false,
+      source: "OWNER_APPROVAL",
+      requestId,
+      createdAtMs: now,
+      createdByUid: request.auth?.uid || "",
+      updatedAtMs: now,
+    }, { merge: true });
+    tx.set(reqRef, {
+      status: "APPROVED",
+      processedAtMs: now,
+      processedByUid: request.auth?.uid || "",
+      updatedAtMs: now,
+    }, { merge: true });
+  });
+  return { ok: true, requestId, ...(await syncCommunityDoc(communityId)) };
+});
+
+exports.ownerRejectSeatRequest = onCall(async (request) => {
+  assertOwner(request);
+  const requestId = safeText(request.data?.requestId);
+  if (!requestId) throw new HttpsError("invalid-argument", "Brak requestId.");
+  await db.doc(`seat_requests/${requestId}`).set({
+    status: "REJECTED",
+    processedAtMs: nowMs(),
+    processedByUid: request.auth?.uid || "",
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  return { ok: true, requestId };
+});
+
+exports.ownerExtendSeatPurchase = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeText(request.data?.communityId);
+  const purchaseId = safeText(request.data?.purchaseId);
+  if (!communityId || !purchaseId) throw new HttpsError("invalid-argument", "Brak danych zakupu.");
+  const ref = db.doc(`communities/${communityId}/seat_purchases/${purchaseId}`);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new HttpsError("not-found", "Zakup nie istnieje.");
+    const current = intValue(snap.data()?.validUntilMs, 0);
+    tx.set(ref, {
+      validUntilMs: futureYearMs(Math.max(current, nowMs())),
+      updatedAtMs: nowMs(),
+    }, { merge: true });
+  });
+  return { ok: true, ...(await syncCommunityDoc(communityId)) };
+});
+
+exports.ownerSetSeatPurchaseBlocked = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeText(request.data?.communityId);
+  const purchaseId = safeText(request.data?.purchaseId);
+  if (!communityId || !purchaseId) throw new HttpsError("invalid-argument", "Brak danych zakupu.");
+  await db.doc(`communities/${communityId}/seat_purchases/${purchaseId}`).set({
+    blocked: request.data?.blocked === true,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  return { ok: true, ...(await syncCommunityDoc(communityId)) };
+});
+
+exports.ownerDeleteCommunity = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  return { ok: true, ...(await syncCommunityDoc(communityId, { blocked: true, panelAccessEnabled: false, deleted: true })) };
+});
+
+exports.ownerRepairCommunity = onCall(async (request) => {
+  assertOwner(request);
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  return { ok: true, ...(await repairCommunityData(communityId)) };
+});
+
+exports.repairCommunitySync = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
+  return { ok: true, ...(await repairCommunityData(communityId)) };
+});
+
+exports.revokeInvite = onCall(async (request) => {
+  const uid = requireAuth(request);
+  const inviteId = safeText(request.data?.inviteId);
+  if (!inviteId) throw new HttpsError("invalid-argument", "Brak inviteId.");
+  const me = await getMyProfile(uid);
+  const snap = await db.doc(`invites/${inviteId}`).get();
+  if (!snap.exists) throw new HttpsError("not-found", "Invite nie istnieje.");
+  const invite = snap.data() || {};
+  const communityId = safeText(invite.communityId);
+  const myRole = safeText(me?.role);
+  const sameCommunity = profileCommunityId(me) === communityId;
+  const isOwner = request.auth?.token?.owner === true || OWNER_UIDS.includes(uid) || OWNER_EMAILS.includes(normalizeEmail(request.auth?.token?.email));
+  if (!isOwner && !(sameCommunity && ["MASTER", "ADMIN"].includes(myRole))) {
+    throw new HttpsError("permission-denied", "Brak uprawnien do odwolania invite.");
+  }
+  await db.doc(`invites/${inviteId}`).set({
+    status: "revoked",
+    revokedAtMs: nowMs(),
+    revokedByUid: uid,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  const activeInviteDocId = safeText(invite.role).toUpperCase() === "ADMIN" ? "last_admin_invite" : (safeText(invite.flatId) ? `flat_${safeText(invite.flatId)}` : "");
+  if (activeInviteDocId) {
+    await db.doc(`communities/${communityId}/activeInvites/${activeInviteDocId}`).delete().catch(() => null);
+  }
+  return { ok: true, inviteId };
+});
+
+exports.consumeWebSession = onCall(async (request) => {
+  assertOwner(request);
+  const token = safeText(request.data?.token);
+  if (!token) throw new HttpsError("invalid-argument", "Brak tokenu.");
+  const ref = db.doc(`webSessions/${token}`);
+  return await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new HttpsError("not-found", "Token nie istnieje.");
+    const data = snap.data() || {};
+    if (data.used === true) throw new HttpsError("failed-precondition", "Token juz wykorzystany.");
+    if (Number(data.expiresAtMs || 0) < nowMs()) throw new HttpsError("deadline-exceeded", "Token wygasl.");
+    tx.set(ref, { used: true, usedAtMs: nowMs(), updatedAtMs: nowMs() }, { merge: true });
+    return { ok: true, uid: safeText(data.uid), communityId: safeText(data.communityId), target: safeText(data.target || "/dashboard") };
+  });
+});
+
+exports.moderateChatMessage = onCall(async (request) => {
+  const uid = requireAuth(request);
+  const communityId = safeText(request.data?.communityId);
+  const messageId = safeText(request.data?.messageId);
+  if (!communityId || !messageId) throw new HttpsError("invalid-argument", "Brak communityId lub messageId.");
+  const actor = await getMyProfile(uid);
+  const actorRole = safeText(actor?.role);
+  const messageRef = db.doc(`communities/${communityId}/chatMessages/${messageId}`);
+  const messageSnap = await messageRef.get();
+  if (!messageSnap.exists) throw new HttpsError("not-found", "Wiadomosc nie istnieje.");
+  const message = messageSnap.data() || {};
+  const isAuthor = safeText(message.senderUid) === uid;
+  const isStaff = profileCommunityId(actor) === communityId && ["MASTER", "ADMIN", "ACCOUNTANT"].includes(actorRole);
+  if (!isAuthor && !isStaff) throw new HttpsError("permission-denied", "Brak uprawnien do moderacji tej wiadomosci.");
+  await messageRef.set({
+    deleted: request.data?.deleted !== false,
+    deletedAtMs: nowMs(),
+    deletedByUid: uid,
+    moderationReason: safeText(request.data?.reason),
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  return { ok: true, messageId };
+});
+
+exports.clearCommunityChat = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN"]);
+  const snap = await db.collection(`communities/${communityId}/chatMessages`).get();
+  let batch = db.batch();
+  let ops = 0;
+  for (const doc of snap.docs) {
+    batch.set(doc.ref, {
+      deleted: true,
+      deletedAtMs: nowMs(),
+      deletedByUid: request.auth?.uid || "",
+      updatedAtMs: nowMs(),
+    }, { merge: true });
+    ops += 1;
+    if (ops === 400) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+  if (ops > 0) await batch.commit();
+  return { ok: true, cleared: snap.size };
+});
+
+exports.upsertAiSource = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN"]);
+  const sourceId = safeText(request.data?.sourceId) || db.collection(`communities/${communityId}/aiSources`).doc().id;
+  const ref = db.doc(`communities/${communityId}/aiSources/${sourceId}`);
+  await ref.set({
+    id: sourceId,
+    communityId,
+    name: safeText(request.data?.name || request.data?.sourceName),
+    url: safeText(request.data?.url),
+    category: safeText(request.data?.category),
+    refreshEveryMinutes: Math.max(intValue(request.data?.refreshEveryMinutes || request.data?.refreshIntervalMinutes, 360), 15),
+    filterRules: safeText(request.data?.filterRules || request.data?.filters),
+    enabled: request.data?.enabled !== false,
+    publishAsAnnouncement: request.data?.publishAsAnnouncement === true,
+    updatedAtMs: nowMs(),
+    updatedByUid: request.auth?.uid || "",
+    createdAtMs: Number(request.data?.createdAtMs || nowMs()),
+  }, { merge: true });
+  return { ok: true, sourceId };
+});
+
+exports.deleteAiSource = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const sourceId = safeText(request.data?.sourceId);
+  if (!communityId || !sourceId) throw new HttpsError("invalid-argument", "Brak communityId lub sourceId.");
+  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN"]);
+  await db.doc(`communities/${communityId}/aiSources/${sourceId}`).set({
+    deleted: true,
+    enabled: false,
+    deletedAtMs: nowMs(),
+    updatedAtMs: nowMs(),
+    updatedByUid: request.auth?.uid || "",
+  }, { merge: true });
+  return { ok: true, sourceId };
+});
+
+exports.refreshCommunityAiSource = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const sourceId = safeText(request.data?.sourceId);
+  if (!communityId || !sourceId) throw new HttpsError("invalid-argument", "Brak communityId lub sourceId.");
+  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN"]);
+  return { ok: true, ...(await refreshAiSourceInternal(communityId, sourceId, request.auth?.uid || "", { force: true })) };
+});
+
+exports.refreshCommunityAi = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN"]);
+  const sourcesSnap = await db.collection(`communities/${communityId}/aiSources`).where("enabled", "==", true).get();
+  const results = [];
+  for (const sourceDoc of sourcesSnap.docs) {
+    results.push(await refreshAiSourceInternal(communityId, sourceDoc.id, request.auth?.uid || "", { force: true }).catch((error) => ({ sourceId: sourceDoc.id, error: safeText(error?.message) })));
+  }
+  return { ok: true, results };
+});
+
+exports.setAiNewsState = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const newsId = safeText(request.data?.newsId);
+  if (!communityId || !newsId) throw new HttpsError("invalid-argument", "Brak communityId lub newsId.");
+  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN"]);
+  const ref = db.doc(`communities/${communityId}/aiNews/${newsId}`);
+  const patch = {
+    important: request.data?.important === true,
+    pinned: request.data?.pinned === true,
+    hidden: request.data?.hidden === true,
+    archived: request.data?.archived === true,
+    updatedAtMs: nowMs(),
+    updatedByUid: request.auth?.uid || "",
+  };
+  await ref.set(patch, { merge: true });
+  if (request.data?.publishAsAnnouncement === true) {
+    const snap = await ref.get();
+    if (snap.exists) {
+      const item = { id: snap.id, ...snap.data() };
+      const announcementId = await publishAiItemAsAnnouncement(communityId, item, request.auth?.uid || "");
+      await ref.set({ publishedAsAnnouncement: true, announcementId, updatedAtMs: nowMs() }, { merge: true });
+    }
+  }
+  return { ok: true, newsId };
+});
+
+exports.ksefSetConfig = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  await db.doc(`communities/${communityId}/ksef/config`).set({
+    environment: safeText(request.data?.environment || request.data?.mode || "MOCK").toUpperCase(),
+    mode: safeText(request.data?.environment || request.data?.mode || "MOCK").toUpperCase(),
+    nip: safeText(request.data?.nip),
+    identifier: safeText(request.data?.identifier),
+    token: safeText(request.data?.token),
+    subjectType: safeText(request.data?.subjectType || "Subject2"),
+    syncFrom: safeText(request.data?.syncFrom),
+    syncTo: safeText(request.data?.syncTo),
+    autoSyncEnabled: request.data?.autoSyncEnabled === true,
+    autoSyncIntervalMinutes: Math.max(intValue(request.data?.autoSyncIntervalMinutes, 60), 15),
+    autoSyncCount: Math.max(intValue(request.data?.autoSyncCount, 5), 1),
+    retryEnabled: request.data?.retryEnabled !== false,
+    retryMaxAttempts: Math.max(intValue(request.data?.retryMaxAttempts, 3), 1),
+    retryDelayMinutes: Math.max(intValue(request.data?.retryDelayMinutes, 15), 5),
+    dedupeEnabled: request.data?.dedupeEnabled !== false,
+    updatedAtMs: nowMs(),
+    updatedByUid: request.auth?.uid || "",
+  }, { merge: true });
+  return { ok: true };
+});
+
+exports.ksefRetryNow = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  await requireCommunityStaff(request, communityId);
+  await assertPanelAccessEnabled(communityId);
+  const period = parsePeriod(request.data?.period);
+  const count = Math.max(intValue(request.data?.count, 2), 1);
+  const created = [];
+  for (let index = 0; index < count; index += 1) {
+    const ref = db.collection("communities").doc(communityId).collection("invoices").doc();
+    await ref.set({
+      communityId,
+      period,
+      vendorName: index % 2 === 0 ? "TAURON" : "WODOCIAGI",
+      title: index % 2 === 0 ? `Energia elektryczna ${period}` : `Woda i scieki ${period}`,
+      totalGrossCents: index % 2 === 0 ? 184299 : 96340,
+      currency: "PLN",
+      source: "KSEF_RETRY",
+      status: "NOWA",
+      createdAtMs: nowMs(),
+      updatedAtMs: nowMs(),
+    }, { merge: true });
+    created.push(ref.id);
+  }
+  await db.doc(`communities/${communityId}/ksef/config`).set({
+    lastSyncSuccessAtMs: nowMs(),
+    lastSyncError: "",
+    lastSyncDuplicates: 0,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  return { ok: true, created, duplicates: [] };
+});
+
 exports.removeUser = onCall(async (request) => {
-  const targetUid = safeText(request.data?.targetUid);
+  const actorUid = requireAuth(request);
+  const targetUid = safeText(request.data?.targetUid || request.data?.uid);
   if (!targetUid) throw new HttpsError("invalid-argument", "Brak targetUid.");
-  const targetSnap = await db.doc(`users/${targetUid}`).get();
+
+  const actor = await getMyProfile(actorUid);
+  const targetRef = db.doc(`users/${targetUid}`);
+  const targetSnap = await targetRef.get();
   if (!targetSnap.exists) throw new HttpsError("not-found", "Użytkownik nie istnieje.");
   const target = targetSnap.data() || {};
-  const communityId = profileCommunityId(target);
-  await requireCommunityStaff(request, communityId);
-  await db.doc(`users/${targetUid}`).update({ role: "REMOVED", removedAtMs: nowMs(), appVisible: false, updatedAtMs: nowMs() });
-  await syncCommunityDerivedState(communityId).catch(() => null);
+
+  const actorRole = safeText(actor?.role);
+  const targetRole = safeText(target?.role);
+  const sameCommunity = profileCommunityId(actor) && profileCommunityId(actor) === profileCommunityId(target);
+  const actorIsOwner = request.auth?.token?.owner === true || OWNER_UIDS.includes(actorUid) || OWNER_EMAILS.includes(safeText(request.auth?.token?.email));
+  const actorCanManage = actorIsOwner || (sameCommunity && ["MASTER", "ADMIN", "ACCOUNTANT"].includes(actorRole));
+  if (!actorCanManage) throw new HttpsError("permission-denied", "Brak uprawnień do usunięcia użytkownika.");
+  if (targetRole === "MASTER" && !actorIsOwner && actorRole !== "MASTER") {
+    throw new HttpsError("permission-denied", "Nie możesz usunąć konta MASTER.");
+  }
+
+  const now = nowMs();
+  const batch = db.batch();
+  batch.set(targetRef, {
+    role: "REMOVED",
+    removedAtMs: now,
+    updatedAtMs: now,
+    ...blockedPatch(true),
+    communityId: null,
+    customerId: null,
+    activeCommunityId: null,
+    currentCommunityId: null,
+    selectedCommunityId: null,
+    staircaseId: null,
+    flatId: null,
+    flatLabel: null,
+  }, { merge: true });
+
+  const communityId = safeText(target?.communityId);
+  const flatId = safeText(target?.flatId);
+  if (communityId && flatId) {
+    const flatRef = db.doc(`communities/${communityId}/flats/${flatId}`);
+    batch.set(flatRef, {
+      residentUid: target?.residentUid === targetUid ? null : FieldValue.delete(),
+      occupantsUids: FieldValue.arrayRemove(targetUid),
+      updatedAtMs: now,
+    }, { merge: true });
+  }
+
+  await batch.commit();
   return { ok: true };
 });
 
 exports.setUserBlocked = onCall(async (request) => {
-  const targetUid = safeText(request.data?.targetUid);
+  const actorUid = requireAuth(request);
+  const targetUid = safeText(request.data?.targetUid || request.data?.uid);
   if (!targetUid) throw new HttpsError("invalid-argument", "Brak targetUid.");
-  const targetSnap = await db.doc(`users/${targetUid}`).get();
+
+  const actor = await getMyProfile(actorUid);
+  const targetRef = db.doc(`users/${targetUid}`);
+  const targetSnap = await targetRef.get();
   if (!targetSnap.exists) throw new HttpsError("not-found", "Użytkownik nie istnieje.");
   const target = targetSnap.data() || {};
-  const communityId = profileCommunityId(target);
-  await requireCommunityStaff(request, communityId);
-  await db.doc(`users/${targetUid}`).update({ appBlocked: !!request.data?.blocked, updatedAtMs: nowMs() });
+
+  const actorRole = safeText(actor?.role);
+  const sameCommunity = profileCommunityId(actor) && profileCommunityId(actor) === profileCommunityId(target);
+  const actorIsOwner = request.auth?.token?.owner === true || OWNER_UIDS.includes(actorUid) || OWNER_EMAILS.includes(safeText(request.auth?.token?.email));
+  const actorCanManage = actorIsOwner || (sameCommunity && ["MASTER", "ADMIN", "ACCOUNTANT"].includes(actorRole));
+  if (!actorCanManage) throw new HttpsError("permission-denied", "Brak uprawnień do blokady użytkownika.");
+
+  await targetRef.set({ ...blockedPatch(!!request.data?.blocked), updatedAtMs: nowMs() }, { merge: true });
   return { ok: true };
 });
 
@@ -1213,16 +2005,27 @@ exports.addStreet = onCall(async (request) => {
   const name = safeText(request.data?.name);
   if (!communityId || !name) throw new HttpsError("invalid-argument", "Brak communityId lub nazwy ulicy.");
   await requireCommunityStaff(request, communityId);
-  const ref = db.collection("communities").doc(communityId).collection("streets").doc();
-  await ref.set({ name, createdAtMs: nowMs(), updatedAtMs: nowMs() });
-  return { id: ref.id };
+  const streetId = normalizeStreetName(name) || db.collection("communities").doc(communityId).collection("streets").doc().id;
+  await db.doc(`communities/${communityId}/streets/${streetId}`).set({
+    id: streetId,
+    communityId,
+    name,
+    normalizedName: streetId,
+    isActive: true,
+    createdAtMs: nowMs(),
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  return { id: streetId };
 });
 
 exports.createJoinCode = onCall(async (request) => {
   const communityId = safeText(request.data?.communityId);
-  const role = "ACCOUNTANT";
+  const role = safeText(request.data?.role || "ACCOUNTANT").toUpperCase();
   const { uid } = await requireCommunityRole(request, communityId, ["MASTER"]);
-  await assertPanelAccessEnabled(communityId);
+  if (["ACCOUNTANT", "ADMIN"].includes(role)) await assertPanelAccessEnabled(communityId);
+  if (!["ACCOUNTANT", "ADMIN", "RESIDENT", "CONTRACTOR"].includes(role)) {
+    throw new HttpsError("invalid-argument", "Nieobslugiwana rola join code.");
+  }
   for (let i = 0; i < 10; i++) {
     const code = randomCode(8);
     const ref = db.doc(`join_codes/${code}`);
@@ -1244,7 +2047,9 @@ exports.claimJoinCode = onCall(async (request) => {
   const joinSnap = await joinRef.get();
   if (!joinSnap.exists) throw new HttpsError("not-found", "Kod nie istnieje.");
   const joinData = joinSnap.data();
-  await assertPanelAccessEnabled(joinData.communityId);
+  if (["ACCOUNTANT", "ADMIN"].includes(safeText(joinData.role).toUpperCase())) {
+    await assertPanelAccessEnabled(joinData.communityId);
+  }
   return db.runTransaction(async (tx) => {
     const ref = db.doc(`join_codes/${code}`);
     const snap = await tx.get(ref);
@@ -1252,16 +2057,24 @@ exports.claimJoinCode = onCall(async (request) => {
     const data = snap.data();
     if (data.used) throw new HttpsError("failed-precondition", "Kod został już wykorzystany.");
     if (Number(data.expiresAtMs || 0) < nowMs()) throw new HttpsError("deadline-exceeded", "Kod wygasł.");
-    const finalRole = safeText(data.role || "ACCOUNTANT") === "ACCOUNTANT" ? "ACCOUNTANT" : "ACCOUNTANT";
-    tx.set(db.doc(`users/${uid}`), { role: finalRole, communityId: data.communityId, customerId: data.communityId, updatedAtMs: nowMs() }, { merge: true });
+    const finalRole = ["ACCOUNTANT", "ADMIN", "RESIDENT", "CONTRACTOR"].includes(safeText(data.role).toUpperCase()) ? safeText(data.role).toUpperCase() : "ACCOUNTANT";
+    tx.set(db.doc(`users/${uid}`), {
+      role: finalRole,
+      communityId: data.communityId,
+      customerId: data.communityId,
+      activeCommunityId: data.communityId,
+      currentCommunityId: data.communityId,
+      selectedCommunityId: data.communityId,
+      updatedAtMs: nowMs(),
+    }, { merge: true });
     tx.update(ref, { used: true, usedByUid: uid, usedAtMs: nowMs() });
-    return { ok: true, communityId: data.communityId, role: "ACCOUNTANT" };
+    return { ok: true, communityId: data.communityId, role: finalRole };
   });
 });
 
 exports.claimResidentFlat = onCall(async (request) => {
   const uid = requireAuth(request);
-  const communityId = safeText(request.data?.communityId || request.data?.customerId);
+  const communityId = safeText(request.data?.communityId);
   if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
   const flat = await claimOrCreateFlatForResident({
     communityId,
@@ -1275,24 +2088,19 @@ exports.claimResidentFlat = onCall(async (request) => {
     staircaseId: safeText(request.data?.staircaseId),
   });
   await db.doc(`users/${uid}`).set({
-    uid,
     communityId,
     customerId: communityId,
+    activeCommunityId: communityId,
+    currentCommunityId: communityId,
+    selectedCommunityId: communityId,
     street: flat.street,
-    streetId: safeText(request.data?.streetId || normalizeFlatPart(flat.street)),
     buildingNo: flat.buildingNo,
     apartmentNo: flat.apartmentNo,
     flatId: flat.flatId,
     staircaseId: flat.staircaseId || undefined,
     flatLabel: flat.flatLabel,
-    flatKey: flat.flatKey,
-    authLinked: true,
-    appVisible: true,
-    placeholderResident: false,
-    isShadow: false,
     updatedAtMs: nowMs(),
   }, { merge: true });
-  await syncCommunityDerivedState(communityId).catch(() => null);
   return { ok: true, ...flat };
 });
 
@@ -1300,67 +2108,13 @@ exports.createWebSession = onCall(async (request) => {
   const uid = requireAuth(request);
   const profile = await getMyProfile(uid);
   const communityId = profileCommunityId(profile);
-  const role = safeText(profile?.role).toUpperCase();
-  if (!communityId) throw new HttpsError("failed-precondition", "Brak communityId dla sesji webpanelu.");
-  if (!(isOwnerRequest(request) || ["MASTER", "ACCOUNTANT"].includes(role))) {
-    throw new HttpsError("permission-denied", "Administrator nie ma dostępu do webpanelu.");
-  }
+  const role = safeText(profile?.role);
+  if (!["MASTER", "ADMIN", "ACCOUNTANT"].includes(role)) throw new HttpsError("permission-denied", "Administrator nie ma dostepu do webpanelu.");
   await assertPanelAccessEnabled(communityId);
   const token = `${randomCode(12)}${randomCode(12)}`;
   const target = safeText(request.data?.target || "/dashboard");
   await db.doc(`webSessions/${token}`).set({ uid, communityId, used: false, target, createdAtMs: nowMs(), expiresAtMs: nowMs() + 15 * 60 * 1000 });
   return { token, target };
-});
-
-
-exports.revokeInvite = onCall(async (request) => {
-  const communityId = safeText(request.data?.communityId);
-  const inviteId = safeText(request.data?.inviteId);
-  if (!communityId || !inviteId) throw new HttpsError("invalid-argument", "Brak communityId lub inviteId.");
-  const { uid } = await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
-  const inviteRef = db.doc(`invites/${inviteId}`);
-  const inviteSnap = await inviteRef.get();
-  if (!inviteSnap.exists) throw new HttpsError("not-found", "Invite nie istnieje.");
-  const inviteData = inviteSnap.data() || {};
-  if (firstNonBlank(inviteData.communityId, inviteData.customerId) !== communityId) {
-    throw new HttpsError("permission-denied", "Invite należy do innej wspólnoty.");
-  }
-  const activeSnap = await db.collection(`communities/${communityId}/activeInvites`).where("inviteId", "==", inviteId).get();
-  const batch = db.batch();
-  batch.set(inviteRef, { status: "revoked", revokedAtMs: nowMs(), revokedByUid: uid }, { merge: true });
-  activeSnap.docs.forEach((doc) => batch.set(doc.ref, { status: "revoked", revokedAtMs: nowMs(), revokedByUid: uid }, { merge: true }));
-  await batch.commit();
-  return { ok: true };
-});
-
-exports.moderateChatMessage = onCall(async (request) => {
-  const communityId = safeText(request.data?.communityId);
-  const messageId = safeText(request.data?.messageId);
-  if (!communityId || !messageId) throw new HttpsError("invalid-argument", "Brak communityId lub messageId.");
-  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
-  const ref = db.doc(`communities/${communityId}/chatMessages/${messageId}`);
-  const snap = await ref.get();
-  if (!snap.exists) throw new HttpsError("not-found", "Wiadomość nie istnieje.");
-  await ref.set({ deleted: true, deletedAtMs: nowMs() }, { merge: true });
-  return { ok: true };
-});
-
-exports.clearCommunityChat = onCall(async (request) => {
-  const communityId = safeText(request.data?.communityId);
-  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
-  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
-  const snap = await db.collection(`communities/${communityId}/chatMessages`).get();
-  const batch = db.batch();
-  snap.docs.forEach((doc) => batch.set(doc.ref, { deleted: true, deletedAtMs: nowMs() }, { merge: true }));
-  await batch.commit();
-  return { ok: true, count: snap.size };
-});
-
-exports.repairCommunitySync = onCall(async (request) => {
-  const communityId = safeText(request.data?.communityId || request.data?.customerId);
-  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
-  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
-  return await syncCommunityDerivedState(communityId);
 });
 
 exports.ksefFetchInvoices = onCall(async (request) => {
@@ -1388,7 +2142,13 @@ exports.ksefFetchInvoices = onCall(async (request) => {
     }, { merge: true });
   });
   await batch.commit();
-  return { ok: true, createdIds };
+  await db.doc(`communities/${communityId}/ksef/config`).set({
+    lastSyncSuccessAtMs: nowMs(),
+    lastSyncError: "",
+    lastSyncDuplicates: 0,
+    updatedAtMs: nowMs(),
+  }, { merge: true });
+  return { ok: true, created: createdIds, duplicates: [] };
 });
 
 exports.ksefParseInvoice = onCall(async (request) => {
@@ -1720,38 +2480,3 @@ exports.closeReviewItem = onCall(async (request) => {
   return { ok: true };
 });
 
-
-exports.onFlatSeatSync = onDocumentWritten("communities/{communityId}/flats/{flatId}", async (event) => {
-  const before = event.data?.before || null;
-  const after = event.data?.after || null;
-  if (!hasMeaningfulChange(before, after, ["street", "streetId", "buildingNo", "apartmentNo", "flatLabel", "flatKey", "areaM2", "residentUid", "userId"])) return;
-  await syncCommunityDerivedState(event.params.communityId);
-});
-
-exports.onStreetRegistrySync = onDocumentWritten("communities/{communityId}/streets/{streetId}", async (event) => {
-  if (!hasMeaningfulChange(event.data?.before || null, event.data?.after || null, ["name", "street", "isActive", "deletedAtMs", "normalizedName"])) return;
-  await syncCommunityDerivedState(event.params.communityId);
-});
-
-exports.onStreetAssignmentsSync = onDocumentWritten("communities/{communityId}/streetAssignments/{assignmentId}", async (event) => {
-  if (!hasMeaningfulChange(event.data?.before || null, event.data?.after || null, ["street", "streetName", "streetId", "name", "adminUid"])) return;
-  await syncCommunityDerivedState(event.params.communityId);
-});
-
-exports.onPayerShadowSync = onDocumentWritten("communities/{communityId}/payers/{payerId}", async (event) => {
-  if (!hasMeaningfulChange(event.data?.before || null, event.data?.after || null, ["name", "surname", "email", "phone", "street", "streetId", "buildingNo", "apartmentNo", "flatId", "flatLabel", "flatKey", "mailOnly"])) return;
-  await syncCommunityDerivedState(event.params.communityId);
-});
-
-exports.onUserEmailLinkSync = onDocumentWritten("users/{uid}", async (event) => {
-  const beforeData = event.data?.before?.data() || {};
-  const afterData = event.data?.after?.data() || {};
-  const beforeCommunityId = communityIdFromData(beforeData);
-  const afterCommunityId = communityIdFromData(afterData);
-  const changed = !jsonEq(beforeCommunityId, afterCommunityId) || !jsonEq(beforeData.email || null, afterData.email || null) || !jsonEq(beforeData.flatId || null, afterData.flatId || null) || !jsonEq(beforeData.role || null, afterData.role || null) || !jsonEq(beforeData.removedAtMs || null, afterData.removedAtMs || null) || !jsonEq(beforeData.appVisible || null, afterData.appVisible || null) || !jsonEq(beforeData.authLinked || null, afterData.authLinked || null);
-  if (!changed) return;
-  const communities = new Set([beforeCommunityId, afterCommunityId].filter(Boolean));
-  for (const communityId of communities) {
-    await syncCommunityDerivedState(communityId);
-  }
-});

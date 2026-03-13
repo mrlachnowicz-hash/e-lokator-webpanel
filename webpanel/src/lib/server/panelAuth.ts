@@ -61,7 +61,7 @@ export async function requirePanelAccess(req: RequestLike, options: RequirePanel
 
   if (options.requirePanelAccess !== false) {
     const communitySnap = await db.doc(`communities/${communityId}`).get();
-    const panelEnabled = isPanelEnabled(communitySnap.data() || {});
+    const panelEnabled = isPanelEnabled(communitySnap.data()?.panelAccessEnabled);
     if (!panelEnabled) {
       throw new PanelAuthError(403, "Panel nie jest aktywny dla tej wspólnoty.");
     }

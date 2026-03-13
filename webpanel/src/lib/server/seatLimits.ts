@@ -1,6 +1,6 @@
 function asNum(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value);
   return null;
 }
 
@@ -12,7 +12,6 @@ export type SeatState = {
 };
 
 const LIMIT_KEYS = [
-  'appSeatsTotal',
   'seatsTotal',
   'panelSeats',
   'panelSeatsLimit',
@@ -30,32 +29,30 @@ const LIMIT_KEYS = [
   'seatCount',
 ];
 
-const USED_KEYS = [
-  'appSeatsUsed',
-  'seatsUsed',
-  'occupiedSeats',
-  'residentCount',
-  'usersCount',
-  'panelSeatsUsed',
-];
+const USED_KEYS = ['seatsUsed', 'panelSeatsUsed', 'appSeatsUsed', 'occupiedSeats', 'residentCount', 'usersCount'];
 
 export function getSeatLimit(communityData: Record<string, any> | null | undefined): { limit: number | null; source: string | null } {
   if (!communityData) return { limit: null, source: null };
+  let best: { limit: number | null; source: string | null } = { limit: null, source: null };
   for (const key of LIMIT_KEYS) {
     const value = asNum(communityData[key]);
-    if (value != null) return { limit: Math.max(0, Math.floor(value)), source: key };
+    if (value != null) {
+      const normalized = Math.max(0, Math.floor(value));
+      if (best.limit == null || normalized > best.limit) best = { limit: normalized, source: key };
+    }
   }
-  return { limit: null, source: null };
+  return best;
 }
 
 export function getSeatUsed(communityData: Record<string, any> | null | undefined, fallback: number): number {
+  let best = Math.max(0, Math.floor(fallback));
   if (communityData) {
     for (const key of USED_KEYS) {
       const value = asNum(communityData[key]);
-      if (value != null) return Math.max(0, Math.floor(value));
+      if (value != null) best = Math.max(best, Math.max(0, Math.floor(value)));
     }
   }
-  return Math.max(0, Math.floor(fallback));
+  return best;
 }
 
 export function getSeatState(communityData: Record<string, any> | null | undefined, fallbackUsed: number): SeatState {

@@ -10,8 +10,8 @@ import { isPanelEnabled } from "../lib/panelAccess";
 export function Nav() {
   const { profile, community } = useAuth();
   const role = profile?.role || "";
-  const comm = profile?.communityId || profile?.customerId || "";
-  const panelEnabled = isPanelEnabled(community);
+  const comm = profile?.communityId || "";
+  const panelEnabled = isPanelEnabled(community?.panelAccessEnabled);
 
   useEffect(() => {
     const run = async () => {
@@ -55,6 +55,7 @@ export function Nav() {
             <Link href="/meters">Liczniki</Link>
             <Link href="/payments">Przelewy</Link>
             <Link href="/review">Przegląd</Link>
+            <Link href="/community-ai">Wspólnota AI</Link>
           </>
         ) : null}
         <button className="btnGhost" onClick={() => signOut(auth)}>

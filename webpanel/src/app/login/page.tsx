@@ -6,7 +6,6 @@ import { signInWithEmailAndPassword } from "firebase/auth";
 import Link from "next/link";
 import { auth } from "../../lib/firebase";
 import { useAuth } from "../../lib/authContext";
-import { isPanelEnabled } from "../../lib/panelAccess";
 
 type Mode = "MASTER" | "ACCOUNTANT";
 
@@ -45,7 +44,7 @@ export default function LoginPage() {
       return;
     }
 
-    const panelEnabled = isPanelEnabled(community);
+    const panelEnabled = community?.panelAccessEnabled === true || String((community as any)?.panelAccessEnabled || "").toLowerCase() === "true";
     if (!panelEnabled) {
       setErr("Panel nie jest aktywny dla tej wspólnoty. Włącz przełącznik „Udziel dostępu do panelu” w generatorze ownera.");
       return;

@@ -44,7 +44,7 @@ export function RequireAuth({ children, roles, requirePanelAccess = true }: { ch
     }
   }
 
-  const panelEnabled = isPanelEnabled(community);
+  const panelEnabled = isPanelEnabled(community?.panelAccessEnabled);
 
   if (requirePanelAccess && !panelEnabled) {
     return (
