@@ -1,6 +1,6 @@
 function asNum(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isFinite(value)) return value;
-  if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value);
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
   return null;
 }
 
@@ -12,6 +12,7 @@ export type SeatState = {
 };
 
 const LIMIT_KEYS = [
+  'appSeatsTotal',
   'seatsTotal',
   'panelSeats',
   'panelSeatsLimit',
@@ -29,7 +30,14 @@ const LIMIT_KEYS = [
   'seatCount',
 ];
 
-const USED_KEYS = ['seatsUsed'];
+const USED_KEYS = [
+  'appSeatsUsed',
+  'seatsUsed',
+  'occupiedSeats',
+  'residentCount',
+  'usersCount',
+  'panelSeatsUsed',
+];
 
 export function getSeatLimit(communityData: Record<string, any> | null | undefined): { limit: number | null; source: string | null } {
   if (!communityData) return { limit: null, source: null };

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import * as admin from "firebase-admin";
+import { isPanelEnabled } from "@/lib/panelAccess";
 
 // firebase-admin is Node-only (not Edge). Force Node runtime for this route.
 export const runtime = "nodejs";
@@ -44,7 +45,7 @@ export async function POST(req: Request) {
       if (!communityId) throw new Error("Missing communityId for web session");
 
       const communitySnap = await tx.get(db.doc(`communities/${communityId}`));
-      if (communitySnap.data()?.panelAccessEnabled !== true) {
+      if (!isPanelEnabled(communitySnap.data() || {})) {
         throw new Error("Panel nie jest aktywny dla tej wspólnoty.");
       }
 

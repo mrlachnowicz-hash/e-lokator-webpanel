@@ -10,8 +10,8 @@ import { isPanelEnabled } from "../lib/panelAccess";
 export function Nav() {
   const { profile, community } = useAuth();
   const role = profile?.role || "";
-  const comm = profile?.communityId || "";
-  const panelEnabled = isPanelEnabled(community?.panelAccessEnabled);
+  const comm = profile?.communityId || profile?.customerId || "";
+  const panelEnabled = isPanelEnabled(community);
 
   useEffect(() => {
     const run = async () => {

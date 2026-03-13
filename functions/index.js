@@ -1,7 +1,7 @@
 const admin = require("firebase-admin");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
-const { onDocumentCreated, onDocumentUpdated } = require("firebase-functions/v2/firestore");
+const { onDocumentCreated, onDocumentUpdated, onDocumentWritten } = require("firebase-functions/v2/firestore");
 
 setGlobalOptions({ region: "europe-west1" });
 
@@ -38,9 +38,9 @@ async function requireCommunityStaff(request, communityId) {
   const uid = requireAuth(request);
   const profile = await getMyProfile(uid);
   const role = String(profile?.role || "");
-  const ok = ["MASTER", "ADMIN", "ACCOUNTANT"].includes(role) && String(profile?.communityId || "") === String(communityId || "");
+  const ok = isOwnerRequest(request) || (["MASTER", "ADMIN", "ACCOUNTANT"].includes(role) && sameCommunity(profile, communityId));
   if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień do tej wspólnoty.");
-  return { uid, profile };
+  return { uid, profile, role };
 }
 
 async function getCommunity(communityId) {
@@ -51,18 +51,18 @@ async function getCommunity(communityId) {
 
 async function assertPanelAccessEnabled(communityId) {
   const community = await getCommunity(communityId);
-  if (!community || community.panelAccessEnabled !== true) {
+  if (!community || !panelEnabledFromCommunity(community)) {
     throw new HttpsError("permission-denied", "Panel nie jest aktywny dla tej wspólnoty.");
   }
   return community;
 }
 
-
 async function requireCommunityRole(request, communityId, allowedRoles) {
   const uid = requireAuth(request);
   const profile = await getMyProfile(uid);
   const role = String(profile?.role || "");
-  const ok = Array.isArray(allowedRoles) && allowedRoles.includes(role) && String(profile?.communityId || "") === String(communityId || "");
+  const owner = isOwnerRequest(request);
+  const ok = owner || (Array.isArray(allowedRoles) && allowedRoles.includes(role) && sameCommunity(profile, communityId));
   if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień do tej operacji.");
   return { uid, profile, role };
 }
@@ -167,12 +167,16 @@ async function upsertFlatWithSeat({ communityId, flatId = "", staircaseId = "", 
   });
 }
 
-function assertOwner(request) {
-  const uid = requireAuth(request);
-  const token = request.auth.token || {};
+function isOwnerRequest(request) {
+  const uid = request?.auth?.uid || "";
+  const token = request?.auth?.token || {};
   const email = String(token.email || "");
-  const ok = token.owner === true || OWNER_UIDS.includes(uid) || OWNER_EMAILS.includes(email);
-  if (!ok) throw new HttpsError("permission-denied", "Brak uprawnień Ownera.");
+  return token.owner === true || OWNER_UIDS.includes(uid) || OWNER_EMAILS.includes(email);
+}
+
+function assertOwner(request) {
+  requireAuth(request);
+  if (!isOwnerRequest(request)) throw new HttpsError("permission-denied", "Brak uprawnień Ownera.");
 }
 
 function randomCode(len = 10) {
@@ -184,6 +188,94 @@ function randomCode(len = 10) {
 
 function safeText(v, fallback = "") {
   return String(v == null ? fallback : v).trim();
+}
+
+
+const PANEL_ACCESS_KEYS = ["panelAccessEnabled", "accessToPanel", "panelActive", "panelEnabled", "webPanelEnabled", "webpanelEnabled"];
+const COMMUNITY_ID_KEYS = ["communityId", "customerId", "activeCommunityId", "currentCommunityId", "selectedCommunityId"];
+const SEAT_LIMIT_KEYS = ["appSeatsTotal", "seatsTotal", "panelSeats", "panelSeatsLimit", "seats", "seatsLimit", "totalSeats", "maxSeats", "purchasedSeats", "seatsPurchased", "flatsLimit", "localsLimit", "localiLimit", "unitsLimit", "licenses", "seatCount"];
+const SEAT_USED_KEYS = ["appSeatsUsed", "seatsUsed", "occupiedSeats", "residentCount", "usersCount", "panelSeatsUsed"];
+
+function asBool(value) {
+  if (value === true) return true;
+  if (typeof value === "number") return Number.isFinite(value) && value !== 0;
+  const text = String(value || "").trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(text);
+}
+
+function asNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
+  return null;
+}
+
+function firstNonBlank(...values) {
+  for (const value of values) {
+    const text = safeText(value);
+    if (text) return text;
+  }
+  return "";
+}
+
+function communityIdFromData(data) {
+  if (!data) return "";
+  return firstNonBlank(...COMMUNITY_ID_KEYS.map((key) => data?.[key]));
+}
+
+function profileCommunityId(profile) {
+  return communityIdFromData(profile || {});
+}
+
+function sameCommunity(profile, communityId) {
+  return profileCommunityId(profile) === safeText(communityId);
+}
+
+function panelEnabledFromCommunity(community) {
+  return PANEL_ACCESS_KEYS.some((key) => asBool(community?.[key]));
+}
+
+function communitySeatMetric(community, keys, fallback = 0) {
+  for (const key of keys) {
+    const value = asNumber(community?.[key]);
+    if (value != null) return Math.max(0, Math.floor(value));
+  }
+  return Math.max(0, Math.floor(fallback));
+}
+
+function isRemovedUser(data) {
+  const role = safeText(data?.role).toUpperCase();
+  return role === "REMOVED" || data?.removedAtMs != null;
+}
+
+function isVisibleSeatUser(data) {
+  const role = safeText(data?.role).toUpperCase();
+  return ["RESIDENT", "CONTRACTOR"].includes(role) && data?.appVisible !== false && !isRemovedUser(data);
+}
+
+function jsonEq(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+async function setIfChanged(ref, patch) {
+  const cleanPatch = Object.fromEntries(Object.entries(patch || {}).filter(([, value]) => value !== undefined));
+  const snap = await ref.get();
+  const current = snap.exists ? (snap.data() || {}) : {};
+  const changed = Object.entries(cleanPatch).some(([key, value]) => !jsonEq(current[key] ?? null, value ?? null));
+  if (!changed) return false;
+  await ref.set(cleanPatch, { merge: true });
+  return true;
+}
+
+async function getCommunityUserDocs(communityId) {
+  const id = safeText(communityId);
+  if (!id) return [];
+  const [byCommunity, byCustomer] = await Promise.all([
+    db.collection("users").where("communityId", "==", id).get(),
+    db.collection("users").where("customerId", "==", id).get(),
+  ]);
+  const merged = new Map();
+  [...byCommunity.docs, ...byCustomer.docs].forEach((doc) => merged.set(doc.id, doc));
+  return Array.from(merged.values());
 }
 
 function parsePeriod(input) {
@@ -297,6 +389,252 @@ async function claimOrCreateFlatForResident({ communityId, uid, flatId = "", fla
     flatKey: safeText(data.flatKey),
     residentUid: uid,
   };
+}
+
+
+async function syncCommunityDerivedState(communityId) {
+  const id = safeText(communityId);
+  if (!id) return { ok: false, reason: "missing-community" };
+  const communityRef = db.doc(`communities/${id}`);
+  const [communitySnap, payersSnap, flatsSnap, streetsSnap, assignmentsSnap, userDocs] = await Promise.all([
+    communityRef.get(),
+    db.collection(`communities/${id}/payers`).get(),
+    db.collection(`communities/${id}/flats`).get(),
+    db.collection(`communities/${id}/streets`).get(),
+    db.collection(`communities/${id}/streetAssignments`).get(),
+    getCommunityUserDocs(id),
+  ]);
+  if (!communitySnap.exists) return { ok: false, reason: "community-not-found" };
+
+  const preferredUsersByEmail = new Map();
+  const visibleUsers = new Map();
+  for (const doc of userDocs) {
+    const data = doc.data() || {};
+    const email = sanitizeEmail(data.email);
+    const removed = isRemovedUser(data);
+    if (!removed) visibleUsers.set(doc.id, data);
+    const isSynthetic = doc.id.startsWith(`payer_${id}_`) || doc.id.startsWith(`shadow_${id}_`) || data.isShadow === true || data.placeholderResident === true;
+    if (email && !removed && (data.authLinked === true || !isSynthetic) && !preferredUsersByEmail.has(email)) {
+      preferredUsersByEmail.set(email, { id: doc.id, data });
+    }
+  }
+
+  const streetMap = new Map();
+  const registerStreet = (idValue, nameValue) => {
+    const name = safeText(nameValue);
+    const sid = safeText(idValue || normalizeFlatPart(name));
+    if (sid && name) streetMap.set(sid, { id: sid, name });
+  };
+
+  const communityData = communitySnap.data() || {};
+  const communityStreetIds = Array.isArray(communityData.streetIds) ? communityData.streetIds : [];
+  const communityStreetNames = Array.isArray(communityData.streetNames) ? communityData.streetNames : [];
+  const communityStreetList = Array.isArray(communityData.streetsList) ? communityData.streetsList : [];
+  communityStreetIds.forEach((value, index) => registerStreet(value, communityStreetNames[index]));
+  communityStreetList.forEach((item) => registerStreet(item?.id, item?.name));
+
+  for (const doc of streetsSnap.docs) {
+    const data = doc.data() || {};
+    if (data.isActive === false || data.deletedAtMs != null) continue;
+    registerStreet(data.id || doc.id, data.name || data.street || doc.id);
+  }
+  for (const doc of assignmentsSnap.docs) {
+    const data = doc.data() || {};
+    registerStreet(data.streetId || data.id || doc.id, data.streetName || data.name || data.street || doc.id);
+  }
+  for (const doc of flatsSnap.docs) {
+    const data = doc.data() || {};
+    registerStreet(data.streetId, data.street);
+  }
+  for (const doc of payersSnap.docs) {
+    const data = doc.data() || {};
+    registerStreet(data.streetId, data.street);
+  }
+
+  let linkedUsers = 0;
+  let syntheticUsers = 0;
+  const occupiedFlatIds = new Set();
+
+  for (const payerDoc of payersSnap.docs) {
+    const payer = payerDoc.data() || {};
+    const flatId = safeText(payer.flatId || payerDoc.id);
+    if (!flatId) continue;
+    occupiedFlatIds.add(flatId);
+    const street = safeText(payer.street);
+    const buildingNo = safeText(payer.buildingNo);
+    const apartmentNo = safeText(payer.apartmentNo || payer.flatNumber);
+    const streetId = safeText(payer.streetId || normalizeFlatPart(street));
+    const flatLabel = safeText(payer.flatLabel || makeFlatLabel(street, buildingNo, apartmentNo) || apartmentNo);
+    const flatKey = safeText(payer.flatKey || buildFlatKey(id, street, buildingNo, apartmentNo));
+    const email = sanitizeEmail(payer.email);
+    const linked = preferredUsersByEmail.get(email);
+    const linkedUid = safeText(payer.residentUid || payer.userId || linked?.id);
+
+    if (linked && linked.id) {
+      linkedUsers += 1;
+      await Promise.all([
+        setIfChanged(db.doc(`communities/${id}/payers/${payerDoc.id}`), {
+          communityId: id,
+          customerId: id,
+          flatId,
+          residentUid: linked.id,
+          userId: linked.id,
+          street,
+          streetId,
+          buildingNo,
+          apartmentNo,
+          flatLabel,
+          flatKey,
+          mailOnly: false,
+          appVisible: true,
+        }),
+        setIfChanged(db.doc(`communities/${id}/flats/${flatId}`), {
+          communityId: id,
+          flatId,
+          residentUid: linked.id,
+          userId: linked.id,
+          street,
+          streetId,
+          buildingNo,
+          apartmentNo,
+          flatLabel,
+          flatKey,
+          appVisible: true,
+        }),
+        setIfChanged(db.doc(`users/${linked.id}`), {
+          uid: linked.id,
+          communityId: id,
+          customerId: id,
+          role: safeText(linked.data.role || "RESIDENT") || "RESIDENT",
+          displayName: safeText(linked.data.displayName || [safeText(linked.data.firstName || payer.name), safeText(linked.data.lastName || payer.surname)].filter(Boolean).join(" ") || flatLabel || apartmentNo),
+          firstName: safeText(linked.data.firstName || payer.name) || undefined,
+          lastName: safeText(linked.data.lastName || payer.surname) || undefined,
+          source: safeText(linked.data.source || "APP_USER"),
+          appVisible: true,
+          authLinked: true,
+          mailOnly: false,
+          isShadow: false,
+          placeholderResident: false,
+          email: safeText(linked.data.email || payer.email),
+          emailLower: sanitizeEmail(linked.data.email || payer.email),
+          phone: safeText(linked.data.phone || payer.phone),
+          street,
+          streetId,
+          buildingNo,
+          apartmentNo,
+          flatId,
+          flatLabel,
+          flatKey,
+          active: true,
+        }),
+      ]);
+      const syntheticRef = db.doc(`users/payer_${id}_${flatId}`);
+      const syntheticSnap = await syntheticRef.get();
+      if (syntheticSnap.exists && syntheticSnap.id !== linked.id) {
+        await syntheticRef.delete().catch(() => null);
+      }
+      continue;
+    }
+
+    const syntheticUid = linkedUid || `payer_${id}_${flatId}`;
+    syntheticUsers += 1;
+    await Promise.all([
+      setIfChanged(db.doc(`users/${syntheticUid}`), {
+        uid: syntheticUid,
+        communityId: id,
+        customerId: id,
+        role: "RESIDENT",
+        displayName: safeText([safeText(payer.name), safeText(payer.surname)].filter(Boolean).join(" ") || payer.displayName || flatLabel || apartmentNo),
+        firstName: safeText(payer.name) || undefined,
+        lastName: safeText(payer.surname) || undefined,
+        source: "WEBPANEL_PAYER",
+        appVisible: true,
+        authLinked: false,
+        mailOnly: !!safeText(payer.email) && !safeText(payer.phone),
+        isShadow: false,
+        placeholderResident: false,
+        email: safeText(payer.email),
+        emailLower: sanitizeEmail(payer.email),
+        phone: safeText(payer.phone),
+        street,
+        streetId,
+        buildingNo,
+        apartmentNo,
+        flatId,
+        flatLabel,
+        flatKey,
+        active: true,
+        createdAtMs: Number(payer.createdAtMs || nowMs()),
+      }),
+      setIfChanged(db.doc(`communities/${id}/payers/${payerDoc.id}`), {
+        communityId: id,
+        customerId: id,
+        flatId,
+        residentUid: syntheticUid,
+        userId: syntheticUid,
+        street,
+        streetId,
+        buildingNo,
+        apartmentNo,
+        flatLabel,
+        flatKey,
+        appVisible: true,
+      }),
+      setIfChanged(db.doc(`communities/${id}/flats/${flatId}`), {
+        communityId: id,
+        flatId,
+        residentUid: syntheticUid,
+        userId: syntheticUid,
+        street,
+        streetId,
+        buildingNo,
+        apartmentNo,
+        flatLabel,
+        flatKey,
+        appVisible: true,
+      }),
+    ]);
+  }
+
+  for (const item of streetMap.values()) {
+    await setIfChanged(db.doc(`communities/${id}/streets/${item.id}`), {
+      id: item.id,
+      communityId: id,
+      name: item.name,
+      normalizedName: item.id,
+      isActive: true,
+    });
+  }
+
+  const finalUserDocs = await getCommunityUserDocs(id);
+  const visibleSeatUsers = finalUserDocs
+    .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
+    .filter((data) => isVisibleSeatUser(data));
+  const payerCount = payersSnap.size;
+  const appSeatsUsed = visibleSeatUsers.length;
+  const panelSeatsUsed = payerCount;
+  const occupiedSeats = Math.max(occupiedFlatIds.size, appSeatsUsed, panelSeatsUsed);
+
+  await setIfChanged(communityRef, {
+    streetIds: Array.from(streetMap.values()).map((item) => item.id),
+    streetNames: Array.from(streetMap.values()).map((item) => item.name),
+    streetsList: Array.from(streetMap.values()),
+    seatsUsed: occupiedSeats,
+    appSeatsUsed,
+    panelSeatsUsed,
+    residentCount: appSeatsUsed,
+    usersCount: appSeatsUsed,
+    occupiedSeats,
+  });
+
+  return { ok: true, communityId: id, payerCount, appSeatsUsed, panelSeatsUsed, occupiedSeats, linkedUsers, syntheticUsers, streetCount: streetMap.size };
+}
+
+function hasMeaningfulChange(before, after, keys) {
+  const beforeData = before ? before.data() || {} : {};
+  const afterData = after ? after.data() || {} : {};
+  if (!before || !after) return true;
+  return keys.some((key) => !jsonEq(beforeData[key] ?? null, afterData[key] ?? null));
 }
 
 function normalizeCategory(input) {
@@ -628,16 +966,19 @@ exports.createActivationCode = onCall(async (request) => {
 });
 
 exports.createInvite = onCall(async (request) => {
-  const uid = requireAuth(request);
-  const me = await getMyProfile(uid);
-  const communityId = safeText(request.data?.communityId || me?.communityId);
-  const role = safeText(request.data?.role || "RESIDENT");
+  const communityId = safeText(request.data?.communityId || request.data?.customerId);
+  const role = safeText(request.data?.role || "RESIDENT").toUpperCase() || "RESIDENT";
+  const { uid, profile, role: myRole } = await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
+  if (role === "ADMIN" && !(isOwnerRequest(request) || myRole === "MASTER")) {
+    throw new HttpsError("permission-denied", "Tylko MASTER lub owner może tworzyć zaproszenie ADMIN.");
+  }
   const invite = {
-    customerId: me?.customerId || me?.communityId || communityId,
+    customerId: firstNonBlank(request.data?.customerId, profile?.customerId, profile?.communityId, communityId),
     communityId,
     role,
     status: "active",
     createdAtMs: nowMs(),
+    createdByUid: uid,
     expiresAtMs: Number(request.data?.expiresAtMs || nowMs() + 7 * 24 * 3600 * 1000),
     staircaseId: safeText(request.data?.staircaseId),
     flatId: safeText(request.data?.flatId),
@@ -668,9 +1009,15 @@ exports.claimInvite = onCall(async (request) => {
   const inviteRef = db.doc(`invites/${inviteId}`);
   const snap = await inviteRef.get();
   if (!snap.exists) throw new HttpsError("not-found", "Invite nie istnieje.");
-  const inv = snap.data();
-  const communityId = safeText(inv.communityId);
-  const role = safeText(inv.role || "RESIDENT");
+  const inv = snap.data() || {};
+  const communityId = firstNonBlank(inv.communityId, inv.customerId);
+  const role = safeText(inv.role || "RESIDENT").toUpperCase() || "RESIDENT";
+  if (!communityId) throw new HttpsError("failed-precondition", "Invite nie ma communityId.");
+  if (safeText(inv.status || "active").toLowerCase() !== "active") throw new HttpsError("failed-precondition", "Zaproszenie nie jest już aktywne.");
+  if (Number(inv.expiresAtMs || 0) > 0 && Number(inv.expiresAtMs || 0) < nowMs()) throw new HttpsError("deadline-exceeded", "Zaproszenie wygasło.");
+  if (role === "RESIDENT" && !safeText(requestApartmentNo || inv.apartmentNo)) {
+    throw new HttpsError("invalid-argument", "Brak numeru mieszkania/lokalu.");
+  }
   let flat = null;
   if (role === "RESIDENT" && communityId) {
     flat = await claimOrCreateFlatForResident({
@@ -686,19 +1033,27 @@ exports.claimInvite = onCall(async (request) => {
     });
   }
   await db.doc(`users/${uid}`).set({
+    uid,
     role,
     communityId,
-    customerId: inv.customerId || communityId,
+    customerId: firstNonBlank(inv.customerId, communityId),
     displayName: senderName || undefined,
     street: flat?.street || requestStreet || safeText(inv.street),
+    streetId: safeText((flat && flat.street ? normalizeFlatPart(flat.street) : "") || inv.streetId || normalizeFlatPart(requestStreet || safeText(inv.street))),
     buildingNo: flat?.buildingNo || requestBuildingNo || safeText(inv.buildingNo),
     apartmentNo: flat?.apartmentNo || requestApartmentNo || safeText(inv.apartmentNo),
     flatId: flat?.flatId || safeText(inv.flatId) || undefined,
     staircaseId: flat?.staircaseId || safeText(inv.staircaseId) || undefined,
     flatLabel: flat?.flatLabel || safeText(inv.flatLabel) || undefined,
+    flatKey: flat?.flatKey || safeText(inv.flatKey) || buildFlatKey(communityId, requestStreet || safeText(inv.street), requestBuildingNo || safeText(inv.buildingNo), requestApartmentNo || safeText(inv.apartmentNo)),
+    authLinked: true,
+    appVisible: true,
+    placeholderResident: false,
+    isShadow: false,
     updatedAtMs: nowMs(),
   }, { merge: true });
   await inviteRef.set({ status: "used", usedByUid: uid, usedAtMs: nowMs() }, { merge: true });
+  await syncCommunityDerivedState(communityId).catch(() => null);
   return { ok: true, flatId: flat?.flatId || null, flatLabel: flat?.flatLabel || null };
 });
 
@@ -794,7 +1149,34 @@ exports.activateCommunity = onCall(async (request) => {
   if (!code || !nip || !name) throw new HttpsError("invalid-argument", "Brak danych aktywacji.");
   const communityDoc = db.collection("communities").doc();
   return db.runTransaction(async (tx) => {
-    tx.set(communityDoc, { id: communityDoc.id, name, nip, createdAtMs: nowMs(), seatsTotal: 2, seatsUsed: 0, panelAccessEnabled: false, updatedAtMs: nowMs() });
+    const initialSeats = 2;
+    tx.set(communityDoc, {
+      id: communityDoc.id,
+      name,
+      nip,
+      createdAtMs: nowMs(),
+      seatsTotal: initialSeats,
+      appSeatsTotal: initialSeats,
+      maxSeats: initialSeats,
+      seats: initialSeats,
+      seatsLimit: initialSeats,
+      panelSeats: initialSeats,
+      panelSeatsLimit: initialSeats,
+      licenses: initialSeats,
+      seatsUsed: 0,
+      appSeatsUsed: 0,
+      panelSeatsUsed: 0,
+      residentCount: 0,
+      usersCount: 0,
+      occupiedSeats: 0,
+      panelAccessEnabled: false,
+      accessToPanel: false,
+      panelActive: false,
+      panelEnabled: false,
+      webPanelEnabled: false,
+      webpanelEnabled: false,
+      updatedAtMs: nowMs(),
+    });
     tx.set(db.doc(`users/${uid}`), { role: "MASTER", communityId: communityDoc.id, customerId: communityDoc.id, updatedAtMs: nowMs() }, { merge: true });
     tx.set(db.doc(`activation_codes/${code}`), { used: true, communityId: communityDoc.id, usedAtMs: nowMs() }, { merge: true });
     return { communityId: communityDoc.id };
@@ -802,72 +1184,27 @@ exports.activateCommunity = onCall(async (request) => {
 });
 
 exports.removeUser = onCall(async (request) => {
-  const actorUid = requireAuth(request);
-  const targetUid = safeText(request.data?.targetUid || request.data?.uid);
+  const targetUid = safeText(request.data?.targetUid);
   if (!targetUid) throw new HttpsError("invalid-argument", "Brak targetUid.");
-
-  const actor = await getMyProfile(actorUid);
-  const targetRef = db.doc(`users/${targetUid}`);
-  const targetSnap = await targetRef.get();
+  const targetSnap = await db.doc(`users/${targetUid}`).get();
   if (!targetSnap.exists) throw new HttpsError("not-found", "Użytkownik nie istnieje.");
   const target = targetSnap.data() || {};
-
-  const actorRole = safeText(actor?.role);
-  const targetRole = safeText(target?.role);
-  const sameCommunity = safeText(actor?.communityId) && safeText(actor?.communityId) === safeText(target?.communityId);
-  const actorIsOwner = request.auth?.token?.owner === true || OWNER_UIDS.includes(actorUid) || OWNER_EMAILS.includes(safeText(request.auth?.token?.email));
-  const actorCanManage = actorIsOwner || (sameCommunity && ["MASTER", "ADMIN", "ACCOUNTANT"].includes(actorRole));
-  if (!actorCanManage) throw new HttpsError("permission-denied", "Brak uprawnień do usunięcia użytkownika.");
-  if (targetRole === "MASTER" && !actorIsOwner && actorRole !== "MASTER") {
-    throw new HttpsError("permission-denied", "Nie możesz usunąć konta MASTER.");
-  }
-
-  const now = nowMs();
-  const batch = db.batch();
-  batch.set(targetRef, {
-    role: "REMOVED",
-    removedAtMs: now,
-    updatedAtMs: now,
-    appBlocked: true,
-    communityId: null,
-    staircaseId: null,
-    flatId: null,
-    flatLabel: null,
-  }, { merge: true });
-
-  const communityId = safeText(target?.communityId);
-  const flatId = safeText(target?.flatId);
-  if (communityId && flatId) {
-    const flatRef = db.doc(`communities/${communityId}/flats/${flatId}`);
-    batch.set(flatRef, {
-      residentUid: target?.residentUid === targetUid ? null : FieldValue.delete(),
-      occupantsUids: FieldValue.arrayRemove(targetUid),
-      updatedAtMs: now,
-    }, { merge: true });
-  }
-
-  await batch.commit();
+  const communityId = profileCommunityId(target);
+  await requireCommunityStaff(request, communityId);
+  await db.doc(`users/${targetUid}`).update({ role: "REMOVED", removedAtMs: nowMs(), appVisible: false, updatedAtMs: nowMs() });
+  await syncCommunityDerivedState(communityId).catch(() => null);
   return { ok: true };
 });
 
 exports.setUserBlocked = onCall(async (request) => {
-  const actorUid = requireAuth(request);
-  const targetUid = safeText(request.data?.targetUid || request.data?.uid);
+  const targetUid = safeText(request.data?.targetUid);
   if (!targetUid) throw new HttpsError("invalid-argument", "Brak targetUid.");
-
-  const actor = await getMyProfile(actorUid);
-  const targetRef = db.doc(`users/${targetUid}`);
-  const targetSnap = await targetRef.get();
+  const targetSnap = await db.doc(`users/${targetUid}`).get();
   if (!targetSnap.exists) throw new HttpsError("not-found", "Użytkownik nie istnieje.");
   const target = targetSnap.data() || {};
-
-  const actorRole = safeText(actor?.role);
-  const sameCommunity = safeText(actor?.communityId) && safeText(actor?.communityId) === safeText(target?.communityId);
-  const actorIsOwner = request.auth?.token?.owner === true || OWNER_UIDS.includes(actorUid) || OWNER_EMAILS.includes(safeText(request.auth?.token?.email));
-  const actorCanManage = actorIsOwner || (sameCommunity && ["MASTER", "ADMIN", "ACCOUNTANT"].includes(actorRole));
-  if (!actorCanManage) throw new HttpsError("permission-denied", "Brak uprawnień do blokady użytkownika.");
-
-  await targetRef.set({ appBlocked: !!request.data?.blocked, updatedAtMs: nowMs() }, { merge: true });
+  const communityId = profileCommunityId(target);
+  await requireCommunityStaff(request, communityId);
+  await db.doc(`users/${targetUid}`).update({ appBlocked: !!request.data?.blocked, updatedAtMs: nowMs() });
   return { ok: true };
 });
 
@@ -924,7 +1261,7 @@ exports.claimJoinCode = onCall(async (request) => {
 
 exports.claimResidentFlat = onCall(async (request) => {
   const uid = requireAuth(request);
-  const communityId = safeText(request.data?.communityId);
+  const communityId = safeText(request.data?.communityId || request.data?.customerId);
   if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
   const flat = await claimOrCreateFlatForResident({
     communityId,
@@ -938,29 +1275,92 @@ exports.claimResidentFlat = onCall(async (request) => {
     staircaseId: safeText(request.data?.staircaseId),
   });
   await db.doc(`users/${uid}`).set({
+    uid,
     communityId,
+    customerId: communityId,
     street: flat.street,
+    streetId: safeText(request.data?.streetId || normalizeFlatPart(flat.street)),
     buildingNo: flat.buildingNo,
     apartmentNo: flat.apartmentNo,
     flatId: flat.flatId,
     staircaseId: flat.staircaseId || undefined,
     flatLabel: flat.flatLabel,
+    flatKey: flat.flatKey,
+    authLinked: true,
+    appVisible: true,
+    placeholderResident: false,
+    isShadow: false,
     updatedAtMs: nowMs(),
   }, { merge: true });
+  await syncCommunityDerivedState(communityId).catch(() => null);
   return { ok: true, ...flat };
 });
 
 exports.createWebSession = onCall(async (request) => {
   const uid = requireAuth(request);
   const profile = await getMyProfile(uid);
-  const communityId = safeText(profile?.communityId);
-  const role = safeText(profile?.role);
-  if (!["MASTER", "ACCOUNTANT"].includes(role)) throw new HttpsError("permission-denied", "Administrator nie ma dostępu do webpanelu.");
+  const communityId = profileCommunityId(profile);
+  const role = safeText(profile?.role).toUpperCase();
+  if (!communityId) throw new HttpsError("failed-precondition", "Brak communityId dla sesji webpanelu.");
+  if (!(isOwnerRequest(request) || ["MASTER", "ACCOUNTANT"].includes(role))) {
+    throw new HttpsError("permission-denied", "Administrator nie ma dostępu do webpanelu.");
+  }
   await assertPanelAccessEnabled(communityId);
   const token = `${randomCode(12)}${randomCode(12)}`;
   const target = safeText(request.data?.target || "/dashboard");
   await db.doc(`webSessions/${token}`).set({ uid, communityId, used: false, target, createdAtMs: nowMs(), expiresAtMs: nowMs() + 15 * 60 * 1000 });
   return { token, target };
+});
+
+
+exports.revokeInvite = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const inviteId = safeText(request.data?.inviteId);
+  if (!communityId || !inviteId) throw new HttpsError("invalid-argument", "Brak communityId lub inviteId.");
+  const { uid } = await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
+  const inviteRef = db.doc(`invites/${inviteId}`);
+  const inviteSnap = await inviteRef.get();
+  if (!inviteSnap.exists) throw new HttpsError("not-found", "Invite nie istnieje.");
+  const inviteData = inviteSnap.data() || {};
+  if (firstNonBlank(inviteData.communityId, inviteData.customerId) !== communityId) {
+    throw new HttpsError("permission-denied", "Invite należy do innej wspólnoty.");
+  }
+  const activeSnap = await db.collection(`communities/${communityId}/activeInvites`).where("inviteId", "==", inviteId).get();
+  const batch = db.batch();
+  batch.set(inviteRef, { status: "revoked", revokedAtMs: nowMs(), revokedByUid: uid }, { merge: true });
+  activeSnap.docs.forEach((doc) => batch.set(doc.ref, { status: "revoked", revokedAtMs: nowMs(), revokedByUid: uid }, { merge: true }));
+  await batch.commit();
+  return { ok: true };
+});
+
+exports.moderateChatMessage = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  const messageId = safeText(request.data?.messageId);
+  if (!communityId || !messageId) throw new HttpsError("invalid-argument", "Brak communityId lub messageId.");
+  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
+  const ref = db.doc(`communities/${communityId}/chatMessages/${messageId}`);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("not-found", "Wiadomość nie istnieje.");
+  await ref.set({ deleted: true, deletedAtMs: nowMs() }, { merge: true });
+  return { ok: true };
+});
+
+exports.clearCommunityChat = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
+  const snap = await db.collection(`communities/${communityId}/chatMessages`).get();
+  const batch = db.batch();
+  snap.docs.forEach((doc) => batch.set(doc.ref, { deleted: true, deletedAtMs: nowMs() }, { merge: true }));
+  await batch.commit();
+  return { ok: true, count: snap.size };
+});
+
+exports.repairCommunitySync = onCall(async (request) => {
+  const communityId = safeText(request.data?.communityId || request.data?.customerId);
+  if (!communityId) throw new HttpsError("invalid-argument", "Brak communityId.");
+  await requireCommunityRole(request, communityId, ["MASTER", "ADMIN", "ACCOUNTANT"]);
+  return await syncCommunityDerivedState(communityId);
 });
 
 exports.ksefFetchInvoices = onCall(async (request) => {
@@ -1318,4 +1718,40 @@ exports.closeReviewItem = onCall(async (request) => {
   await assertPanelAccessEnabled(communityId);
   await db.collection("communities").doc(communityId).collection("reviewQueue").doc(reviewId).set({ status: safeText(request.data?.status || "CLOSED"), resolution: safeText(request.data?.resolution || ""), closedAtMs: nowMs() }, { merge: true });
   return { ok: true };
+});
+
+
+exports.onFlatSeatSync = onDocumentWritten("communities/{communityId}/flats/{flatId}", async (event) => {
+  const before = event.data?.before || null;
+  const after = event.data?.after || null;
+  if (!hasMeaningfulChange(before, after, ["street", "streetId", "buildingNo", "apartmentNo", "flatLabel", "flatKey", "areaM2", "residentUid", "userId"])) return;
+  await syncCommunityDerivedState(event.params.communityId);
+});
+
+exports.onStreetRegistrySync = onDocumentWritten("communities/{communityId}/streets/{streetId}", async (event) => {
+  if (!hasMeaningfulChange(event.data?.before || null, event.data?.after || null, ["name", "street", "isActive", "deletedAtMs", "normalizedName"])) return;
+  await syncCommunityDerivedState(event.params.communityId);
+});
+
+exports.onStreetAssignmentsSync = onDocumentWritten("communities/{communityId}/streetAssignments/{assignmentId}", async (event) => {
+  if (!hasMeaningfulChange(event.data?.before || null, event.data?.after || null, ["street", "streetName", "streetId", "name", "adminUid"])) return;
+  await syncCommunityDerivedState(event.params.communityId);
+});
+
+exports.onPayerShadowSync = onDocumentWritten("communities/{communityId}/payers/{payerId}", async (event) => {
+  if (!hasMeaningfulChange(event.data?.before || null, event.data?.after || null, ["name", "surname", "email", "phone", "street", "streetId", "buildingNo", "apartmentNo", "flatId", "flatLabel", "flatKey", "mailOnly"])) return;
+  await syncCommunityDerivedState(event.params.communityId);
+});
+
+exports.onUserEmailLinkSync = onDocumentWritten("users/{uid}", async (event) => {
+  const beforeData = event.data?.before?.data() || {};
+  const afterData = event.data?.after?.data() || {};
+  const beforeCommunityId = communityIdFromData(beforeData);
+  const afterCommunityId = communityIdFromData(afterData);
+  const changed = !jsonEq(beforeCommunityId, afterCommunityId) || !jsonEq(beforeData.email || null, afterData.email || null) || !jsonEq(beforeData.flatId || null, afterData.flatId || null) || !jsonEq(beforeData.role || null, afterData.role || null) || !jsonEq(beforeData.removedAtMs || null, afterData.removedAtMs || null) || !jsonEq(beforeData.appVisible || null, afterData.appVisible || null) || !jsonEq(beforeData.authLinked || null, afterData.authLinked || null);
+  if (!changed) return;
+  const communities = new Set([beforeCommunityId, afterCommunityId].filter(Boolean));
+  for (const communityId of communities) {
+    await syncCommunityDerivedState(communityId);
+  }
 });

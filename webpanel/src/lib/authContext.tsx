@@ -59,14 +59,14 @@ async function resolveCommunity(profile: UserProfile | null, user: User | null):
     try {
       const snap = await getDoc(doc(db, "communities", communityId));
       if (snap.exists()) {
-        return { ...snap.data(), panelAccessEnabled: isPanelEnabled((snap.data() as any)?.panelAccessEnabled) } as CommunityProfile;
+        return { ...snap.data(), panelAccessEnabled: isPanelEnabled(snap.data() as any) } as CommunityProfile;
       }
     } catch {}
 
     try {
       const q = query(collection(db, "communities"), where("id", "==", communityId), limit(1));
       const qs = await getDocs(q);
-      if (!qs.empty) return { ...qs.docs[0].data(), panelAccessEnabled: isPanelEnabled((qs.docs[0].data() as any)?.panelAccessEnabled) } as CommunityProfile;
+      if (!qs.empty) return { ...qs.docs[0].data(), panelAccessEnabled: isPanelEnabled(qs.docs[0].data() as any) } as CommunityProfile;
     } catch {}
   }
 
@@ -76,7 +76,7 @@ async function resolveCommunity(profile: UserProfile | null, user: User | null):
       try {
         const q = query(collection(db, "communities"), where(field, "==", email), limit(1));
         const qs = await getDocs(q);
-        if (!qs.empty) return { ...qs.docs[0].data(), panelAccessEnabled: isPanelEnabled((qs.docs[0].data() as any)?.panelAccessEnabled) } as CommunityProfile;
+        if (!qs.empty) return { ...qs.docs[0].data(), panelAccessEnabled: isPanelEnabled(qs.docs[0].data() as any) } as CommunityProfile;
       } catch {}
     }
   }

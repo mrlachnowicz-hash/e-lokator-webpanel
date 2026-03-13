@@ -31,7 +31,11 @@ service cloud.firestore {
 
     function myCommId() {
       return exists(/databases/$(database)/documents/users/$(request.auth.uid))
-        ? getMyData().get('communityId', '')
+        ? (
+            getMyData().get('communityId', '') != ''
+              ? getMyData().get('communityId', '')
+              : getMyData().get('customerId', '')
+          )
         : '';
     }
 
@@ -48,8 +52,14 @@ service cloud.firestore {
     }
 
     function panelAccessEnabled(communityId) {
-      return exists(/databases/$(database)/documents/communities/$(communityId)) &&
-        get(/databases/$(database)/documents/communities/$(communityId)).data.get('panelAccessEnabled', false) == true;
+      return exists(/databases/$(database)/documents/communities/$(communityId)) && (
+        get(/databases/$(database)/documents/communities/$(communityId)).data.get('panelAccessEnabled', false) == true ||
+        get(/databases/$(database)/documents/communities/$(communityId)).data.get('accessToPanel', false) == true ||
+        get(/databases/$(database)/documents/communities/$(communityId)).data.get('panelActive', false) == true ||
+        get(/databases/$(database)/documents/communities/$(communityId)).data.get('panelEnabled', false) == true ||
+        get(/databases/$(database)/documents/communities/$(communityId)).data.get('webPanelEnabled', false) == true ||
+        get(/databases/$(database)/documents/communities/$(communityId)).data.get('webpanelEnabled', false) == true
+      );
     }
 
     function canUsePanel(communityId) {
@@ -63,14 +73,19 @@ service cloud.firestore {
     match /users/{uid} {
       allow read: if signedIn() && (
         request.auth.uid == uid ||
-        (myCommId() != "" && myCommId() == resource.data.get('communityId', '')) ||
+        (myCommId() != "" && (
+          myCommId() == resource.data.get('communityId', '') ||
+          myCommId() == resource.data.get('customerId', '')
+        )) ||
         isAdminOrMaster()
       );
       allow create: if signedIn() && request.auth.uid == uid;
       allow update: if signedIn() && (
         request.auth.uid == uid ||
-        (isAdminOrMaster() && myCommId() == resource.data.get('communityId', '') &&
-         request.resource.data.diff(resource.data).changedKeys().hasOnly([
+        (isAdminOrMaster() && (
+            myCommId() == resource.data.get('communityId', '') ||
+            myCommId() == resource.data.get('customerId', '')
+         ) && request.resource.data.diff(resource.data).changedKeys().hasOnly([
            "chatMutedUntilMs", "chatBanned", "appBlocked", "blockedAtMs"
          ]))
       );
